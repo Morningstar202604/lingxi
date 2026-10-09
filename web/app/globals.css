@@ -1,0 +1,46 @@
+@tailwind base;
+@tailwind components;
+@tailwind utilities;
+
+:root {
+  --lingxi-navy: #1B2A4A;
+  --lingxi-orange: #E8963E;
+  --lingxi-green: #2ECC71;
+  --lingxi-red: #E74C3C;
+  --lingxi-slate: #2C3E50;
+  --lingxi-muted: #95A5A6;
+}
+
+html,
+body {
+  background-color: #0f1729;
+  color: #e2e8f0;
+  min-height: 100vh;
+}
+
+/* Thin scrollbar */
+::-webkit-scrollbar {
+  width: 6px;
+  height: 6px;
+}
+::-webkit-scrollbar-track {
+  background: #1a2744;
+}
+::-webkit-scrollbar-thumb {
+  background: #3a4a6a;
+  border-radius: 3px;
+}
+
+/* Pulse indicator for live status */
+@keyframes pulse-dot {
+  0%, 100% { opacity: 1; }
+  50% { opacity: 0.3; }
+}
+.pulse-dot {
+  animation: pulse-dot 1.5s ease-in-out infinite;
+}
+
+/* Card style */
+.card {
+  @apply bg-lingxi-slate/50 border border-white/5 rounded-xl p-4 backdrop-blur-sm;
+}
