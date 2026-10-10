@@ -17,10 +17,13 @@ import logging
 import sys
 import uuid
 from contextvars import ContextVar
-from functools import lru_cache
-from typing import Any
+from functools import cache
+from typing import TYPE_CHECKING, Any
 
 import structlog
+
+if TYPE_CHECKING:
+    from structlog.typing import EventDict, Processor
 
 # ── trace_id 上下文变量（每个 asyncio task 独立）──
 trace_id_var: ContextVar[str | None] = ContextVar("trace_id", default=None)
@@ -40,7 +43,7 @@ def get_trace_id() -> str:
     return tid
 
 
-def _add_trace_id(logger: Any, method_name: str, event_dict: dict[str, Any]) -> dict[str, Any]:
+def _add_trace_id(logger: Any, method_name: str, event_dict: EventDict) -> EventDict:
     """structlog processor: 把 trace_id 自动加入每条日志。"""
     tid = trace_id_var.get()
     if tid:
@@ -54,10 +57,10 @@ def _render_to_stderr(logger: Any, method_name: str, event_dict: dict[str, Any])
     print(event_dict, file=sys.stderr)
 
 
-@lru_cache(maxsize=None)
+@cache
 def configure_logging(log_level: str = "INFO", json_format: bool = False) -> None:
     """初始化全局结构化日志。幂等（重复调用不叠加 handler）。"""
-    shared_processors = [
+    shared_processors: list[Processor] = [
         structlog.contextvars.merge_contextvars,
         _add_trace_id,
         structlog.processors.add_log_level,
@@ -109,7 +112,8 @@ def get_logger(name: str | None = None) -> structlog.stdlib.BoundLogger:
         log = get_logger(__name__)
         log.info("user_login", user_id="42")
     """
-    return structlog.get_logger(name)
+    logger: structlog.stdlib.BoundLogger = structlog.get_logger(name)
+    return logger
 
 
 __all__ = [

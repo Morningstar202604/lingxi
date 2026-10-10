@@ -1,12 +1,9 @@
 """Layer 3 测试 — Lorebook + GraphStore + MemoryPipeline。"""
 from __future__ import annotations
 
-import pytest
-
+from lingxi.memory.graph_store import Entity, InMemoryGraphStore, Relation
 from lingxi.memory.lorebook import Lorebook, LorebookEntry
-from lingxi.memory.graph_store import Entity, Relation, InMemoryGraphStore
 from lingxi.memory.pipeline import MemoryItem, MemoryPipeline
-
 
 # ── Lorebook ──
 

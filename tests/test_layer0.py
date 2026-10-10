@@ -18,13 +18,12 @@ from lingxi.core import (
     ChannelType,
     IMEvent,
     MessageSegment,
-    PostType,
     MessageType,
     OutboundMessage,
-    set_trace_id,
+    PostType,
     get_trace_id,
+    set_trace_id,
 )
-
 
 # ── MessageSegment ──
 

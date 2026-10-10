@@ -16,11 +16,11 @@ from __future__ import annotations
 import time
 import uuid
 from dataclasses import dataclass, field
-from enum import Enum
+from enum import StrEnum
 from typing import Any
 
 
-class TicketStatus(str, Enum):
+class TicketStatus(StrEnum):
     """工单状态机。"""
 
     INTAKE = "intake"           # 刚创建，等待 Agent 处理
@@ -31,7 +31,7 @@ class TicketStatus(str, Enum):
     CLOSED = "closed"           # 超时或用户主动关闭
 
 
-class TicketCategory(str, Enum):
+class TicketCategory(StrEnum):
     """工单自动分类。"""
 
     INQUIRY = "inquiry"         # 商品/物流/规则咨询

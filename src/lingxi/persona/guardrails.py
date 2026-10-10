@@ -16,8 +16,8 @@
 from __future__ import annotations
 
 import re
-from enum import Enum
-from typing import Literal
+from enum import StrEnum
+from typing import Any, Literal
 
 from lingxi.core import get_logger
 
@@ -26,40 +26,54 @@ log = get_logger(__name__)
 
 # ── 注入检测 ──
 
-# 常见的 prompt injection 模式
-_INJECTION_PATTERNS = [
+# 明确注入模式：指令性要求模型覆盖/遗忘/篡改系统设定 → 直接拦截
+_BLOCK_PATTERNS = [
     r"(?i)ignore\s+(previous|above|all)\s+instructions?",
-    r"(?i)you\s+are\s+now\s+(a|an|the)\s+\w+",
+    r"(?i)forget\s+(everything|all|your)\s+(instructions?|rules?|settings?)?",
     r"(?i)new\s+persona[:：]",
-    r"(?i)forget\s+(everything|all|your)",
-    r"(?i)system\s*[:：]\s*you\s+are",
-    r"(?i)你(现在|现在起)(是|扮演|变成)",
-    r"(?i)忽略(之前|上面|所有)(指令|设定|规则)",
-    r"(?i)你(现在)?是(一个|一名|助理)",
-    r"(?i)假装你是",
     r"(?i)pretend\s+(to\s+be|you\s+are)",
+    r"(?i)忽略.{0,5}?(之前|前面|以上|所有).{0,5}?(指令|设定|规则|配置)",
+    r"(?i)假装你是",
+    r"(?i)请?忘记?你(的|原来的|之前的)(身份|角色|设定)",
+    r"(?i)you\s+are\s+now\s+(a|an|the)\s+(?!helpful|friendly|helpful\s+assistant)",
+    r"(?i)system\s*[:：]\s*you\s+are",
 ]
 
-_COMPILED_PATTERNS = [re.compile(p) for p in _INJECTION_PATTERNS]
+# 可疑模式：可能是角色扮演/测试等合法场景，需调用方自行决策
+_SUSPECT_PATTERNS = [
+    r"(?i)你(现在|现在起|来)(是|扮演|变成|当)",
+    r"(?i)(assume|act)\s+(the\s+role|as)",
+]
+
+_COMPILED_BLOCK = [re.compile(p) for p in _BLOCK_PATTERNS]
+_COMPILED_SUSPECT = [re.compile(p) for p in _SUSPECT_PATTERNS]
 
 
-class InjectionVerdict(str, Enum):
+class InjectionVerdict(StrEnum):
     """注入检测结果。"""
 
     CLEAN = "clean"
-    SUSPECT = "suspect"  # 可疑但可能是正常用语
-    BLOCK = "block"  # 明确注入尝试
+    SUSPECT = "suspect"  # 可疑但可能是正常用语（调用方决定）
+    BLOCK = "block"  # 明确注入尝试（硬拦截）
 
 
 def detect_injection(text: str) -> tuple[InjectionVerdict, str | None]:
     """检测文本中是否包含 prompt injection 特征。
 
+    二阶段判断：
+    1. 命中 BLOCK 模式（指令性覆盖/遗忘/注入）→ 硬拦截
+    2. 命中 SUSPECT 模式（假设性角色扮演）→ 由调用方决定是否放行
+    3. 全部未命中 → CLEAN
+
     Returns:
         (verdict, matched_pattern_or_none)
     """
-    for pattern in _COMPILED_PATTERNS:
+    for pattern in _COMPILED_BLOCK:
         if pattern.search(text):
             return InjectionVerdict.BLOCK, pattern.pattern
+    for pattern in _COMPILED_SUSPECT:
+        if pattern.search(text):
+            return InjectionVerdict.SUSPECT, pattern.pattern
     return InjectionVerdict.CLEAN, None
 
 
@@ -74,10 +88,10 @@ PERM_HIGH_RISK: PermissionLevel = 3    # Shell/删文件/提权
 PERM_FORBIDDEN: PermissionLevel = 4    # 访问凭据/改配置
 
 
-class PermissionDenied(Exception):
+class PermissionDeniedError(Exception):
     """权限不足异常。"""
 
-    def __init__(self, required: PermissionLevel, actual: PermissionLevel, action: str) -> None:
+    def __init__(self, required: int, actual: int, action: str) -> None:
         super().__init__(
             f"Permission denied: action '{action}' requires level {required}, "
             f"current level is {actual}"
@@ -89,12 +103,12 @@ class PermissionDenied(Exception):
 
 def check_permission(
     action: str,
-    current_level: PermissionLevel,
-    required_level: PermissionLevel,
+    current_level: int,
+    required_level: int,
 ) -> None:
-    """检查权限是否足够。不够则抛出 PermissionDenied。"""
+    """检查权限是否足够。不够则抛出 PermissionDeniedError。"""
     if current_level < required_level:
-        raise PermissionDenied(
+        raise PermissionDeniedError(
             required=required_level,
             actual=current_level,
             action=action,
@@ -133,7 +147,7 @@ def classify_shell_command(command: str, blocked_list: list[str]) -> PermissionL
 
 # ── 角色篡改检测 ──
 
-def detect_role_override(messages: list[dict]) -> bool:
+def detect_role_override(messages: list[dict[str, Any]]) -> bool:
     """检查 messages 列表中是否有 system 角色被篡改。
 
     正常流程只有一个 system message（开头），且由 PersonaInjector 生成。
@@ -152,7 +166,7 @@ __all__ = [
     "InjectionVerdict",
     "detect_injection",
     "PermissionLevel",
-    "PermissionDenied",
+    "PermissionDeniedError",
     "check_permission",
     "classify_shell_command",
     "detect_role_override",

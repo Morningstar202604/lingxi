@@ -9,22 +9,18 @@
 """
 from __future__ import annotations
 
-import asyncio
-
 import pytest
 
+from lingxi.config.settings import OneBotConfig
 from lingxi.core import (
     ChannelType,
     IMEvent,
-    MessageSegment,
-    PostType,
     MessageType,
+    PostType,
 )
-from lingxi.im.adapter import _parse_onebot_message, _parse_cq_code
+from lingxi.im.adapter import _parse_cq_code, _parse_onebot_message
 from lingxi.im.gewechat import GewechatAdapter
 from lingxi.im.napcat import NapCatAdapter
-from lingxi.config.settings import OneBotConfig
-
 
 # ── CQ 码解析 ──
 

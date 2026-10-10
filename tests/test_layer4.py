@@ -2,16 +2,21 @@
 from __future__ import annotations
 
 import asyncio
+import sys
 from typing import Any
 from unittest.mock import AsyncMock, MagicMock, patch
 
 import pytest
 
-from lingxi.agent.graph import ZhiXiAgent, _route_after_reason, _route_after_tool
+from lingxi.agent.graph import (
+    ZhiXiAgent,
+    _create_default_checkpointer,
+    _route_after_reason,
+    _route_after_tool,
+)
 from lingxi.agent.nodes import (
     _parse_reason_output,
     escalate_node,
-    reason_node,
     respond_node,
 )
 from lingxi.agent.state import AgentState
@@ -22,15 +27,13 @@ from lingxi.agent.tools import (
     execute_tool,
 )
 from lingxi.persona.guardrails import (
-    PermissionDenied,
-    PermissionLevel,
     PERM_AUTO,
     PERM_FORBIDDEN,
     PERM_HIGH_RISK,
+    PermissionDeniedError,
     check_permission,
     classify_shell_command,
 )
-
 
 # ─────────────── Tool Registry ───────────────
 
@@ -156,7 +159,7 @@ class TestExecuteTool:
     @pytest.mark.asyncio
     async def test_shell_high_risk_requires_permission(self) -> None:
         """高风险 shell 命令需要 PERM_HIGH_RISK。"""
-        from lingxi.persona.guardrails import PERM_LOW_RISK, PERM_HIGH_RISK
+        from lingxi.persona.guardrails import PERM_HIGH_RISK, PERM_LOW_RISK
         reg = _create_default_registry()
         # PERM_LOW_RISK 级别不能执行 rm -rf（高风险）
         result = await execute_tool(
@@ -164,7 +167,7 @@ class TestExecuteTool:
         )
         assert result["success"] is False
         # PERM_HIGH_RISK 级别可以
-        result2 = await execute_tool(
+        await execute_tool(
             reg, "shell", {"command": "rm -rf /test_tmp_dir"}, PERM_HIGH_RISK,
         )
         # 命令执行可能会因为路径不存在而失败，但权限层面应该通过
@@ -313,6 +316,35 @@ class TestGraphRouting:
         assert _route_after_tool(state) == "escalate"
 
 
+# ─────────────── 默认 checkpointer（持久化策略） ───────────────
+
+
+class TestDefaultCheckpointer:
+    """langgraph 1.x 的 sqlite saver 在配套包 langgraph-checkpoint-sqlite 中。
+    缺失时必须显式回退（有日志），装了就必须真正持久化——禁止静默降级。
+    """
+
+    @pytest.mark.asyncio
+    async def test_sqlite_persistence_when_package_available(self) -> None:
+        """配套包已装 → 工厂返回的 async CM 进入后必须是 AsyncSqliteSaver。"""
+        from langgraph.checkpoint.sqlite.aio import AsyncSqliteSaver
+
+        cp = _create_default_checkpointer()
+        saver = await cp.__aenter__()
+        try:
+            assert isinstance(saver, AsyncSqliteSaver)
+        finally:
+            await cp.__aexit__(None, None, None)
+
+    def test_fallback_to_memory_saver_on_import_error(self, monkeypatch: pytest.MonkeyPatch) -> None:
+        from langgraph.checkpoint.memory import MemorySaver
+
+        # sys.modules 置 None → import 时抛 ImportError，模拟配套包缺失
+        monkeypatch.setitem(sys.modules, "langgraph.checkpoint.sqlite.aio", None)
+        cp = _create_default_checkpointer()
+        assert isinstance(cp, MemorySaver)
+
+
 # ─────────────── LangGraph integration (mocked LLM) ───────────────
 
 
@@ -320,7 +352,7 @@ class TestZhiXiAgentGraph:
     def _make_state(self, **overrides: Any) -> AgentState:
         base: dict[str, Any] = dict(
             user_id="u1", chat_id="c1", channel="qq_private",
-            raw_message="你好", system_prompt="You are 灵犀", memory_block="",
+            raw_message="你好", system_prompt="You are 智犀", memory_block="",
             lorebook_block="", messages=[], step_count=0, max_steps=3,
             stage="opening", emotion="calm", pending_tool_call=None,
             tool_results=[], next_step="reason", final_reply="", escalate_reason="",
@@ -344,7 +376,7 @@ class TestZhiXiAgentGraph:
 
         # Mock acompletion 返回直接回复
         mock_response = MagicMock()
-        mock_response.choices[0].message.content = "你好，我是灵犀，有什么可以帮你？"
+        mock_response.choices[0].message.content = "你好，我是智犀，有什么可以帮你？"
         mock_response.choices[0].message.tool_calls = None
 
         with patch("litellm.acompletion", new_callable=AsyncMock, return_value=mock_response):
@@ -364,7 +396,7 @@ class TestPermissionHelpers:
         check_permission("read", current_level=1, required_level=0)
 
     def test_check_permission_raises(self) -> None:
-        with pytest.raises(PermissionDenied):
+        with pytest.raises(PermissionDeniedError):
             check_permission("delete", current_level=0, required_level=3)
 
     def test_classify_ls_is_auto(self) -> None:

@@ -44,14 +44,23 @@
 from __future__ import annotations
 
 import asyncio
-from typing import Any, Awaitable, Callable
+from typing import TYPE_CHECKING, Any
 
 import httpx
 from pydantic import BaseModel
 
 from lingxi.core import get_logger
-from lingxi.core.protocol import ChannelType, IMEvent, MessageSegment
+from lingxi.core.protocol import (
+    ChannelType,
+    IMEvent,
+    MessageSegment,
+    MessageType,
+    PostType,
+)
 from lingxi.im.adapter import IMAdapter, safe_int
+
+if TYPE_CHECKING:
+    from collections.abc import Awaitable, Callable
 
 log = get_logger(__name__)
 
@@ -195,14 +204,12 @@ class GewechatAdapter(IMAdapter):
     def _to_im_event(self, data: dict[str, Any]) -> IMEvent | None:
         """ Gewechat 的回调数据 → 统一 IMEvent。"""
         # 安全取字段
-        new_msg_id = safe_int(data.get("newMsgId")) or 0
         from_user = str(data.get("fromUser") or data.get("from_user") or "")
         to_user = str(data.get("toUser") or data.get("to_user") or "")
         msg_type = safe_int(data.get("msgType")) or 0
         content = str(data.get("content") or "")
         at_list = data.get("atList") or []
         to_wxid = str(data.get("toWxid") or data.get("to_wxid") or "")
-        timestamp = safe_int(data.get("timestamp")) or 0
 
         if not from_user or not content:
             return None
@@ -210,13 +217,18 @@ class GewechatAdapter(IMAdapter):
         # 判断私聊 vs 群聊
         is_group = "@chatroom" in to_wxid or "@chatroom" in to_user
 
-        # 构建 IMEvent（使用正确的 channel 类型）
+        # 构建 segment 列表（包含 at 段）
+        segment_list = _parse_gw_message_segments(msg_type, content)
+        if at_list:
+            for wxid in at_list:
+                segment_list.insert(0, MessageSegment(type="at", data={"qq": wxid}))
+
+        # 构建 IMEvent（post_type 应为 "message"——这是用户发来的消息）
         if is_group:
             group_id = to_wxid or to_user  # 不使用 int() 强转
-            segment_list = _parse_gw_message_segments(msg_type, content)
             return IMEvent(
-                post_type="notice",
-                message_type="group",
+                post_type=PostType.MESSAGE,
+                message_type=MessageType.GROUP,
                 channel=ChannelType.WECHAT_GROUP,
                 user_id=from_user,
                 group_id=group_id,
@@ -224,10 +236,9 @@ class GewechatAdapter(IMAdapter):
                 segments=segment_list,
             )
         else:
-            segment_list = _parse_gw_message_segments(msg_type, content)
             return IMEvent(
-                post_type="notice",
-                message_type="private",
+                post_type=PostType.MESSAGE,
+                message_type=MessageType.PRIVATE,
                 channel=ChannelType.WECHAT_PRIVATE,
                 user_id=from_user,
                 raw_message=content,
@@ -301,9 +312,8 @@ def _parse_gw_message_segments(msg_type: int, content: str) -> list[MessageSegme
     - msgType=49: content 是 XML/JSON 卡片
     - msgType=10002: content 是系统通知文本
     """
-    import json
 
-    if msg_type == _GW_MSG_TEXT or msg_type == _GW_MSG_SYSTEM:
+    if msg_type in (_GW_MSG_TEXT, _GW_MSG_SYSTEM):
         return [MessageSegment(type="text", data={"text": content})] if content.strip() else []
     elif msg_type == _GW_MSG_IMAGE:
         # content 通常是 XML 或 JSON，包含 CDN URL；提取 cdnwxurl 字段

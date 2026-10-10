@@ -1,7 +1,7 @@
 [project]
 name = "lingxi"
 version = "0.1.0"
-description = "灵犀 (LingXi) — 心有灵犀一点通。二十四小时在线的全栈数字员工引擎。"
+description = "智犀 (ZhiXi) — 智辨已知，犀照善为。二十四小时在线的全栈数字员工引擎。"
 requires-python = ">=3.11"
 readme = "README.md"
 license = { text = "MIT" }
@@ -19,7 +19,9 @@ dependencies = [
     "pydantic-settings>=2.5.0",
     "pyyaml>=6.0",
     # ── Agent 编排 ──
-    "langgraph>=0.2.0",
+    # langgraph 1.x 起 sqlite checkpointer 拆为官方配套包；锁大版本防 API 漂移
+    "langgraph>=1.2,<2",
+    "langgraph-checkpoint-sqlite>=3.1,<4",
     "langchain-core>=0.3.0",
     "langchain>=0.3.0",
     # ── 记忆 & 检索 ──
@@ -70,13 +72,20 @@ known-first-party = ["lingxi"]
 testpaths = ["tests"]
 asyncio_mode = "strict"
 asyncio_default_fixture_loop_scope = "function"
-addopts = "-v --tb=short"
+addopts = "-v --tb=short -W ignore::DeprecationWarning:starlette.testclient -W ignore::DeprecationWarning:anyio._lazyimport"
 pythonpath = ["src"]
-filterwarnings = ["error"]
+filterwarnings = [
+    # anyio 旧版别名被 starlette/fastapi 触发的第三方弃用警告，不影响本仓库
+    "ignore:.*BlockingPortal.*:DeprecationWarning",
+    # 其余所有 warning 升级为 error（严格模式）
+    "error",
+]
 
 # ── Mypy ──
 [tool.mypy]
-python_version = "3.11"
+# 3.12 是解析环境内 numpy stubs（PEP 695 type 语句）的最低要求；
+# 实际兼容下限由 requires-python>=3.11 + ruff target-version=py311 把关
+python_version = "3.12"
 strict = true
 warn_return_any = true
 warn_unused_configs = true
@@ -87,5 +96,5 @@ explicit_package_bases = true
 mypy_path = "src"
 
 [[tool.mypy.overrides]]
-module = ["litellm.*", "mem0ai.*"]
+module = ["litellm.*"]
 ignore_missing_imports = true

@@ -17,13 +17,16 @@
 from __future__ import annotations
 
 import json
-from typing import Any
+from typing import TYPE_CHECKING, Any
 
-from lingxi.agent.state import AgentState, ToolResult
 from lingxi.agent.tools import ToolRegistry, execute_tool
 from lingxi.config import get_settings
 from lingxi.core import get_logger
-from lingxi.persona.guardrails import PermissionLevel, PermissionDenied, detect_role_override
+from lingxi.persona.guardrails import detect_role_override
+
+if TYPE_CHECKING:
+    from lingxi.agent.state import AgentState, ToolResult
+    from lingxi.persona.guardrails import PermissionLevel
 
 log = get_logger(__name__)
 
@@ -83,9 +86,21 @@ async def reason_node(state: AgentState) -> dict[str, Any]:
     # 解析 LLM 输出
     parsed = _parse_reason_output(content, tool_calls_raw)
 
+    # ── 置信度计算 ──
+    # 优先级：LLM 显式输出 > 启发式推断
+    confidence = parsed.get("confidence") or 0.0
+    if confidence == 0.0:
+        if parsed.get("final_answer"):
+            confidence = 0.85  # 直接给出答案 → 较高置信度
+        elif parsed.get("tool_call"):
+            confidence = 0.60  # 需要调工具验证 → 中等置信度
+        else:
+            confidence = 0.30  # 无明确结论 → 低置信度
+
     update: dict[str, Any] = {
         "messages": [*state["messages"], {"role": "assistant", "content": content}],
         "step_count": 1,
+        "confidence": confidence,
     }
 
     if parsed.get("tool_call"):
@@ -100,14 +115,21 @@ async def reason_node(state: AgentState) -> dict[str, Any]:
         if state["step_count"] >= state["max_steps"] * 0.5:
             update["final_reply"] = "我已经思考了多步但尚未找到确切答案，建议您提供更多上下文或联系人工同事。"
             update["next_step"] = "respond"
+            update["confidence"] = 0.20
         else:
             update["next_step"] = "reason"
 
     return update
 
 
-def _parse_reason_output(content: str, tool_calls_raw: list | None) -> dict[str, Any]:
-    """解析 LLM 返回的内容 + 结构化 tool_calls。"""
+def _parse_reason_output(content: str, tool_calls_raw: list[Any] | None) -> dict[str, Any]:
+    """解析 LLM 返回的内容 + 结构化 tool_calls。
+
+    支持 LLM 输出 confidence 字段（0.0–1.0），用于 pipeline 判断是否升级人工。
+    期望的 JSON 格式：
+        {"answer": "...", "confidence": 0.9}
+        {"tool": "shell", "tool_args": {...}, "confidence": 0.6}
+    """
     result: dict[str, Any] = {}
 
     # 优先：结构化 tool_calls（OpenAI function calling 格式）
@@ -121,6 +143,9 @@ def _parse_reason_output(content: str, tool_calls_raw: list | None) -> dict[str,
             "tool_name": tc.function.name,
             "arguments": args,
         }
+        # 尝试从 args 中提取 confidence
+        if "confidence" in args and isinstance(args["confidence"], (int, float)):
+            result["confidence"] = float(args["confidence"])
         return result
 
     # 其次：文本中的 JSON 块
@@ -139,6 +164,9 @@ def _parse_reason_output(content: str, tool_calls_raw: list | None) -> dict[str,
                 }
             if data.get("answer"):
                 result["final_answer"] = data["answer"]
+            # LLM 显式置信度
+            if "confidence" in data and isinstance(data["confidence"], (int, float)):
+                result["confidence"] = float(data["confidence"])
             return result
     except (json.JSONDecodeError, ValueError):
         pass

@@ -11,13 +11,13 @@
 """
 from __future__ import annotations
 
-from enum import Enum
+from enum import StrEnum
 from typing import Literal
 
 from pydantic import BaseModel, Field
 
 
-class EmotionLevel(str, Enum):
+class EmotionLevel(StrEnum):
     """情绪强度分级。"""
 
     CALM = "calm"
@@ -27,7 +27,7 @@ class EmotionLevel(str, Enum):
     APOLOGETIC = "apologetic"
 
 
-class TurnStage(str, Enum):
+class TurnStage(StrEnum):
     """对话阶段。决定回复策略和引导语。"""
 
     OPENING = "opening"

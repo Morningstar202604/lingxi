@@ -17,12 +17,13 @@ from __future__ import annotations
 
 import re
 from abc import ABC, abstractmethod
-from typing import Any, Awaitable, Callable
-
-from pydantic import BaseModel
+from typing import TYPE_CHECKING, Any
 
 from lingxi.core import get_logger
-from lingxi.core.protocol import ChannelType, IMEvent, MessageSegment
+from lingxi.core.protocol import IMEvent, MessageSegment
+
+if TYPE_CHECKING:
+    from collections.abc import Awaitable, Callable
 
 log = get_logger(__name__)
 

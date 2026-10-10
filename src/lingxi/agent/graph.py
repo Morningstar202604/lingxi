@@ -9,8 +9,7 @@
 """
 from __future__ import annotations
 
-import uuid
-from functools import lru_cache
+from functools import lru_cache, partial
 from typing import Any
 
 from langgraph.checkpoint.memory import MemorySaver
@@ -26,13 +25,9 @@ from lingxi.agent.state import AgentState
 from lingxi.agent.tools import ToolRegistry, _create_default_registry
 from lingxi.config import get_settings
 from lingxi.core import get_logger
-from lingxi.persona.guardrails import PermissionLevel
+from lingxi.persona.guardrails import PermissionLevel  # noqa: TC001
 
 log = get_logger(__name__)
-
-# 模块级变量：graph 闭包引用的 registry/permission（避免 lambda 序列化问题）
-_AGENT_REGISTRY: ToolRegistry | None = None
-_AGENT_PERMISSION_LEVEL: int = 1
 
 
 def _route_after_reason(state: AgentState) -> str:
@@ -72,13 +67,23 @@ class ZhiXiAgent:
         self._permission_level = permission_level
         self._max_steps = max_steps
         self._checkpointer_factory = checkpointer_factory
-        self._checkpointer_cm = None  # async context manager（lazy init）
-        self._graph = self._build_graph(checkpointer)
+        self._checkpointer_cm: Any = None  # async context manager（lazy init）
+        # 默认使用 MemorySaver，保证多轮会话状态在同一进程内持久化
+        effective_checkpointer = checkpointer if checkpointer is not None else MemorySaver()
+        self._graph = self._build_graph(effective_checkpointer)
 
     def _build_graph(self, checkpointer: Any) -> Any:
         builder = StateGraph(AgentState)
         builder.add_node("reason", reason_node)
-        builder.add_node("execute_tool", _execute_tool_wrapper)
+        # 用 partial 绑定当前实例的 registry + permission，避免模块级全局变量
+        builder.add_node(
+            "execute_tool",
+            partial(
+                execute_tool_node,
+                registry=self._registry,
+                current_permission=self._permission_level,
+            ),
+        )
         builder.add_node("escalate", escalate_node)
         builder.add_node("respond", respond_node)
 
@@ -135,12 +140,12 @@ class ZhiXiAgent:
             "next_step": "reason",
             "final_reply": "",
             "escalate_reason": "",
+            "confidence": 0.0,
         }
 
-        if self._graph.checkpointer is not None:
-            thread_id = f"{channel}:{chat_id}"
-        else:
-            thread_id = f"{channel}:{chat_id}:{uuid.uuid4().hex[:8]}"
+        # 始终使用确定性 thread_id（基于 channel + chat_id），
+        # 保证同一会话多轮对话状态在 checkpointer 中连续累积
+        thread_id = f"{channel}:{chat_id}"
         config = {"configurable": {"thread_id": thread_id}}
 
         try:
@@ -150,6 +155,7 @@ class ZhiXiAgent:
             return {
                 "final_reply": "服务暂时不可用，请稍后再试。",
                 "escalate_reason": str(e),
+                "confidence": 0.0,
             }
 
         return {
@@ -157,24 +163,24 @@ class ZhiXiAgent:
             "tool_results": final_state.get("tool_results", []),
             "escalate_reason": final_state.get("escalate_reason", ""),
             "step_count": final_state.get("step_count", 0),
+            "confidence": final_state.get("confidence", 0.0),
         }
 
 
-async def _execute_tool_wrapper(state: AgentState) -> dict[str, Any]:
-    """包装 execute_tool_node 以注入全局 registry/permission。"""
-    registry = _AGENT_REGISTRY or _create_default_registry()
-    return await execute_tool_node(state, registry, _AGENT_PERMISSION_LEVEL)
-
-
 def _create_default_checkpointer() -> Any:
-    """创建默认 checkpointer（AsyncSqliteSaver）。"""
+    """创建默认 checkpointer（AsyncSqliteSaver，返回 async context manager）。
+
+    langgraph 1.x 起 sqlite saver 位于配套包 langgraph-checkpoint-sqlite
+    （pyproject 已锁定依赖）；未安装时优雅降级 MemorySaver（进程内有效）。
+    """
     try:
         from langgraph.checkpoint.sqlite.aio import AsyncSqliteSaver
-        settings = get_settings()
-        db_path = getattr(settings.memory, "db_path", "data/zhixi_agent.db")
+
+        db_path = get_settings().memory.db_path
+        log.info("sqlite_checkpointer_enabled", db_path=db_path)
         return AsyncSqliteSaver.from_conn_string(db_path)
     except ImportError:
-        log.info("AsyncSqliteSaver 不可用，回退 MemorySaver")
+        log.warning("AsyncSqliteSaver 不可用，回退 MemorySaver（会话状态不跨重启）")
         return MemorySaver()
 
 
@@ -186,14 +192,9 @@ def get_agent(
     use_checkpoint: bool = True,
 ) -> ZhiXiAgent:
     """全局单例 Agent。"""
-    global _AGENT_REGISTRY, _AGENT_PERMISSION_LEVEL
-
     if registry is None:
         blocked = get_settings().security.blocked_commands
         registry = _create_default_registry(blocked_commands=blocked)
-
-    _AGENT_REGISTRY = registry
-    _AGENT_PERMISSION_LEVEL = permission_level
 
     if not use_checkpoint:
         return ZhiXiAgent(registry=registry, permission_level=permission_level, max_steps=max_steps)

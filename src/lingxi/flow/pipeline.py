@@ -16,14 +16,13 @@
 from __future__ import annotations
 
 import asyncio
+from collections.abc import Callable, Coroutine
 from dataclasses import dataclass
-from typing import Any, Callable, Coroutine
+from typing import TYPE_CHECKING, Any
 
-from lingxi.agent.graph import ZhiXiAgent
 from lingxi.agent.tools import ToolRegistry, register_tool_bridge
 from lingxi.core import get_logger
 from lingxi.core.protocol import ChannelType, IMEvent, OutboundMessage
-from lingxi.flow.queue import EscalationQueue
 from lingxi.flow.ticket import (
     Ticket,
     TicketCategory,
@@ -31,7 +30,11 @@ from lingxi.flow.ticket import (
     TicketStore,
     classify_intent,
 )
-from lingxi.persona.guardrails import PermissionLevel
+
+if TYPE_CHECKING:
+    from lingxi.agent.graph import ZhiXiAgent
+    from lingxi.flow.queue import EscalationQueue
+    from lingxi.persona.guardrails import PermissionLevel
 
 log = get_logger(__name__)
 
@@ -93,11 +96,11 @@ class CustomerServicePipeline:
         if memory_pipeline is not None:
             async def _bridge_search(user_id: str, query: str) -> str:
                 result = memory_pipeline.recall(user_id=user_id, query=query, top_k=5)
-                return result.render_for_prompt()
+                return str(result.render_for_prompt())
             register_tool_bridge("knowledge_search", _bridge_search)
 
     @staticmethod
-    def _detect_channel(chat_id: str) -> "ChannelType":
+    def _detect_channel(chat_id: str) -> ChannelType:
         """从 chat_id 前缀推断渠道。"""
         if "wxid" in str(chat_id) or "@chatroom" in str(chat_id):
             return ChannelType.WECHAT_GROUP if "@chatroom" in str(chat_id) else ChannelType.WECHAT_PRIVATE
@@ -170,7 +173,7 @@ class CustomerServicePipeline:
                 ),
                 timeout=self._max_agent_timeout,
             )
-        except asyncio.TimeoutError:
+        except TimeoutError:
             log.warning("agent_timeout", chat_id=event.chat_id)
             return await self._escalate_and_respond(
                 ticket=ticket,
@@ -181,8 +184,10 @@ class CustomerServicePipeline:
 
         final_reply = agent_result.get("final_reply", "")
         escalate_reason = agent_result.get("escalate_reason", "")
+        confidence = float(agent_result.get("confidence", 0.0))
 
         # 3. 判断：直接回复 or 升级
+        # 升级条件：Agent 主动要求 / 无回复 / 置信度低于阈值
         if escalate_reason or not final_reply.strip():
             return await self._escalate_and_respond(
                 ticket=ticket,
@@ -191,8 +196,15 @@ class CustomerServicePipeline:
                 send_func=send_func,
             )
 
-        # 4. 直接回复（confidence 由 Agent 输出决定，缺失时用中性值 0.5）
-        confidence = float(agent_result.get("confidence", 0.5))
+        if confidence > 0 and confidence < self._confidence_threshold:
+            return await self._escalate_and_respond(
+                ticket=ticket,
+                reason=f"low_confidence_{confidence:.2f}",
+                reply_text=final_reply,
+                send_func=send_func,
+            )
+
+        # 4. 直接回复
         ticket.add_message("agent", final_reply, confidence=confidence)
         try:
             ticket.transition(TicketStatus.WAITING_USER)

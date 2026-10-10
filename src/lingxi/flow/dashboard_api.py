@@ -18,13 +18,16 @@
 """
 from __future__ import annotations
 
-from typing import Any
+import contextlib
+from typing import TYPE_CHECKING, Any
 
 from fastapi import FastAPI, Header, HTTPException
 
 from lingxi.config import get_settings
-from lingxi.flow.queue import EscalationQueue
 from lingxi.flow.ticket import TicketStatus, TicketStore
+
+if TYPE_CHECKING:
+    from lingxi.flow.queue import EscalationQueue
 
 
 def create_dashboard_app(
@@ -128,10 +131,8 @@ def create_dashboard_app(
             raise HTTPException(status_code=404, detail="Ticket not found")
         queue.complete(ticket_id)
         # 同步更新 ticket 状态为 CLOSED
-        try:
+        with contextlib.suppress(ValueError):
             ticket.transition(TicketStatus.CLOSED)
-        except ValueError:
-            pass
         return {"ticket_id": ticket_id, "status": "completed"}
 
     return app

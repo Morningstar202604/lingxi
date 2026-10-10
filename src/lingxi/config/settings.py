@@ -41,14 +41,30 @@ class LLMConfig(BaseModel):
 
 
 class MemoryConfig(BaseModel):
-    """记忆系统配置。"""
+    """记忆系统配置。
 
-    backend: Literal["mem0", "local"] = "local"
+    支持三种后端（可组合）：
+    - local    → SQLite + 内置管线（默认，零依赖跑通）
+    - mem0     → Mem0 语义召回（需 mem0ai + embedding provider）
+    - neo4j    → Neo4j 实体图谱（需 neo4j 驱动）
+    """
+
+    # ── 后端选择 ──
+    backend: Literal["local", "mem0", "neo4j"] = "local"
+    mem0_api_key: str | None = None             # 非空时启用 Mem0 语义召回
+    embed_model: str = "text-embedding-3-small"
+    recall_top_k: int = 5
+
+    # ── SQLite 持久化（LangGraph checkpointer + MemoryPipeline 存储）──
+    db_path: str = "data/zhixi_memory.db"
+
+    # ── Lorebook YAML 加载路径 ──
+    lorebook_paths: list[str] = Field(default_factory=list)
+
+    # ── Neo4j 图谱（生产环境大规模实体关系）──
     neo4j_uri: str | None = None
     neo4j_user: str | None = None
     neo4j_password: SecretStr | None = None
-    embed_model: str = "text-embedding-3-small"
-    recall_top_k: int = 5
 
 
 class AgentConfig(BaseModel):
@@ -58,14 +74,6 @@ class AgentConfig(BaseModel):
     confidence_threshold: float = 0.6
     context_char_budget: int = 4000
     max_concurrent_sessions: int = 200
-
-
-class MemoryConfig(BaseModel):
-    """记忆系统配置。"""
-
-    db_path: str = "data/zhixi_memory.db"      # SqliteSaver 持久化路径
-    lorebook_paths: list[str] = Field(default_factory=list)
-    mem0_api_key: str | None = None             # 非空时启用 Mem0 后端
 
 
 class SecurityConfig(BaseModel):

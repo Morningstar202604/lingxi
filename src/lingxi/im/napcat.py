@@ -18,14 +18,13 @@
 from __future__ import annotations
 
 import asyncio
+import contextlib
 import json
 import time
-from typing import Any, Awaitable, Callable
+from typing import TYPE_CHECKING, Any
 
 import websockets
-from websockets.asyncio.client import ClientConnection
 
-from lingxi.config.settings import OneBotConfig
 from lingxi.core import (
     ChannelType,
     IMEvent,
@@ -34,6 +33,13 @@ from lingxi.core import (
     get_logger,
 )
 from lingxi.im.adapter import IMAdapter, _parse_onebot_message, safe_int
+
+if TYPE_CHECKING:
+    from collections.abc import Awaitable, Callable
+
+    from websockets.asyncio.client import ClientConnection
+
+    from lingxi.config.settings import OneBotConfig
 
 log = get_logger(__name__)
 
@@ -75,6 +81,8 @@ class NapCatAdapter(IMAdapter):
 
             except asyncio.CancelledError:
                 break
+            # aqg: top-level boundary — 重连循环是适配器最外层边界：
+            # 任何连接异常都降级为 backoff 重试，不能冒泡杀死进程
             except Exception:
                 if not self._running:
                     break
@@ -105,10 +113,8 @@ class NapCatAdapter(IMAdapter):
             # 清理未完成的 task
             for t in pending:
                 t.cancel()
-                try:
+                with contextlib.suppress(asyncio.CancelledError, Exception):
                     await t
-                except (asyncio.CancelledError, Exception):
-                    pass
 
             # 清理 pending_echo futures（避免 hang 在已断开的连接上）
             self._cleanup_pending_echo()
@@ -117,10 +123,8 @@ class NapCatAdapter(IMAdapter):
         self._running = False
         self._cleanup_pending_echo()
         if self._ws:
-            try:
+            with contextlib.suppress(Exception):
                 await self._ws.close()
-            except Exception:
-                pass
             self._ws = None
 
     def _cleanup_pending_echo(self) -> None:
@@ -131,13 +135,12 @@ class NapCatAdapter(IMAdapter):
 
     # ── 发送消息 ──
 
-    async def send(self, message: Any) -> None:
+    async def send(self, message: Any) -> bool:
         """通过 OneBot send_*_msg API 发消息。"""
-        from lingxi.core.protocol import OutboundMessage
 
         if not self._ws:
             log.warning("napcat_not_connected")
-            return
+            return False
 
         # channel → action + 目标 ID
         if message.channel == ChannelType.QQ_GROUP:
@@ -149,16 +152,16 @@ class NapCatAdapter(IMAdapter):
         elif message.channel in (ChannelType.WECHAT_GROUP, ChannelType.WECHAT_PRIVATE):
             # NapCat 不支持微信；返回并记录（避免 silence 失败）
             log.warning("napcat_cannot_send_wechat", channel=message.channel.value)
-            return
+            return False
         else:
             log.warning("napcat_unknown_channel", channel=message.channel.value)
-            return
+            return False
 
         # 检查 ID 是否有效
         target_id = params.get("user_id") or params.get("group_id")
         if target_id is None:
             log.warning("napcat_send_invalid_target", target=message.target_id)
-            return
+            return False
 
         # 结构化段 → OneBot 数组格式
         onebot_msg = [
@@ -170,7 +173,8 @@ class NapCatAdapter(IMAdapter):
         params["message"] = onebot_msg
         params["auto_escape"] = True
 
-        await self._api_call(action, params)
+        resp = await self._api_call(action, params)
+        return bool(resp) and resp.get("status") != "timeout"
 
     # ── 内部实现 ──
 
@@ -194,13 +198,15 @@ class NapCatAdapter(IMAdapter):
         if self._ws:
             try:
                 await self._ws.send(json.dumps(payload, ensure_ascii=False))
-            except Exception as e:
+            # aqg: top-level boundary — 发送失败必须清掉挂起的 echo future
+            # 再重抛，否则断连时 future 会永久挂起
+            except Exception:
                 self._pending_echo.pop(echo, None)
                 raise
 
         try:
             return await asyncio.wait_for(fut, timeout=30.0)
-        except asyncio.TimeoutError:
+        except TimeoutError:
             log.warning("api_timeout", action=action)
             return {"status": "timeout", "data": None}
         finally:
@@ -254,6 +260,8 @@ class NapCatAdapter(IMAdapter):
             except websockets.ConnectionClosed:
                 log.info("napcat_heartbeat_ws_closed")
                 break
+            # aqg: top-level boundary — 心跳是独立循环边界：心跳异常只结束心跳并
+            # 交还外层重连，不牵连收事件任务
             except Exception as e:
                 log.warning("napcat_heartbeat_error", error=str(e))
                 break

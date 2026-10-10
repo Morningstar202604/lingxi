@@ -1,7 +1,8 @@
 """Layer 5 测试：业务层（工单系统 + 队列 + 流水线 + Dashboard API）。"""
 from __future__ import annotations
 
-from unittest.mock import AsyncMock, MagicMock, patch
+from typing import Any
+from unittest.mock import AsyncMock, MagicMock
 
 import pytest
 from fastapi.testclient import TestClient
@@ -14,10 +15,9 @@ from lingxi.core.protocol import (
     MessageSegment,
     MessageType,
     PostType,
-    OutboundMessage,
 )
 from lingxi.flow.dashboard_api import create_dashboard_app
-from lingxi.flow.pipeline import CustomerServicePipeline, PipelineResult
+from lingxi.flow.pipeline import CustomerServicePipeline
 from lingxi.flow.queue import EscalationQueue
 from lingxi.flow.ticket import (
     Ticket,
@@ -26,7 +26,6 @@ from lingxi.flow.ticket import (
     TicketStore,
     classify_intent,
 )
-
 
 # ─────────────── classify_intent ───────────────
 

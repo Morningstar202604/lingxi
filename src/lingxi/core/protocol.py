@@ -1,11 +1,10 @@
 """OneBot v11 协议模型。涵盖消息段、事件、API 请求/响应。"""
 from __future__ import annotations
 
-from enum import Enum
-from typing import Any, Literal
+from enum import StrEnum
+from typing import Any
 
 from pydantic import BaseModel, Field
-
 
 # ── 消息段 ──
 
@@ -23,7 +22,7 @@ class MessageSegment(BaseModel):
     def text_content(self) -> str:
         """如果是 text 段，返回其文本内容。"""
         if self.type == "text":
-            return self.data.get("text", "")
+            return str(self.data.get("text", ""))
         return ""
 
     def is_at(self, qq: str | None = None) -> bool:
@@ -44,7 +43,7 @@ class MessageSegment(BaseModel):
 
 # ── 统一 IM 事件（独立于 NapCat/Gewechat 的实现差异）──
 
-class ChannelType(str, Enum):
+class ChannelType(StrEnum):
     """IM 渠道类型。"""
 
     QQ_PRIVATE = "qq_private"
@@ -53,7 +52,7 @@ class ChannelType(str, Enum):
     WECHAT_GROUP = "wechat_group"
 
 
-class PostType(str, Enum):
+class PostType(StrEnum):
     """OneBot 上报类型。"""
 
     MESSAGE = "message"
@@ -62,7 +61,7 @@ class PostType(str, Enum):
     META_EVENT = "meta_event"
 
 
-class MessageType(str, Enum):
+class MessageType(StrEnum):
     """消息类型。"""
 
     PRIVATE = "private"
@@ -129,7 +128,7 @@ class OutboundMessage(BaseModel):
     segments: list[MessageSegment] = Field(default_factory=list)
 
     @classmethod
-    def text(cls, channel: ChannelType, target_id: str, content: str) -> "OutboundMessage":
+    def text(cls, channel: ChannelType, target_id: str, content: str) -> OutboundMessage:
         return cls(
             channel=channel,
             target_id=target_id,

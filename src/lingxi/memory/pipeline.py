@@ -171,7 +171,7 @@ class MemoryPipeline:
         cutoff = datetime.now() - timedelta(days=days)
         aged = [
             m for m in self._memories.values()
-            if m.last_accessed < cutoff
+            if m.last_accessed <= cutoff
             and (user_id is None or m.user_id == user_id)
         ]
         for item in aged:

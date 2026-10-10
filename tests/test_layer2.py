@@ -4,19 +4,19 @@ from __future__ import annotations
 import pytest
 
 from lingxi.core import get_logger
-from lingxi.persona.schema import PersonaConfig, Identity, BehaviorRules, EmotionLevel, TurnStage
-from lingxi.persona.injector import PersonaInjector
 from lingxi.persona.guardrails import (
-    detect_injection,
-    InjectionVerdict,
-    classify_shell_command,
     PERM_AUTO,
-    PERM_HIGH_RISK,
     PERM_FORBIDDEN,
-    PermissionDenied,
+    PERM_HIGH_RISK,
+    InjectionVerdict,
+    PermissionDeniedError,
     check_permission,
+    classify_shell_command,
+    detect_injection,
     detect_role_override,
 )
+from lingxi.persona.injector import PersonaInjector
+from lingxi.persona.schema import EmotionLevel, Identity, PersonaConfig
 
 log = get_logger(__name__)
 
@@ -26,11 +26,11 @@ log = get_logger(__name__)
 class TestInjector:
     def test_basic_prompt_contains_identity(self) -> None:
         persona = PersonaConfig(
-            identity=Identity(name="灵犀", role="数字助理", speaking_style="简洁"),
+            identity=Identity(name="智犀", role="数字助理", speaking_style="简洁"),
         )
         injector = PersonaInjector(persona)
         prompt = injector.build_system_prompt()
-        assert "灵犀" in prompt
+        assert "智犀" in prompt
         assert "数字助理" in prompt
         assert "简洁" in prompt
 
@@ -133,5 +133,5 @@ class TestPermission:
         check_permission("test", current_level=2, required_level=1)  # 不抛
 
     def test_check_permission_fail(self) -> None:
-        with pytest.raises(PermissionDenied):
+        with pytest.raises(PermissionDeniedError):
             check_permission("test", current_level=1, required_level=2)

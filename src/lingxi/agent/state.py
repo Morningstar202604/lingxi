@@ -19,9 +19,7 @@
 """
 from __future__ import annotations
 
-from typing import Annotated, Any, Literal, TypedDict
-
-from typing_extensions import NotRequired
+from typing import Annotated, Any, Literal, NotRequired, TypedDict
 
 
 class ToolCall(TypedDict):
@@ -73,6 +71,7 @@ class AgentState(TypedDict):
     # ── 输出 ──
     final_reply: str
     escalate_reason: str
+    confidence: float
 
 
 __all__ = ["AgentState", "ToolCall", "ToolResult"]

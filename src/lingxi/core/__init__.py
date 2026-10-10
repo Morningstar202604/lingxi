@@ -3,8 +3,8 @@ from lingxi.core.logging import configure_logging, get_logger, get_trace_id, set
 from lingxi.core.protocol import (
     ChannelType,
     IMEvent,
-    MessageType,
     MessageSegment,
+    MessageType,
     OutboundMessage,
     PostType,
 )

@@ -25,4 +25,5 @@ __all__ = [
     "MemoryItem",
     "MemoryPipeline",
     "MemoryRecallResult",
+    "Relation",
 ]

@@ -19,14 +19,16 @@ from __future__ import annotations
 
 import asyncio
 import subprocess
-from typing import Any, Awaitable, Callable, Coroutine
+from typing import TYPE_CHECKING, Any
 
 from lingxi.core import get_logger
 from lingxi.persona.guardrails import (
-    PermissionLevel,
-    classify_shell_command,
     check_permission,
+    classify_shell_command,
 )
+
+if TYPE_CHECKING:
+    from collections.abc import Callable
 
 log = get_logger(__name__)
 
@@ -123,7 +125,7 @@ async def execute_tool(
         if cmd_level >= 4:
             return {"success": False, "observation": "命令被黑名单拦截，已拒绝执行。"}
         try:
-            check_permission(f"shell", current_permission, cmd_level)
+            check_permission("shell", current_permission, cmd_level)
         except Exception:
             return {"success": False, "observation": f"Shell 命令权限被拒绝（级别 {cmd_level}）"}
 
@@ -143,7 +145,7 @@ async def execute_tool(
         observation = str(result) if not isinstance(result, str) else result
         return {"success": True, "observation": observation}
 
-    except asyncio.TimeoutError:
+    except TimeoutError:
         return {"success": False, "observation": f"工具 '{tool_name}' 执行超时（{timeout}s）"}
     except Exception as e:
         log.exception("tool_error", tool=tool_name)
@@ -179,7 +181,7 @@ async def _knowledge_search_handler(query: str, user_id: str = "") -> str:
     if bridge is None:
         return "（知识库未配置，无法执行搜索）"
     try:
-        return await bridge(user_id=user_id, query=query)
+        return str(await bridge(user_id=user_id, query=query))
     except Exception as e:
         return f"知识库查询异常: {e}"
 

@@ -21,8 +21,7 @@ import time
 from dataclasses import dataclass, field
 from typing import Any
 
-from lingxi.flow.ticket import Ticket, TicketCategory, TicketStatus
-
+from lingxi.flow.ticket import Ticket, TicketCategory
 
 # 投诉 > 售后 > 咨询 > 其他
 _CATEGORY_PRIORITY: dict[TicketCategory, int] = {

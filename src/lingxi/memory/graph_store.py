@@ -15,7 +15,6 @@ from __future__ import annotations
 
 from abc import ABC, abstractmethod
 from dataclasses import dataclass, field
-from datetime import datetime
 
 
 @dataclass
@@ -33,7 +32,7 @@ class Relation:
 
     source_id: str
     target_id: str
-    rel_type: str  | None = None  # "KNOWS" | "BOUGHT" | "LOCATED_IN" | ...
+    rel_type: str | None = None  # "KNOWS" | "BOUGHT" | "LOCATED_IN" | ...
     properties: dict[str, str | int | float | bool] = field(default_factory=dict)
 
 
@@ -50,7 +49,7 @@ class GraphStore(ABC):
     def find_entity(self, entity_id: str) -> Entity | None: ...
 
     @abstractmethod
-    def search(self, label: str | None = None, **properties) -> list[Entity]: ...
+    def search(self, label: str | None = None, **properties: str | int | float | bool) -> list[Entity]: ...
 
     @abstractmethod
     def related(self, entity_id: str, rel_type: str | None = None) -> list[tuple[Relation, Entity]]: ...
@@ -76,7 +75,7 @@ class InMemoryGraphStore(GraphStore):
     def find_entity(self, entity_id: str) -> Entity | None:
         return self._entities.get(entity_id)
 
-    def search(self, label: str | None = None, **properties) -> list[Entity]:
+    def search(self, label: str | None = None, **properties: str | int | float | bool) -> list[Entity]:
         results: list[Entity] = []
         for ent in self._entities.values():
             if label and ent.label != label:

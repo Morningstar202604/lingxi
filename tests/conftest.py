@@ -14,17 +14,26 @@
 from __future__ import annotations
 
 import shutil
-from pathlib import Path
+from typing import TYPE_CHECKING
 
 import pytest
 
-from lingxi.config.settings import Settings, OneBotConfig, LLMConfig, MemoryConfig, AgentConfig, SecurityConfig
+if TYPE_CHECKING:
+    from pathlib import Path
+
+from lingxi.config.settings import (
+    AgentConfig,
+    LLMConfig,
+    MemoryConfig,
+    OneBotConfig,
+    SecurityConfig,
+    Settings,
+)
 
 
 @pytest.fixture(autouse=True)
 def _init_logging() -> None:
     """每个测试运行前初始化日志系统（仅控制台，DEBUG 级别）。"""
-    import structlog
     from lingxi.core.logging import configure_logging
 
     configure_logging(log_level="DEBUG")
