@@ -365,3 +365,83 @@ class TestPipeline:
         assert result.replied is True
         assert result.escalated is True
         assert "agent_timeout" in result.escalation_reason
+
+
+# ─────────────── 会话历史传递（回归锁：AUDIT-2026-10-10 #1） ───────────────
+
+
+class TestConversationHistory:
+    """pipeline 必须把工单里的历史对话传给 agent，否则推理层看不到上下文。"""
+
+    @staticmethod
+    def _event(text: str) -> IMEvent:
+        return IMEvent(
+            post_type=PostType.MESSAGE,
+            message_type=MessageType.PRIVATE,
+            channel=ChannelType.QQ_PRIVATE,
+            user_id="u1",
+            raw_message=text,
+            segments=[MessageSegment(type="text", data={"text": text})],
+        )
+
+    @pytest.mark.asyncio
+    async def test_agent_receives_full_conversation_history(self) -> None:
+        """第 2 轮传给 agent.run 的 messages 必须包含第 1 轮的问答。"""
+        agent = MagicMock(spec=ZhiXiAgent)
+        captured: list[dict[str, Any]] = []
+
+        async def _run(**kwargs: Any) -> dict[str, Any]:
+            captured.append(kwargs)
+            return {
+                "final_reply": "好的",
+                "tool_results": [],
+                "escalate_reason": "",
+                "step_count": 1,
+                "confidence": 0.9,
+            }
+
+        agent.run = _run
+        pipe = CustomerServicePipeline(
+            agent=agent,
+            ticket_store=TicketStore(),
+            escalation_queue=EscalationQueue(),
+            registry=_create_default_registry(),
+        )
+
+        await pipe.handle_event(self._event("我的订单号是 A123"), system_prompt="SP")
+        await pipe.handle_event(self._event("那它什么时候到？"), system_prompt="SP")
+
+        assert len(captured) == 2
+        msgs = captured[1].get("messages")
+        assert msgs, "pipeline 未向 agent 传 messages，第 2 轮推理看不到历史"
+        joined = " ".join(str(m.get("content", "")) for m in msgs)
+        assert "A123" in joined, "第 2 轮 messages 缺少第 1 轮内容"
+        assert "那它什么时候到？" in joined, "第 2 轮 messages 缺少当前轮消息"
+        assert msgs[0].get("role") == "system", "system prompt 必须是首条消息"
+
+    @pytest.mark.asyncio
+    async def test_history_is_capped_by_budget(self) -> None:
+        """超长历史必须按 context_char_budget 裁剪最近 N 轮，不能无界增长。"""
+        agent = MagicMock(spec=ZhiXiAgent)
+        captured: list[dict[str, Any]] = []
+
+        async def _run(**kwargs: Any) -> dict[str, Any]:
+            captured.append(kwargs)
+            return {"final_reply": "好", "tool_results": [], "escalate_reason": "",
+                    "step_count": 1, "confidence": 0.9}
+
+        agent.run = _run
+        pipe = CustomerServicePipeline(
+            agent=agent,
+            ticket_store=TicketStore(),
+            escalation_queue=EscalationQueue(),
+            registry=_create_default_registry(),
+        )
+
+        for i in range(30):
+            await pipe.handle_event(self._event(f"第{i}条消息" + "x" * 200),
+                                    system_prompt="SP")
+
+        msgs = captured[-1].get("messages") or []
+        total = sum(len(str(m.get("content", ""))) for m in msgs)
+        assert total <= 12000, f"历史未受预算约束，messages 总长 {total} 字符"

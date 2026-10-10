@@ -410,3 +410,81 @@ class TestPermissionHelpers:
 
     def test_classify_pip_is_medium(self) -> None:
         assert classify_shell_command("pip install foo", []) == 2
+
+
+# ─────────────── 多轮上下文（回归锁：AUDIT-2026-10-10 #1） ───────────────
+
+
+class TestMultiTurnContext:
+    """同一 thread 的多轮对话：历史必须对 LLM 可见，step_count 必须每轮归零。
+
+    缺陷背景：graph 每轮向 ainvoke 传完整 initial state，LangGraph 的 channel 语义下
+    - messages（LastValue）被 [system, 当前 user] 整段覆盖 -> 历史丢失
+    - step_count（add reducer）跨轮累加 -> 第 4 轮起 max_steps 恒触发，LLM 不再被调用
+    """
+
+    @staticmethod
+    def _llm_reply(text: str) -> MagicMock:
+        r = MagicMock()
+        r.choices[0].message.content = text
+        r.choices[0].message.tool_calls = None
+        return r
+
+    @pytest.mark.asyncio
+    async def test_agent_does_not_truncate_provided_history(self) -> None:
+        """agent 必须原样使用调用方传入的历史（pipeline 传，agent 不做隐式恢复）。
+
+        历史真源是 TicketStore.messages（见 flow/pipeline.py
+        _build_conversation_messages）。若 agent 改为从 checkpointer 隐式恢复，
+        会与 pipeline 传入的完整历史重复，故本测试锁定显式契约。
+        """
+        agent = ZhiXiAgent(registry=_create_default_registry(), max_steps=3)
+        seen: list[list[dict[str, Any]]] = []
+
+        async def _capture(*args: Any, **kwargs: Any) -> MagicMock:
+            seen.append(list(kwargs.get("messages") or args[1]))
+            return self._llm_reply("好的，我来帮你")
+
+        history = [
+            {"role": "system", "content": "SP"},
+            {"role": "user", "content": "我的订单号是 A123"},
+            {"role": "assistant", "content": "已为您查询订单 A123"},
+            {"role": "user", "content": "那它什么时候到？"},
+        ]
+        with patch("litellm.acompletion", new_callable=AsyncMock, side_effect=_capture):
+            await agent.run(raw_message="那它什么时候到？", chat_id="c1",
+                            user_id="u1", channel="qq_private", messages=history)
+
+        assert len(seen) == 1
+        joined = " ".join(str(m.get("content", "")) for m in seen[0])
+        assert "A123" in joined, "agent 截断了调用方传入的历史"
+        assert seen[0][0].get("role") == "system", "system prompt 必须在首位"
+
+    @pytest.mark.asyncio
+    async def test_step_count_resets_each_turn(self) -> None:
+        """长对话的后续轮次仍能正常调用 LLM（step_count 不跨轮累加）。"""
+        agent = ZhiXiAgent(registry=_create_default_registry(), max_steps=3)
+
+        with patch("litellm.acompletion", new_callable=AsyncMock,
+                   side_effect=lambda *a, **k: self._llm_reply("收到")) as mock:
+            counts = []
+            for turn in range(4):
+                res = await agent.run(raw_message=f"消息{turn}", chat_id="c1",
+                                      user_id="u1", channel="qq_private")
+                counts.append(res["step_count"])
+
+        assert mock.call_count == 4, f"LLM 只被调用 {mock.call_count} 次，第 4 轮已被降级"
+        assert counts[-1] <= 3, f"第 4 轮 step_count={counts[-1]} 超过 max_steps"
+
+    @pytest.mark.asyncio
+    async def test_react_loop_still_bounded(self) -> None:
+        """step_count 改为每轮归零后，图内自环仍必须受 max_steps 约束（防无限循环）。"""
+        agent = ZhiXiAgent(registry=_create_default_registry(), max_steps=3)
+
+        with patch("litellm.acompletion", new_callable=AsyncMock,
+                   side_effect=lambda *a, **k: self._llm_reply("...")) as mock:
+            res = await agent.run(raw_message="无解问题", chat_id="c2",
+                                  user_id="u1", channel="qq_private")
+
+        assert mock.call_count <= 3, f"LLM 被调用 {mock.call_count} 次，max_steps 未生效"
+        assert res["final_reply"] != ""

@@ -19,7 +19,7 @@
 """
 from __future__ import annotations
 
-from typing import Annotated, Any, Literal, NotRequired, TypedDict
+from typing import Any, Literal, NotRequired, TypedDict
 
 
 class ToolCall(TypedDict):
@@ -49,14 +49,18 @@ class AgentState(TypedDict):
     system_prompt: str  # PersonaInjector 生成的完整 system prompt
 
     # ── 上下文（reason 节点消费）──
-    memory_block: str  # 从 MemoryPipeline.recall() 渲染
-    lorebook_block: str  # 从 Lorebook.query() 渲染
+    memory_block: str  # 记忆块（由 PersonaInjector 拼进 system prompt，不由 reason 节点直读）
+    lorebook_block: str  # 世界观块（同上，注入 system prompt）
 
     # ── 消息历史（reason 节点消费 & 修改）──
     messages: list[dict[str, Any]]  # [{role, content, ...}, ...]
 
     # ── step 控制 ──
-    step_count: Annotated[int, lambda x, y: x + y]  # ReAct 循环步数
+    # 刻意不用 Annotated 累加器：LangGraph 的 add reducer 会跨 ainvoke 调用持续累加，
+    # 使第 N 轮的 step_count 叠加前 N-1 轮残留，会话很快触顶 max_steps 而永久降级
+    # （见 docs/AUDIT-2026-10-10.md #1）。改为 LastValue：每轮由调用方传 0 归零，
+    # 节点返回 state["step_count"] + 1 自增。
+    step_count: int  # 本轮 ReAct 步数（每轮归零）
     max_steps: int  # 步数上限
     stage: str  # opening / gathering / resolving / closing
     emotion: str  # calm / pleased / neutral / irritated / apologetic

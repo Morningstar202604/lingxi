@@ -80,7 +80,7 @@ async def reason_node(state: AgentState) -> dict[str, Any]:
             "next_step": "escalate",
             "escalate_reason": f"LLM 调用失败: {type(e).__name__}",
             "final_reply": "服务暂时不可用，请稍后再试。",
-            "step_count": 1,
+            "step_count": state["step_count"] + 1,
         }
 
     # 解析 LLM 输出
@@ -99,7 +99,7 @@ async def reason_node(state: AgentState) -> dict[str, Any]:
 
     update: dict[str, Any] = {
         "messages": [*state["messages"], {"role": "assistant", "content": content}],
-        "step_count": 1,
+        "step_count": state["step_count"] + 1,
         "confidence": confidence,
     }
 
@@ -187,7 +187,7 @@ async def execute_tool_node(
     """执行 pending_tool_call 中的工具调用。"""
     tool_call = state.get("pending_tool_call")
     if tool_call is None:
-        return {"next_step": "reason", "step_count": 1}
+        return {"next_step": "reason", "step_count": state["step_count"] + 1}
 
     tool_name = tool_call["tool_name"]
     arguments = tool_call.get("arguments", {})
@@ -224,7 +224,7 @@ async def execute_tool_node(
         "messages": [*state["messages"], tool_msg],
         "next_step": next_step,
         "escalate_reason": escalate_reason,
-        "step_count": 1,
+        "step_count": state["step_count"] + 1,
     }
 
 

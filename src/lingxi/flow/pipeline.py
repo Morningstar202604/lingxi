@@ -21,6 +21,7 @@ from dataclasses import dataclass
 from typing import TYPE_CHECKING, Any
 
 from lingxi.agent.tools import ToolRegistry, register_tool_bridge
+from lingxi.config import get_settings
 from lingxi.core import get_logger
 from lingxi.core.protocol import ChannelType, IMEvent, OutboundMessage
 from lingxi.flow.ticket import (
@@ -100,6 +101,44 @@ class CustomerServicePipeline:
             register_tool_bridge("knowledge_search", _bridge_search)
 
     @staticmethod
+    def _build_conversation_messages(
+        system_prompt: str,
+        ticket: Ticket,
+        budget_chars: int,
+    ) -> list[dict[str, Any]]:
+        """把工单消息历史渲染成 LLM 的 messages 列表。
+
+        Ticket.messages 是会话历史的业务真源（pipeline 每轮都在调 agent 前
+        `ticket.add_message("user", text)`，故末条即当前轮用户消息）。
+        若不传历史，agent 只能看到 system + 当前这条，用户一句"那它到哪了"
+        会因为没有指代对象而答非所问（见 docs/AUDIT-2026-10-10.md #1）。
+
+        超预算时从最新一轮往前裁剪，system prompt 永不丢弃（它是唯一的角色锚）。
+        """
+        messages: list[dict[str, Any]] = [
+            {"role": "system", "content": system_prompt}
+        ]
+        history = ticket.messages
+        kept: list[dict[str, Any]] = []
+        used = len(system_prompt)
+        for msg in reversed(history):
+            role = "assistant" if msg.role in ("agent", "agent_escalated") else "user"
+            entry = {"role": role, "content": msg.content}
+            if used + len(msg.content) > budget_chars:
+                break
+            kept.append(entry)
+            used += len(msg.content)
+        messages.extend(reversed(kept))
+        if len(kept) < len(history):
+            log.info(
+                "conversation_history_truncated",
+                ticket_id=ticket.ticket_id,
+                kept=len(kept),
+                total=len(history),
+            )
+        return messages
+
+    @staticmethod
     def _detect_channel(chat_id: str) -> ChannelType:
         """从 chat_id 前缀推断渠道。"""
         if "wxid" in str(chat_id) or "@chatroom" in str(chat_id):
@@ -157,10 +196,16 @@ class CustomerServicePipeline:
             except ValueError as e:
                 log.debug("ticket_transition_skipped", error=str(e))
 
-        # 记录用户消息
+        # 记录用户消息（此后 ticket.messages 末条即当前轮，见 _build_conversation_messages）
         ticket.add_message("user", text)
 
-        # 2. 调用 Agent
+        # 2. 调用 Agent（带上完整对话历史，否则多轮指代无从解析）
+        settings = get_settings()
+        history = self._build_conversation_messages(
+            system_prompt=system_prompt,
+            ticket=ticket,
+            budget_chars=settings.agent.context_char_budget,
+        )
         try:
             agent_result = await asyncio.wait_for(
                 self._agent.run(
@@ -170,6 +215,7 @@ class CustomerServicePipeline:
                     channel=event.channel,
                     system_prompt=system_prompt,
                     memory_block=memory_block,
+                    messages=history,
                 ),
                 timeout=self._max_agent_timeout,
             )

@@ -101,9 +101,12 @@ def build_default_engine() -> Engine:
             memory_block = memory.recall(
                 user_id=event.user_id, query=event.text,
             ).render_for_prompt()
+        # 记忆必须由 injector 拼进 system prompt：reason 节点不读 state.memory_block，
+        # 只把它写进 state 等于凭空消失（见 docs/AUDIT-2026-10-10.md #17）
+        system_prompt = injector.build_system_prompt(memory_block=memory_block)
         await pipeline.handle_event(
             event,
-            system_prompt=injector.build_system_prompt(),
+            system_prompt=system_prompt,
             memory_block=memory_block,
             send_func=_send,
             current_permission=_PERMISSION_LEVEL,
