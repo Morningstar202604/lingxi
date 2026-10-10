@@ -65,6 +65,20 @@ class MemoryRecallResult:
         for item in self.items:
             line = f"- {item.fact}（置信度 {item.confidence:.0%}）"
             if total + len(line) > max_chars:
+                # 旧实现 break：首条超预算 → 整块返回空串 →
+                # injector 的 if memory_block 判空 → 记忆凭空消失（无日志）。
+                # 现改为：先把超长条目截断塞进去（至少保留部分事实），
+                # 再 break —— 记忆"变小"而不是"消失"。
+                remaining = max_chars - total
+                if remaining > 20 and item.fact:
+                    fact = item.fact[: max(remaining - 12, 8)] + "…"
+                    parts.append(f"- {fact}（截断）")
+                log.info(
+                    "memory_block_truncated",
+                    memory_id=item.memory_id,
+                    kept=len(parts),
+                    total=len(self.items),
+                )
                 break
             parts.append(line)
             total += len(line)

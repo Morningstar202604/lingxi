@@ -88,17 +88,70 @@ class PersonaInjector:
                 f"emotion={emotion.value} stage={stage.value}"
             )
 
-        result = "\n\n".join(parts)
+        return self._fit_budget(parts)
 
-        if len(result) > self._max_chars:
-            log.warning(
-                "persona_overflow",
-                length=len(result),
-                max_chars=self._max_chars,
-            )
-            result = result[: self._max_chars]
+    def _fit_budget(self, parts: list[str]) -> str:
+        """把各段压进预算，但**永不裁剪硬约束段**（身份锚 / 安全护栏）。
 
-        return result
+        旧实现对拼接结果做尾截断，而护栏排在最后 → 配一份长 custom_prompts
+        就能把安全护栏整块切掉，"兜底拦截"变成"最先牺牲"
+        （见 docs/AUDIT-2026-10-10.md #9）。现改为按优先级丢弃可裁剪段：
+            硬约束（身份锚、护栏）→ 永远保留
+            可裁剪（自定义 prompt、时间戳、签名…）→ 按加入顺序从后往前丢
+        若硬约束本身仍超预算，则在**不破坏护栏**的前提下截断其中最长的一段。
+        """
+        protected = {self._render_identity(self._persona)}
+        if self._persona.modules.static_rules:
+            protected.add(self._render_guardrail(self._persona))
+
+        # join 用 "\n\n" 作分隔符，预算必须把它算进去，否则最终结果会超限
+        def _joined_len(items: list[str]) -> int:
+            return sum(len(p) for p in items) + 2 * max(len(items) - 1, 0)
+
+        total = _joined_len(parts)
+        if total <= self._max_chars:
+            return "\n\n".join(parts)
+
+        log.warning(
+            "persona_overflow",
+            length=total,
+            max_chars=self._max_chars,
+            segments=len(parts),
+        )
+
+        # 1) 先从后往前丢可裁剪段（保身份锚与护栏）
+        kept = list(parts)
+        for idx in range(len(kept) - 1, -1, -1):
+            if _joined_len(kept) <= self._max_chars:
+                break
+            if kept[idx] in protected:
+                continue
+            dropped = kept.pop(idx)
+            log.info("persona_segment_dropped", chars=len(dropped))
+
+        # 2) 仍超预算 → 优先截断最长的可裁剪段
+        overflow = _joined_len(kept) - self._max_chars
+        if overflow > 0:
+            for idx in range(len(kept) - 1, -1, -1):
+                if overflow <= 0:
+                    break
+                if kept[idx] in protected:
+                    continue
+                cut = min(overflow, len(kept[idx]))
+                kept[idx] = kept[idx][:-cut] if cut else kept[idx]
+                overflow -= cut
+
+        # 3) 硬约束本身就超预算（如 backstory 写满 5000 字而 max_chars=200）→
+        #    截断最长的硬约束段，保证输出永远收敛到预算内。
+        #    这是最后手段：正常配置下不会走到这里。
+        if overflow > 0 and kept:
+            longest = max(range(len(kept)), key=lambda i: len(kept[i]))
+            cut = min(overflow, max(len(kept[longest]) - 1, 0))
+            if cut > 0:
+                log.warning("persona_hard_constraint_truncated", chars=cut)
+                kept[longest] = kept[longest][:-cut]
+
+        return "\n\n".join(p for p in kept if p)
 
     # ── 渲染子块 ──
 

@@ -21,6 +21,8 @@ import pytest
 if TYPE_CHECKING:
     from pathlib import Path
 
+from pydantic import SecretStr
+
 from lingxi.config.settings import (
     AgentConfig,
     LLMConfig,
@@ -63,3 +65,29 @@ def test_settings(tmp_data_dir: Path) -> Settings:
         agent=AgentConfig(react_steps=2),
         security=SecurityConfig(permission_model="open"),
     )
+
+
+@pytest.fixture
+def admin_token_env(monkeypatch: pytest.MonkeyPatch) -> str:
+    """给 Dashboard API 注入非默认 admin_token，并让 get_settings 返回它。
+
+    Dashboard 现在对"未改默认 token"fail-closed（见 docs/AUDIT-2026-10-10.md #8），
+    故需要认证的测试必须显式配置凭据，而不是依赖默认值。
+    """
+    from lingxi.config.settings import get_settings
+
+    token = "test-admin-token-8f3a1c"
+    settings = get_settings()
+    monkeypatch.setattr(
+        settings.security,
+        "admin_token",
+        SecretStr(token),
+        raising=False,
+    )
+    return token
+
+
+@pytest.fixture
+def admin_headers(admin_token_env: str) -> dict[str, str]:
+    """带有效管理 token 的请求头。"""
+    return {"x-admin-token": admin_token_env}

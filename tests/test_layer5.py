@@ -215,7 +215,8 @@ class TestEscalationQueue:
 
 
 class TestDashboardAPI:
-    ADMIN_TOKEN = "change-me-in-production"
+    # 凭据由 conftest.admin_headers 注入（Dashboard 对默认 token 已 fail-closed，
+    # 见 docs/AUDIT-2026-10-10.md #8）
 
     @pytest.fixture()
     def client(self) -> TestClient:
@@ -229,33 +230,40 @@ class TestDashboardAPI:
         assert resp.status_code == 200
         assert resp.json()["status"] == "ok"
 
-    def test_summary_requires_auth(self, client: TestClient) -> None:
+    def test_summary_requires_auth(
+        self, client: TestClient, admin_headers: dict[str, str]
+    ) -> None:
+        """已配置凭据但请求未携带 token → 401（未授权）。
+
+        注意区分：未配置凭据时是 503（服务未就绪），
+        见 TestAdminAuthHardening::test_default_token_is_rejected_outside_debug。
+        """
         resp = client.get("/api/dashboard/summary")
         assert resp.status_code == 401
 
-    def test_summary_with_auth(self, client: TestClient) -> None:
-        resp = client.get("/api/dashboard/summary", headers={"x-admin-token": self.ADMIN_TOKEN})
+    def test_summary_with_auth(self, client: TestClient, admin_headers: dict[str, str]) -> None:
+        resp = client.get("/api/dashboard/summary", headers=admin_headers)
         assert resp.status_code == 200
         data = resp.json()
         assert "active_tickets" in data
         assert "queue" in data
 
-    def test_list_tickets(self, client: TestClient) -> None:
+    def test_list_tickets(self, client: TestClient, admin_headers: dict[str, str]) -> None:
         # 先创建一个工单
         store = TicketStore()
         store.get_or_create("c1", user_id="u1")
-        resp = client.get("/api/tickets", headers={"x-admin-token": self.ADMIN_TOKEN})
+        resp = client.get("/api/tickets", headers=admin_headers)
         assert resp.status_code == 200
         assert len(resp.json()) >= 0
 
-    def test_queue_endpoints_require_auth(self, client: TestClient) -> None:
+    def test_queue_endpoints_require_auth(self, client: TestClient, admin_headers: dict[str, str]) -> None:
         resp = client.get("/api/queue")
         assert resp.status_code == 401
 
-    def test_claim_empty_queue(self, client: TestClient) -> None:
+    def test_claim_empty_queue(self, client: TestClient, admin_headers: dict[str, str]) -> None:
         resp = client.post(
             "/api/queue/claim?agent_id=agent1",
-            headers={"x-admin-token": self.ADMIN_TOKEN},
+            headers=admin_headers,
         )
         assert resp.status_code == 404
 

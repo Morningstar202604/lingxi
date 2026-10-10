@@ -22,13 +22,24 @@ from typing import TYPE_CHECKING, Any
 from lingxi.agent.tools import ToolRegistry, execute_tool
 from lingxi.config import get_settings
 from lingxi.core import get_logger
-from lingxi.persona.guardrails import detect_role_override
+from lingxi.persona.guardrails import (
+    InjectionVerdict,
+    detect_injection,
+    detect_role_override,
+)
 
 if TYPE_CHECKING:
     from lingxi.agent.state import AgentState, ToolResult
     from lingxi.persona.guardrails import PermissionLevel
 
 log = get_logger(__name__)
+
+# execute_tool 在权限/黑名单拒绝时使用的前缀（execute_tool_node 据此判定 escalate）
+_PERMISSION_DENIED_PREFIXES = (
+    "权限不足",
+    "命令被黑名单拦截",
+    "Shell 命令权限被拒绝",
+)
 
 
 # ── 节点 1：reason（LLM 推理）──
@@ -40,13 +51,29 @@ async def reason_node(state: AgentState) -> dict[str, Any]:
     当直接给出 answer 时，next_step 设为 "respond"。
     """
     settings = get_settings()
-    # 防止 role override 攻击
+    # 防线 2：system 消息被篡改（多 system / 角色覆盖）
     if detect_role_override(state["messages"]):
         log.warning("role_override_detected", chat_id=state["chat_id"])
         return {
             "next_step": "escalate",
             "escalate_reason": "检测到 system 消息被篡改（可能的注入攻击）",
             "final_reply": "我无法继续处理这条消息，已转交人工审核。",
+        }
+
+    # 防线 3：用户文本注入检测。此处此前从未接入生产路径，
+    # 导致 guardrails.detect_injection 只是测试里的死代码（见 AUDIT-2026-10-10 #11）。
+    user_text = state.get("raw_message", "")
+    verdict, pattern = detect_injection(user_text)
+    if verdict == InjectionVerdict.BLOCK:
+        log.warning(
+            "prompt_injection_blocked",
+            chat_id=state["chat_id"],
+            pattern=pattern,
+        )
+        return {
+            "next_step": "escalate",
+            "escalate_reason": "injection_detected",
+            "final_reply": "这条消息包含我无法处理的内容，已转交人工处理。",
         }
 
     # 超出步数上限 → 友好的兜底回复（不直接 escalate，让 pipeline 的 confidence 机制决定）
@@ -190,7 +217,20 @@ async def execute_tool_node(
         return {"next_step": "reason", "step_count": state["step_count"] + 1}
 
     tool_name = tool_call["tool_name"]
-    arguments = tool_call.get("arguments", {})
+    arguments = dict(tool_call.get("arguments") or {})
+
+    # confidence 是控制流字段，不是工具入参 —— 必须剔除，
+    # 否则 handler(**arguments) 会因多余 kwarg 抛 TypeError（工具必失败）
+    arguments.pop("confidence", None)
+
+    # 受信任目标参数：由代码从 AgentState 注入，覆盖模型提供的同名字段。
+    # 模型无法据此向其他会话发消息 / 读他人记忆。
+    if tool_name == "send_message":
+        arguments.pop("chat_id", None)
+        arguments["current_chat_id"] = state["chat_id"]
+    elif tool_name == "knowledge_search":
+        arguments.pop("user_id", None)
+        arguments["current_user_id"] = state["user_id"]
 
     exec_result = await execute_tool(
         registry=registry,
@@ -211,12 +251,14 @@ async def execute_tool_node(
         "content": f"[Tool: {tool_name}]\n{exec_result['observation']}",
     }
 
-    # 权限不足 → 直接 escalate，不再让 LLM 继续
+    # 权限不足 / 命令被拒 → 直接 escalate，不再让 LLM 反复重试直到 max_steps
+    # 判据用结构化标记而非中文子串：observe_prefixes 里的文案都由 tools.py 统一前缀
     next_step = "reason"
     escalate_reason = ""
-    if not exec_result["success"] and "权限不足" in exec_result["observation"]:
+    observation = exec_result["observation"]
+    if not exec_result["success"] and observation.startswith(_PERMISSION_DENIED_PREFIXES):
         next_step = "escalate"
-        escalate_reason = f"工具 '{tool_name}' 权限不足"
+        escalate_reason = f"工具 '{tool_name}' 被拒绝：{observation}"
 
     return {
         "pending_tool_call": None,

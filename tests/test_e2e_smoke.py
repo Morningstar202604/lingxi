@@ -40,9 +40,6 @@ def app_client() -> TestClient:
     return TestClient(app)
 
 
-@pytest.fixture
-def admin_headers() -> dict[str, str]:
-    return {"x-admin-token": "change-me-in-production"}
 
 
 # ── E2E: Health → Ticket creation → Queue → Dashboard flow ──
@@ -255,3 +252,45 @@ class TestCrossLayerImports:
         queue = EscalationQueue()
         app = create_dashboard_app(store, queue)
         assert app is not None
+
+
+# ── 管理面认证加固（回归锁：AUDIT-2026-10-10 #8） ──
+
+
+class TestAdminAuthHardening:
+    """默认 token 不得成为可用凭据；错误 token 必须 401。"""
+
+    def test_default_token_is_rejected_outside_debug(
+        self, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        """非 debug 且仍用默认 token 时，管理接口 fail-closed（503）。"""
+        from lingxi.config.settings import get_settings
+
+        settings = get_settings()
+        monkeypatch.setattr(settings, "debug", False, raising=False)
+        client = TestClient(create_dashboard_app(TicketStore(), EscalationQueue()))
+
+        resp = client.get(
+            "/api/dashboard/summary",
+            headers={"x-admin-token": "change-me-in-production"},
+        )
+        assert resp.status_code == 503, resp.text
+        assert "ADMIN_TOKEN" in resp.json()["detail"]
+
+    def test_wrong_token_rejected(self, admin_headers: dict[str, str]) -> None:
+        client = TestClient(create_dashboard_app(TicketStore(), EscalationQueue()))
+        resp = client.get(
+            "/api/dashboard/summary",
+            headers={"x-admin-token": "wrong-token"},
+        )
+        assert resp.status_code == 401
+
+    def test_configured_token_accepted(self, admin_headers: dict[str, str]) -> None:
+        client = TestClient(create_dashboard_app(TicketStore(), EscalationQueue()))
+        resp = client.get("/api/dashboard/summary", headers=admin_headers)
+        assert resp.status_code == 200
+
+    def test_health_stays_public(self) -> None:
+        """健康检查不泄露也不需要凭据。"""
+        client = TestClient(create_dashboard_app(TicketStore(), EscalationQueue()))
+        assert client.get("/api/health").status_code == 200

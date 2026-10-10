@@ -2,16 +2,19 @@
 
 // ── Dashboard API client ──
 
-const ADMIN_TOKEN =
-  process.env.NEXT_PUBLIC_ADMIN_TOKEN || "change-me-in-production";
-const API_BASE =
-  process.env.NEXT_PUBLIC_API_BASE || "";
+// 安全：NEXT_PUBLIC_* 会被编译进客户端 bundle 下发给每个访客，
+// 绝不能内置管理凭据默认值。凭据必须由运维在登录后注入。
+const ADMIN_TOKEN = process.env.NEXT_PUBLIC_ADMIN_TOKEN || "";
+const API_BASE = process.env.NEXT_PUBLIC_API_BASE || "";
 
 function authHeaders(): HeadersInit {
-  return {
-    "x-admin-token": ADMIN_TOKEN,
-    "Content-Type": "application/json",
-  };
+  if (!ADMIN_TOKEN) {
+    throw new Error(
+      "未配置 NEXT_PUBLIC_ADMIN_TOKEN：请在 .env.local 设置后重启前端",
+    );
+  }
+  // 不带 Content-Type：GET 请求加 application/json 会触发 CORS 预检
+  return { "x-admin-token": ADMIN_TOKEN };
 }
 
 export interface DashboardSummary {

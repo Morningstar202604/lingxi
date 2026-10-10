@@ -19,12 +19,16 @@
 from __future__ import annotations
 
 import contextlib
+import secrets
 from typing import TYPE_CHECKING, Any
 
 from fastapi import FastAPI, Header, HTTPException
 
 from lingxi.config import get_settings
 from lingxi.flow.ticket import TicketStatus, TicketStore
+
+# 与 SecurityConfig.admin_token 的默认值一致，用于识别"未改配置"
+_DEFAULT_ADMIN_TOKEN = "change-me-in-production"
 
 if TYPE_CHECKING:
     from lingxi.flow.queue import EscalationQueue
@@ -38,10 +42,27 @@ def create_dashboard_app(
     app = FastAPI(title="智犀 (ZhiXi) Dashboard API", version="0.1.0")
 
     def _check_admin(x_admin_token: str | None = Header(None)) -> None:
-        """简易 token 认证（生产应使用 OAuth2 + JWT）。"""
+        """Dashboard 管理面认证。
+
+        安全约束（见 docs/AUDIT-2026-10-10.md #8）：
+        - 常量时间比较，避免时序侧信道（secrets.compare_digest）
+        - 未配置自定义 token 且非 debug 时 fail-closed：
+          默认值 "change-me-in-production" 不再是可用凭据，
+          否则任何未改配置��部署都等于把工单/认领/关闭公开出去
+        """
         settings = get_settings()
         expected = settings.security.admin_token.get_secret_value()
-        if x_admin_token != expected:
+
+        if expected == _DEFAULT_ADMIN_TOKEN and not settings.debug:
+            raise HTTPException(
+                status_code=503,
+                detail=(
+                    "Dashboard 未配置管理凭据：请设置 "
+                    "LINGXI_SECURITY__ADMIN_TOKEN 环境变量"
+                ),
+            )
+
+        if not x_admin_token or not secrets.compare_digest(x_admin_token, expected):
             raise HTTPException(status_code=401, detail="Unauthorized")
 
     @app.get("/api/health")

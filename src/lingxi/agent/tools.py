@@ -155,33 +155,46 @@ async def execute_tool(
 # ── 异步工具 handlers（通过 TOOL_BRIDGE 与 pipeline 通信）──
 
 
-async def _send_message_handler(chat_id: str, content: str) -> str:
+async def _send_message_handler(
+    content: str,
+    chat_id: str = "",
+    *,
+    current_chat_id: str = "",
+) -> str:
     """通过 TOOL_BRIDGE 发送消息到 IM 渠道。
 
-    如果 pipeline 已注册 send_message bridge，真正发送；
-    否则返回提示（LLM 知道该工具当前不可用）。
+    安全：目标会话由 execute_tool_node 从 AgentState 注入（current_chat_id），
+    模型既看不到该参数也无法覆盖 —— 对应 Semantic Kernel CVE-2026-25592
+    的根治方式 "Removed AI access"（详见 docs/AUDIT-2026-10-10.md #5）。
     """
+    target = current_chat_id or chat_id
+    if not target:
+        return "（无法确定目标会话，消息未发送）"
     bridge = TOOL_BRIDGE.get("send_message")
     if bridge is None:
-        return f"（消息发送器尚未配置，消息未实际发送）\n目标: {chat_id}\n内容: {content[:200]}"
+        return f"（消息发送器尚未配置，消息未实际发送）\n目标: {target}\n内容: {content[:200]}"
     try:
-        ok = await bridge(chat_id=chat_id, content=content)
-        return f"消息已发送到 {chat_id}" if ok else f"发送到 {chat_id} 失败"
+        ok = await bridge(chat_id=target, content=content)
+        return f"消息已发送到 {target}" if ok else f"发送到 {target} 失败"
     except Exception as e:
         return f"发送异常: {e}"
 
 
-async def _knowledge_search_handler(query: str, user_id: str = "") -> str:
-    """通过 TOOL_BRIDGE 查询知识库（MemoryPipeline + Lorebook 后端）。
+async def _knowledge_search_handler(
+    query: str,
+    *,
+    current_user_id: str = "",
+) -> str:
+    """通过 TOOL_BRIDGE 查询当前用户的记忆。
 
-    如果 pipeline 已注册 knowledge_memory bridge，真正查询；
-    否则返回兜底提示。
+    安全：user_id 由 execute_tool_node 从 AgentState 注入，模型不可指定，
+    避免跨用户读取他人记忆（见 docs/AUDIT-2026-10-10.md #5）。
     """
     bridge = TOOL_BRIDGE.get("knowledge_search")
     if bridge is None:
         return "（知识库未配置，无法执行搜索）"
     try:
-        return str(await bridge(user_id=user_id, query=query))
+        return str(await bridge(user_id=current_user_id, query=query))
     except Exception as e:
         return f"知识库查询异常: {e}"
 
@@ -218,14 +231,16 @@ def _create_default_registry(blocked_commands: list[str] | None = None) -> ToolR
 
     registry.register(ToolDefinition(
         name="send_message",
-        description="发送文本消息到指定聊天。需要 chat_id 和 content。",
+        description=(
+            "向**当前会话**发送文本消息。只提供 content；"
+            "目标会话由系统自动确定，无需也无法指定他人会话。"
+        ),
         input_schema={
             "type": "object",
             "properties": {
-                "chat_id": {"type": "string", "description": "目标聊天 ID"},
                 "content": {"type": "string", "description": "消息内容", "maxLength": 2000},
             },
-            "required": ["chat_id", "content"],
+            "required": ["content"],
         },
         required_permission=1,  # 写操作至少 LOW_RISK
         handler=_send_message_handler,
@@ -233,12 +248,14 @@ def _create_default_registry(blocked_commands: list[str] | None = None) -> ToolR
 
     registry.register(ToolDefinition(
         name="knowledge_search",
-        description="在知识库中搜索与 query 相关的条目。可传入 user_id 做个性化。",
+        description=(
+            "在当前用户的记忆中搜索与 query 相关的条目。"
+            "检索范围自动限定为当前会话用户。"
+        ),
         input_schema={
             "type": "object",
             "properties": {
                 "query": {"type": "string", "description": "搜索关键词或自然语言问题"},
-                "user_id": {"type": "string", "description": "用户 ID（可选，用于个性化）"},
             },
             "required": ["query"],
         },
