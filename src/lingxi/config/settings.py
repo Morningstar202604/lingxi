@@ -12,7 +12,7 @@
     - 不要在模块顶层调用 get_settings()，用依赖注入模式
     - lru_cache 的生命周期 = 进程生命周期，进程内单例够用
 """
-from functools import lru_cache
+from functools import cache
 from pathlib import Path
 from typing import Literal
 
@@ -20,13 +20,44 @@ from pydantic import BaseModel, Field, SecretStr, field_validator
 from pydantic_settings import BaseSettings, SettingsConfigDict
 
 
+class PostgresConfig(BaseModel):
+    """PostgreSQL 连接配置 (可选后端)。"""
+
+    dsn: SecretStr = SecretStr("postgresql://zhixi:zhixi@localhost:5432/zhixi")
+    pool_min: int = 2
+    pool_max: int = 10
+
+
+class PersistenceConfig(BaseModel):
+    """持久化后端选择配置。"""
+
+    backend: Literal["sqlite", "postgresql", "memory"] = "sqlite"
+    postgres: PostgresConfig = Field(default_factory=PostgresConfig)
+
+
 class OneBotConfig(BaseModel):
-    """OneBot v11 连接配置。"""
+    """OneBot v11 连接配置 (NapCat for QQ)。"""
 
     ws_url: str = "ws://127.0.0.1:3001"
     access_token: SecretStr | None = None
     reconnect_interval: float = 5.0
     heartbeat_interval: float = 30.0
+
+
+class GewechatConfig(BaseModel):
+    """Gewechat 微信适配配置。
+
+    Gewechat 通过 HTTP REST API 控微信，消息走 HTTP 回调推送。
+    需配合独立的 Gewechat 客户端运行在用户本机。
+    """
+
+    enabled: bool = False
+    api_base: str = "http://127.0.0.1:2531"
+    token: str = ""
+    app_id: str = ""
+    callback_path: str = "/api/gewechat/callback"
+    callback_token: SecretStr | None = None
+    verify_token: bool = False
 
 
 class LLMConfig(BaseModel):
@@ -38,6 +69,28 @@ class LLMConfig(BaseModel):
     base_url: str | None = None
     temperature: float = 0.2
     max_tokens: int = 1024
+
+
+class EmbeddingConfig(BaseModel):
+    """Embedding 向量配置 (用于 RAG 知识库)。"""
+
+    model: str = "text-embedding-3-small"
+    base_url: str | None = None
+    api_key: SecretStr | None = None
+    dimensions: int = 1536  # 首次 embedding 后自动覆盖
+    chunk_size: int = 500  # token
+    chunk_overlap: float = 0.1  # 10%
+
+
+class KnowledgeConfig(BaseModel):
+    """知识库 RAG 配置。"""
+
+    enabled: bool = True
+    persist_dir: str = "./data/chroma"
+    collection: str = "zhixi_default"
+    top_k: int = 5
+    score_threshold: float = 0.3
+    max_context_chars: int = 2000
 
 
 class MemoryConfig(BaseModel):
@@ -55,8 +108,11 @@ class MemoryConfig(BaseModel):
     embed_model: str = "text-embedding-3-small"
     recall_top_k: int = 5
 
-    # ── SQLite 持久化（LangGraph checkpointer + MemoryPipeline 存储）──
-    db_path: str = "data/zhixi_memory.db"
+    # ── SQLite 持久化（tickets / queue / memory 共享一张 DB 文件）──
+    # 相对于 settings.data_dir 解析（见 __main__.py 的 data_dir / db_path）。
+    # 此处不要再带 "data/" 前缀，否则会拼成 data/data/xxx.db。
+    db_path: str = "zhixi_memory.db"
+    persistent: bool = True  # 启用写通式持久化 (False 则纯内存, 用于测试)
 
     # ── Lorebook YAML 加载路径 ──
     lorebook_paths: list[str] = Field(default_factory=list)
@@ -86,6 +142,30 @@ class SecurityConfig(BaseModel):
     ])
 
 
+class AuthConfig(BaseModel):
+    """JWT RBAC 鉴权配置。"""
+
+    jwt_secret: str = "change-me-in-production-please-use-strong-secret"
+    jwt_algorithm: str = "HS256"
+    jwt_expire_minutes: int = 60
+    enabled: bool = False  # 默认不启用，按需开启
+
+
+class MetricsConfig(BaseModel):
+    """Prometheus 指标配置。"""
+
+    enabled: bool = True
+    path: str = "/metrics"
+
+
+class WebhookConfig(BaseModel):
+    """出站 Webhook 签名配置。"""
+
+    hmac_secret: SecretStr | None = None  # None 时不签名（兼容旧规则）
+    timeout: int = 5
+    max_retries: int = 2
+
+
 class Settings(BaseSettings):
     """智犀 (ZhiXi) 全局配置。
 
@@ -107,10 +187,17 @@ class Settings(BaseSettings):
     yaml_config_path: Path | None = None
 
     onebot: OneBotConfig = Field(default_factory=OneBotConfig)
+    gewechat: GewechatConfig = Field(default_factory=GewechatConfig)
     llm: LLMConfig = Field(default_factory=LLMConfig)
     memory: MemoryConfig = Field(default_factory=MemoryConfig)
     agent: AgentConfig = Field(default_factory=AgentConfig)
     security: SecurityConfig = Field(default_factory=SecurityConfig)
+    auth: AuthConfig = Field(default_factory=AuthConfig)
+    embedding: EmbeddingConfig = Field(default_factory=EmbeddingConfig)
+    knowledge: KnowledgeConfig = Field(default_factory=KnowledgeConfig)
+    metrics: MetricsConfig = Field(default_factory=MetricsConfig)
+    webhook: WebhookConfig = Field(default_factory=WebhookConfig)
+    persistence: PersistenceConfig = Field(default_factory=PersistenceConfig)
 
     @field_validator("data_dir", mode="before")
     @classmethod
@@ -120,7 +207,7 @@ class Settings(BaseSettings):
         return p
 
 
-@lru_cache(maxsize=1)
+@cache
 def get_settings() -> Settings:
-    """获取全局单例 Settings（lru_cache 保证只构造一次）。"""
+    """获取全局单例 Settings（@cache 保证只构造一次）。"""
     return Settings()

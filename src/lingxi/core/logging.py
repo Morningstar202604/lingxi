@@ -16,6 +16,7 @@ from __future__ import annotations
 import logging
 import sys
 import uuid
+from collections import deque
 from contextvars import ContextVar
 from functools import cache
 from typing import TYPE_CHECKING, Any
@@ -24,6 +25,42 @@ import structlog
 
 if TYPE_CHECKING:
     from structlog.typing import EventDict, Processor
+
+
+class MemoryLogHandler(logging.Handler):
+    """内存环形日志缓冲区（供 Dashboard /api/logs 读取）。
+
+    在 get_logger() 之前调用 configure_logging() 时附带此 handler，
+    前端 /API/logs 即可拿到最近 N 条结构化日志而不必落盘或对接 ELK。
+    """
+
+    def __init__(self, maxlen: int = 1000) -> None:
+        super().__init__()
+        self._records: deque[dict[str, Any]] = deque(maxlen=maxlen)
+
+    def emit(self, record: logging.LogRecord) -> None:
+        try:
+            entry: dict[str, Any] = {
+                "time": self.format(record),
+                "level": record.levelname,
+                "logger": record.name,
+                "msg": record.getMessage(),
+            }
+            self._records.append(entry)
+        except Exception:
+            self.handleError(record)
+
+    def recent(self, n: int = 200) -> list[dict[str, Any]]:
+        """返回最近 n 条日志（最新的排最后）。"""
+        items = list(self._records)[-n:]
+        return items
+
+    def clear(self) -> None:
+        self._records.clear()
+
+
+# 全局单例 — dashboard_api.py 直接 import 使用
+memory_handler = MemoryLogHandler(maxlen=1000)
 
 # ── trace_id 上下文变量（每个 asyncio task 独立）──
 trace_id_var: ContextVar[str | None] = ContextVar("trace_id", default=None)
@@ -43,18 +80,12 @@ def get_trace_id() -> str:
     return tid
 
 
-def _add_trace_id(logger: Any, method_name: str, event_dict: EventDict) -> EventDict:
+def _add_trace_id(logger: Any, method_name: str, event_dict: EventDict) -> EventDict:  # noqa: ARG001
     """structlog processor: 把 trace_id 自动加入每条日志。"""
     tid = trace_id_var.get()
     if tid:
         event_dict["trace_id"] = tid
     return event_dict
-
-
-def _render_to_stderr(logger: Any, method_name: str, event_dict: dict[str, Any]) -> None:
-    """Fallback processor — 当 structlog 未初始化时直接打到 stderr。"""
-    # 生产环境由 configure_logging() 覆盖
-    print(event_dict, file=sys.stderr)
 
 
 @cache
@@ -94,6 +125,9 @@ def configure_logging(log_level: str = "INFO", json_format: bool = False) -> Non
     root = logging.getLogger()
     root.handlers.clear()
     root.addHandler(handler)
+    # 把内存 handler 也接上，让 /api/logs 能读最近日志
+    memory_handler.setLevel(getattr(logging, log_level.upper(), logging.INFO))
+    root.addHandler(memory_handler)
     root.setLevel(getattr(logging, log_level.upper(), logging.INFO))
 
     # 把第三方库 logger 也接到 structlog

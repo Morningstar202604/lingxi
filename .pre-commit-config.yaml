@@ -1,0 +1,44 @@
+# 质量门禁的强制执行点。
+#
+# 此前 pyproject 的 dev extras 里声明了 pre-commit 但没有本文件，
+# 门禁只靠人工记忆，README 的「395 passed / mypy 0 error」因此失真过。
+#
+# 启用： pip install -e ".[dev]" && pre-commit install
+# 全量跑一次： pre-commit run --all-files
+#
+# 完整测试套件不放这里（每次 commit 跑 40s 太慢），见 README「质量门禁」。
+repos:
+  - repo: https://github.com/astral-sh/ruff-pre-commit
+    # rev 必须与 pyproject dev extras 里的 ruff 版本一致，否则同一个 lint 门禁
+    # 在本地和 hook 上给出不同结论（实测 0.7.0 报 3 处、0.16.8 报 0 处）。
+    rev: v0.16.8
+    hooks:
+      # 只挂 ruff lint（现行门禁）。刻意不挂 ruff-format：
+      # 实测 90 个文件里 84 个会被重写，说明它不是本仓库现行风格，
+      # 贸然启用会在首次提交炸出全库 diff。若要引入需单独一次全量格式化提交。
+      - id: ruff
+        args: [--fix]
+
+  - repo: local
+    hooks:
+      - id: mypy-strict
+        name: mypy --strict (src)
+        entry: python -m mypy src
+        language: system
+        files: ^src/.*\.py$
+        pass_filenames: false
+
+      # 防止把凭据提交上去（本项目已在 .git/config 泄露过一次 remote PAT）。
+      # 只匹配「不透明 token」形态：厂商前缀、长随机串、URL userinfo 里的 token。
+      # 注意：形如 postgresql://user:pass@host 的占位口令不在本规则内，
+      # 那类默认值由 Task#1（密钥 fail-closed）在 settings 层治理。
+      - id: no-hardcoded-secrets
+        name: block hardcoded credentials in src/tests/web
+        entry: >-
+          python -c "import re,sys;
+          pat=re.compile(r'(?:glpat-|ghp_|gho_|github_pat_|xox[baprs]-|AKIA[0-9A-Z]{16}|sk-[A-Za-z0-9]{20,}|//[^/@:\\s]{20,}@)');
+          bad=[(f,pat.search(open(f,encoding='utf-8',errors='ignore').read()).group(0)) for f in sys.argv[1:] if pat.search(open(f,encoding='utf-8',errors='ignore').read())];
+          [print('HARDCODED CREDENTIAL in %s -> %s' % b) for b in bad]; sys.exit(1 if bad else 0)"
+        language: system
+        files: ^(src|tests|web/(app|components|lib|scripts))/.*\.(py|ts|tsx|js|mjs)$
+        pass_filenames: true

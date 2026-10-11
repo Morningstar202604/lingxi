@@ -1,45 +1,92 @@
 """Node 5.4 — Dashboard API: FastAPI 后端接口，供 Next.js 控制台消费。
 
 🔗 工程逻辑
-    提供给监控面板的 RESTful API：
-    - /api/health — 健康检查
-    - /api/dashboard/summary — 实时概览（活跃工单数、队列长度、解决率）
-    - /api/tickets — 活跃工单列表
-    - /api/tickets/{id} — 单个工单详情（含消息历史）
-    - /api/queue — 升级队列状态
-    - /api/queue/claim — 坐席认领工单
-    - /api/queue/complete — 坐席完成工单
-    - /api/sessions/live — 当前活跃会话（WebSocket / SSE 占位）
+提供给监控面板的 RESTful API：
+- /api/health — 健康检查
+- /api/dashboard/summary — 实时概览（活跃工单数、队列长度、解决率）
+- /api/tickets — 活跃工单列表
+- /api/tickets/{id} — 单个工单详情（含消息历史）
+- /api/queue — 升级队列状态
+- /api/queue/claim — 坐席认领工单
+- /api/queue/complete — 坐席完成工单
+- /api/sessions — 当前活跃会话列表
+- /api/logs — 最近结构化日志（内存环）
+- /api/events — SSE 实时事件流 (升级/认领/关闭)
+- /api/sessions/{chat_id}/stream — SSE: 流式推送给定会话的 Agent 处理结果
+- /api/stream/chat — SSE: 发送消息并实时接收 Agent 回复流
 
 🤖 AI 避坑
-    - API 必须有认证（admin_token），绝不能暴露到公网无需鉴权
-    - 不要在 API 里做耗时操作，IO 请求用 async
-    - 坐席操作必须是原子的（避免多人同时认领同一工单）
+- API 必须有认证（admin_token），绝不能暴露到公网无需鉴权
+- 不要在 API 里做耗时操作，IO 请求用 async
+- 坐席操作必须是原子的（避免多人同时认领同一工单）
+- SSE 使用 sse_starlette（battle-tested, 纯 asyncio 无额外依赖）
+- Agent streaming 端点返回 EventSourceResponse 时必须由 Starlette 原生处理，
+  不能用 fastapi.responses.Response 包装（会破坏 SSE 长连接 chunked 传输）
 """
 from __future__ import annotations
 
+import asyncio
 import contextlib
+import json
 import secrets
-from typing import TYPE_CHECKING, Any
+from typing import Any
 
-from fastapi import FastAPI, Header, HTTPException
+from fastapi import FastAPI, Header, HTTPException, Request, Response
+from sse_starlette.sse import EventSourceResponse
 
 from lingxi.config import get_settings
-from lingxi.flow.ticket import TicketStatus, TicketStore
+from lingxi.core import get_logger
+from lingxi.core.logging import memory_handler
+from lingxi.flow.ticket import TicketStatus
+
+log = get_logger(__name__)
 
 # 与 SecurityConfig.admin_token 的默认值一致，用于识别"未改配置"
 _DEFAULT_ADMIN_TOKEN = "change-me-in-production"
 
-if TYPE_CHECKING:
-    from lingxi.flow.queue import EscalationQueue
-
 
 def create_dashboard_app(
-    ticket_store: TicketStore,
-    queue: EscalationQueue,
+    ticket_store: Any,  # TicketStore | PersistentTicketStore
+    queue: Any,  # EscalationQueue | PersistentEscalationQueue
+    knowledge_service: Any = None,  # KnowledgeService | None
+    sla_monitor: Any = None,  # SLAMonitor | None
+    rule_engine: Any = None,  # RuleEngine | None
+    audit_log: Any = None,  # AuditLog | None
+    summarizer: Any = None,  # SessionSummarizer | None
+    agent: Any = None,  # ZhiXiAgent | None — 用于 SSE 流式推理端点
+    auth_enabled: bool = False,  # 是否启用 JWT RBAC 鉴权
+    experiment_engine: Any = None,  # ExperimentEngine | None
 ) -> FastAPI:
     """创建 Dashboard FastAPI 应用。"""
-    app = FastAPI(title="智犀 (ZhiXi) Dashboard API", version="0.1.0")
+    app = FastAPI(title="智犀 (ZhiXi) Dashboard v0.2.0", version="0.2.0")
+
+    # ── Prometheus 中间件 (自动记录所有 HTTP 请求) ──
+    settings = get_settings()
+    if settings.metrics.enabled:
+        from lingxi.metrics.middleware import PrometheusMiddleware
+        app.add_middleware(PrometheusMiddleware)
+
+    # ── Prometheus /metrics 端点 ──
+    if settings.metrics.enabled:
+        from lingxi.metrics import get_metrics_collector
+        metrics_path = settings.metrics.path
+
+        @app.get(metrics_path)
+        async def prometheus_metrics() -> Response:
+            """Prometheus 指标抓取端点。"""
+            collector = get_metrics_collector()
+            data = collector.generate()
+            return Response(content=data, media_type="text/plain; version=0.0.4; charset=utf-8")
+
+    # ── 实验管理路由 (A/B Testing) ──
+    if experiment_engine is not None:
+        from lingxi.experiment import create_experiment_router
+        app.include_router(create_experiment_router(experiment_engine))
+
+    # ── 鉴权路由 (JWT RBAC) ──
+    if auth_enabled:
+        from lingxi.auth import create_auth_router
+        app.include_router(create_auth_router())
 
     def _check_admin(x_admin_token: str | None = Header(None)) -> None:
         """Dashboard 管理面认证。
@@ -106,7 +153,7 @@ def create_dashboard_app(
         ticket = ticket_store.get(ticket_id)
         if not ticket:
             raise HTTPException(status_code=404, detail="Ticket not found")
-        d = ticket.to_dict()
+        d: dict[str, Any] = ticket.to_dict()
         d["messages"] = [
             {
                 "role": m.role,
@@ -123,7 +170,8 @@ def create_dashboard_app(
         x_admin_token: str | None = Header(None),
     ) -> dict[str, Any]:
         _check_admin(x_admin_token)
-        return queue.snapshot()
+        snapshot: dict[str, Any] = queue.snapshot()
+        return snapshot
 
     @app.post("/api/queue/claim")
     async def claim_ticket(
@@ -155,6 +203,360 @@ def create_dashboard_app(
         with contextlib.suppress(ValueError):
             ticket.transition(TicketStatus.CLOSED)
         return {"ticket_id": ticket_id, "status": "completed"}
+
+    @app.get("/api/sessions")
+    async def list_sessions(
+        x_admin_token: str | None = Header(None),
+    ) -> list[dict[str, Any]]:
+        """当前活跃会话（含最近消息概要）。"""
+        _check_admin(x_admin_token)
+        tickets = ticket_store.list_active()
+        sessions: list[dict[str, Any]] = []
+        for t in tickets:
+            last_msg = t.messages[-1] if t.messages else None
+            sessions.append(
+                {
+                    "session_id": t.ticket_id,
+                    "chat_id": t.chat_id,
+                    "user_id": t.user_id,
+                    "channel": t.channel,
+                    "status": t.status.value,
+                    "message_count": t.message_count,
+                    "last_activity": t.updated_at,
+                    "last_message": (last_msg.content[:120] if last_msg else ""),
+                    "last_role": (last_msg.role if last_msg else ""),
+                }
+            )
+        # 最近活跃排前
+        sessions.sort(key=lambda s: s["last_activity"], reverse=True)
+        return sessions
+
+    # ── Knowledge 知识库 RAG (Phase 1) ──
+
+    if knowledge_service is not None:
+
+        @app.get("/api/knowledge/stats")
+        async def knowledge_stats(
+            x_admin_token: str | None = Header(None),
+        ) -> dict[str, Any]:
+            _check_admin(x_admin_token)
+            stats: dict[str, Any] = await knowledge_service.stats()
+            return stats
+
+        @app.get("/api/knowledge/docs")
+        async def list_knowledge_docs(
+            x_admin_token: str | None = Header(None),
+        ) -> list[dict[str, Any]]:
+            _check_admin(x_admin_token)
+            docs: list[dict[str, Any]] = await knowledge_service.list_documents()
+            return docs
+
+        @app.post("/api/knowledge/upload")
+        async def upload_knowledge(
+            body: dict[str, Any],
+            x_admin_token: str | None = Header(None),
+        ) -> dict[str, Any]:
+            _check_admin(x_admin_token)
+            content = body.get("content", "")
+            doc_id = body.get("doc_id", "")
+            source = body.get("source", "")
+            if not content:
+                raise HTTPException(status_code=400, detail="content is required")
+            result: dict[str, Any] = await knowledge_service.upload_document(
+                content, doc_id=doc_id, source=source,
+            )
+            return result
+
+        @app.post("/api/knowledge/recall")
+        async def recall_knowledge(
+            body: dict[str, Any],
+            x_admin_token: str | None = Header(None),
+        ) -> list[dict[str, Any]]:
+            _check_admin(x_admin_token)
+            query = body.get("query", "")
+            top_k = body.get("top_k", 5)
+            hits: list[dict[str, Any]] = await knowledge_service.recall(query, top_k=top_k)
+            return hits
+
+        @app.delete("/api/knowledge/docs/{doc_id}")
+        async def delete_knowledge_doc(
+            doc_id: str,
+            x_admin_token: str | None = Header(None),
+        ) -> dict[str, Any]:
+            _check_admin(x_admin_token)
+            count = await knowledge_service.delete_document(doc_id)
+            return {"deleted_chunks": count, "doc_id": doc_id}
+
+        @app.post("/api/knowledge/reset")
+        async def reset_knowledge(
+            x_admin_token: str | None = Header(None),
+        ) -> dict[str, str]:
+            _check_admin(x_admin_token)
+            await knowledge_service.reset()
+            return {"status": "ok"}
+
+    @app.get("/api/logs")
+    async def list_logs(
+        limit: int = 200,
+        x_admin_token: str | None = Header(None),
+    ) -> list[dict[str, Any]]:
+        """最近结构化日志（内存环，最近 N 条）。"""
+        _check_admin(x_admin_token)
+        return memory_handler.recent(min(limit, 1000))
+
+    @app.get("/api/events")
+    async def event_stream(
+        x_admin_token: str | None = Header(None),
+    ) -> EventSourceResponse:
+        """SSE 实时事件流: 升级/认领/关闭。
+
+        前端消费::
+
+            const src = new EventSource("/api/proxy/api/events", {
+                headers: {"x-admin-token": TOKEN}
+            });
+            src.addEventListener("escalated", (e) => {
+                const data = JSON.parse(e.data);
+                console.log("升级工单:", data.ticket_id);
+            });
+
+        sse_starlette 是 asyncio 原生 SSE 实现, 不依赖 Redis/broker,
+        适用于单节点多订阅场景。往 EventSourceResponse 传入一个 async
+        generator, 框架负责编码符合 W3C EventSource 规范的 SSE wire format。
+        """
+        _check_admin(x_admin_token)
+
+        async def _stream() -> Any:
+            q = queue.subscribe()
+            try:
+                # 先发送一条注释确认连接已建立 (代理/Nginx 会缓存, 注释会立刻刷出)
+                yield {"event": "connected", "data": json.dumps({"ts": asyncio.get_event_loop().time()})}
+                while True:
+                    try:
+                        msg = await asyncio.wait_for(q.get(), timeout=30.0)
+                        yield {"event": msg["event"], "data": json.dumps(msg["data"])}
+                    except TimeoutError:
+                        # 30s 无事件: 发心跳注释防 Nginx 代理断开
+                        yield {"event": "ping", "data": ""}
+            except asyncio.CancelledError:
+                pass
+            finally:
+                queue.unsubscribe(q)
+
+        return EventSourceResponse(_stream())
+
+    # ── SLA 监控 (Phase 2) ──
+
+    if sla_monitor is not None:
+
+        @app.get("/api/sla/status")
+        async def sla_status(
+            x_admin_token: str | None = Header(None),
+        ) -> dict[str, Any]:
+            """SLA 状态：活跃工单超时检查。"""
+            _check_admin(x_admin_token)
+            active = ticket_store.list_active()
+            results = sla_monitor.check_all(active)
+            from lingxi.flow.sla import format_sla_status
+            return {
+                "summary": format_sla_status(results),
+                "breaches": results,
+                "sla_config": sla_monitor.sla.model_dump(),
+            }
+
+    # ── 自动化规则引擎 (Phase 2) ──
+
+    if rule_engine is not None:
+
+        @app.get("/api/rules")
+        async def list_rules(
+            x_admin_token: str | None = Header(None),
+        ) -> list[dict[str, Any]]:
+            """列出所有规则。"""
+            _check_admin(x_admin_token)
+            rules: list[dict[str, Any]] = rule_engine.list_rules()
+            return rules
+
+        @app.post("/api/rules")
+        async def add_rule(
+            body: dict[str, Any],
+            x_admin_token: str | None = Header(None),
+        ) -> dict[str, Any]:
+            """添加新规则。"""
+            _check_admin(x_admin_token)
+            from lingxi.flow.rules import Rule
+            rule = Rule(**body)
+            rule_engine.add_rule(rule)
+            return {"status": "ok", "rule": rule.model_dump()}
+
+        @app.post("/api/rules/evaluate")
+        async def evaluate_rules(
+            body: dict[str, Any],
+            x_admin_token: str | None = Header(None),
+        ) -> dict[str, Any]:
+            """评估事件，返回匹配动作（不执行）。"""
+            _check_admin(x_admin_token)
+            event = body.get("event", {})
+            actions = rule_engine.evaluate(event)
+            return {"matched_actions": [a.model_dump() for a in actions]}
+
+        @app.delete("/api/rules/{name}")
+        async def delete_rule(
+            name: str,
+            x_admin_token: str | None = Header(None),
+        ) -> dict[str, Any]:
+            """按名称删除规则。"""
+            _check_admin(x_admin_token)
+            removed = rule_engine.remove_rule(name)
+            if not removed:
+                raise HTTPException(status_code=404, detail=f"Rule '{name}' not found")
+            return {"status": "deleted", "name": name}
+
+    # ── 审计日志 (Phase 3) ──
+
+    if audit_log is not None:
+
+        @app.get("/api/audit")
+        async def list_audit(
+            action: str = "",
+            actor: str = "",
+            limit: int = 100,
+            x_admin_token: str | None = Header(None),
+        ) -> list[dict[str, Any]]:
+            _check_admin(x_admin_token)
+            entries: list[dict[str, Any]] = audit_log.query(
+                action=action, actor=actor, limit=limit
+            )
+            return entries
+
+        @app.get("/api/audit/export")
+        async def export_audit(
+            x_admin_token: str | None = Header(None),
+        ) -> Response:
+            """导出审计日志为 JSON 文件。"""
+            _check_admin(x_admin_token)
+            entries = audit_log.query(limit=100000)
+            body = audit_log.export_json(entries)
+            return Response(
+                content=body,
+                media_type="application/json",
+                headers={
+                    "Content-Disposition": "attachment; filename=audit_log.json",
+                },
+            )
+
+    # ── 会话摘要 (Phase 2) ──
+
+    if summarizer is not None:
+
+        @app.post("/api/sessions/summarize")
+        async def summarize_session(
+            body: dict[str, Any],
+            x_admin_token: str | None = Header(None),
+        ) -> dict[str, Any]:
+            """对一组消息生成摘要。body: {"messages": [...]}"""
+            _check_admin(x_admin_token)
+            messages = body.get("messages", [])
+            if not isinstance(messages, list):
+                raise HTTPException(status_code=400, detail="messages must be a list")
+            if len(messages) < 2:
+                raise HTTPException(
+                    status_code=400,
+                    detail="messages too few to summarize (need at least 2)",
+                )
+            summary = await summarizer.summarize(messages)
+            return {"summary": summary}
+
+    # ── Agent SSE 流式推理 (Phase: streaming support) ──
+
+    if agent is not None:
+        from lingxi.streaming import stream_agent_events
+
+        @app.post("/api/stream/chat", response_class=EventSourceResponse)
+        async def stream_chat(
+            request: Request,
+            x_admin_token: str | None = Header(None),
+        ) -> EventSourceResponse:
+            """SSE: 发送消息并实时接收 Agent 回复流。
+
+            前端消费::
+
+                const res = await fetch("/api/proxy/api/stream/chat", {
+                    method: "POST",
+                    headers: {
+                        "Content-Type": "application/json",
+                        "x-admin-token": TOKEN
+                    },
+                    body: JSON.stringify({
+                        message: "我的订单到哪了",
+                        chat_id: "user_123",
+                        user_id: "user_123",
+                        channel: "qq_private",
+                        system_prompt: "你是客服助手..."
+                    })
+                });
+
+            注意: 此端点返回 SSE 流 (text/event-stream)，不能使用 fetch().json()，
+            应使用 EventSource 或 ReadableStream 逐行读取。
+            """
+            _check_admin(x_admin_token)
+            data = await request.json()
+            message = data.get("message", "").strip()
+            if not message:
+                raise HTTPException(status_code=400, detail="message is required")
+
+            chat_id = data.get("chat_id", "anonymous")
+            user_id = data.get("user_id", chat_id)
+            channel = data.get("channel", "qq_private")
+            system_prompt = data.get("system_prompt", "你是智犀 (ZhiXi) 客服助手。请回答用户问题。")
+
+            log.info("stream_chat_request", chat_id=chat_id, message_len=len(message))
+
+            return stream_agent_events(
+                agent=agent,
+                raw_message=message,
+                chat_id=chat_id,
+                user_id=user_id,
+                channel=channel,
+                system_prompt=system_prompt,
+            )
+
+        @app.get("/api/sessions/{chat_id}/stream")
+        async def stream_session(
+            chat_id: str,
+            x_admin_token: str | None = Header(None),
+            message: str = "",
+            user_id: str = "",
+            channel: str = "qq_private",
+            system_prompt: str = "",
+        ) -> EventSourceResponse:
+            """SSE: 实时流式推送给定 chat_id 的 Agent 处理结果。
+
+            与 POST /api/stream/chat 功能相同, 但以 GET 暴露 (方便 EventSource 直连)。
+
+            Query params:
+                message: 用户消息 (必填)
+                user_id: 用户 ID (默认 = chat_id)
+                channel: 渠道 (默认 qq_private)
+                system_prompt: 系统提示 (默认使用内置模板)
+            """
+            _check_admin(x_admin_token)
+            if not message:
+                raise HTTPException(status_code=400, detail="message query param is required")
+
+            effective_user_id = user_id or chat_id
+            effective_prompt = system_prompt or "你是智犀 (ZhiXi) 客服助手。请回答用户问题。"
+
+            log.info("stream_session_request", chat_id=chat_id, message_len=len(message))
+
+            return stream_agent_events(
+                agent=agent,
+                raw_message=message,
+                chat_id=chat_id,
+                user_id=effective_user_id,
+                channel=channel,
+                system_prompt=effective_prompt,
+            )
 
     return app
 

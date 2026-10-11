@@ -19,7 +19,7 @@
 """
 from __future__ import annotations
 
-from typing import Any, Literal, NotRequired, TypedDict
+from typing import Any, Literal, TypedDict
 
 
 class ToolCall(TypedDict):
@@ -35,7 +35,6 @@ class ToolResult(TypedDict):
     tool_name: str
     success: bool
     observation: str
-    used_fallback: NotRequired[bool]
 
 
 class AgentState(TypedDict):

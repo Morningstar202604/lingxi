@@ -16,6 +16,7 @@
 from __future__ import annotations
 
 import asyncio
+import contextlib
 from collections.abc import Callable, Coroutine
 from dataclasses import dataclass
 from typing import TYPE_CHECKING, Any
@@ -35,6 +36,7 @@ from lingxi.flow.ticket import (
 if TYPE_CHECKING:
     from lingxi.agent.graph import ZhiXiAgent
     from lingxi.flow.queue import EscalationQueue
+    from lingxi.memory.lorebook import Lorebook
     from lingxi.persona.guardrails import PermissionLevel
 
 log = get_logger(__name__)
@@ -70,6 +72,11 @@ class CustomerServicePipeline:
         max_agent_timeout: float = 45.0,
         memory_pipeline: Any = None,
         send_message_func: SendFunc | None = None,
+        lorebook: Lorebook | None = None,
+        knowledge: Any = None,
+        rule_engine: Any = None,  # RuleEngine | None
+        pii_guard: Any = None,  # PIIGuard | None
+        audit_log: Any = None,  # AuditLog | None
     ) -> None:
         self._agent = agent
         self._tickets = ticket_store
@@ -78,7 +85,17 @@ class CustomerServicePipeline:
         self._confidence_threshold = confidence_threshold
         self._max_agent_timeout = max_agent_timeout
         self._memory = memory_pipeline
+        self._lorebook = lorebook
+        self._knowledge = knowledge
         self._send_func = send_message_func
+        self._rule_engine = rule_engine
+        # Phase 2/3: PII 脱敏与审计
+        self._pii = pii_guard
+        self._audit = audit_log
+
+        # 并发会话限流：防止过多并发 Agent 调用耗尽 LLM quota / 内存
+        max_concurrent = get_settings().agent.max_concurrent_sessions
+        self._semaphore = asyncio.Semaphore(max_concurrent) if max_concurrent > 0 else None
 
         # 注册工具桥梁（让 Agent 内的 send_message / knowledge_search 真正生效）
         if send_message_func is not None:
@@ -140,18 +157,26 @@ class CustomerServicePipeline:
 
     @staticmethod
     def _detect_channel(chat_id: str) -> ChannelType:
-        """从 chat_id 前缀推断渠道。"""
-        if "wxid" in str(chat_id) or "@chatroom" in str(chat_id):
-            return ChannelType.WECHAT_GROUP if "@chatroom" in str(chat_id) else ChannelType.WECHAT_PRIVATE
-        return ChannelType.QQ_PRIVATE  # qq 默认私聊
+        """从 chat_id 推断渠道（基于 Gewechat wxid 格式特征）。
+
+        Gewechat wxid 格式：私聊以 "wxid_" 开头，群聊以 "@chatroom" 结尾。
+        QQ 号为纯数字，不匹配以上模式 → 默认 QQ_PRIVATE。
+        """
+        cid = str(chat_id)
+        if cid.endswith("@chatroom"):
+            return ChannelType.WECHAT_GROUP
+        if cid.startswith("wxid_"):
+            return ChannelType.WECHAT_PRIVATE
+        return ChannelType.QQ_PRIVATE
 
     async def handle_event(
         self,
         event: IMEvent,
         system_prompt: str,
         memory_block: str = "",
+        keyword_escalate_reason: str = "",
         send_func: SendFunc | None = None,
-        current_permission: PermissionLevel = 1,
+        current_permission: PermissionLevel = 1,  # noqa: ARG002
     ) -> PipelineResult:
         """处理一条 IM 事件（主入口）。"""
         text = event.text.strip()
@@ -181,6 +206,49 @@ class CustomerServicePipeline:
                     reply_text="收到您的消息，我需要看一下这个内容。",
                 )
 
+        # ── 规则引擎评估: escalate 命中则短路升级 ──
+        if self._rule_engine is not None:
+            rule_event: dict[str, Any] = {
+                "message": text,
+                "confidence": 1.0,
+                "ticket_status": "intake",
+                "channel": getattr(event.channel, "value", str(event.channel)),
+                "elapsed_seconds": 0,
+            }
+            rule_actions = self._rule_engine.evaluate(rule_event)
+            if any(a.action == "escalate" for a in rule_actions):
+                ticket = self._tickets.get_or_create(
+                    chat_id=event.chat_id,
+                    user_id=event.user_id,
+                    channel=event.channel,
+                )
+                ticket.category = classify_intent(text)
+                ticket.add_message("user", text)
+                log.info("rule_engine_escalation", rule_names=[a.action for a in rule_actions])
+                return await self._escalate_and_respond(
+                    ticket=ticket,
+                    reason="rule_engine_match",
+                    reply_text="已为您优先接入人工坐席，请稍候…",
+                    send_func=send_func,
+                )
+
+        # ── 关键词强制升级: 匹配则直接跳 agent, 短路升级 ──
+        if keyword_escalate_reason:
+            ticket = self._tickets.get_or_create(
+                chat_id=event.chat_id,
+                user_id=event.user_id,
+                channel=event.channel,
+            )
+            ticket.category = classify_intent(text)
+            ticket.add_message("user", text)
+            log.info("keyword_forced_escalation", reason=keyword_escalate_reason)
+            return await self._escalate_and_respond(
+                ticket=ticket,
+                reason=keyword_escalate_reason,
+                reply_text="已为您优先接入人工坐席，请稍候…",
+                send_func=send_func,
+            )
+
         # 1. 获取或创建票
         ticket = self._tickets.get_or_create(
             chat_id=event.chat_id,
@@ -197,28 +265,71 @@ class CustomerServicePipeline:
                 log.debug("ticket_transition_skipped", error=str(e))
 
         # 记录用户消息（此后 ticket.messages 末条即当前轮，见 _build_conversation_messages）
-        ticket.add_message("user", text)
+        # PII 脱敏: 写入 ticket 前先替换手机号/身份证/邮箱/银行卡
+        stored_text = self._pii.sanitize_input(text) if self._pii is not None else text
+        ticket.add_message("user", stored_text)
 
-        # 2. 调用 Agent（带上完整对话历史，否则多轮指代无从解析）
+        # 记忆编码：从对话中提取结构化事实（异步，失败静默降级）
+        if self._memory is not None and event.user_id and text:
+            import asyncio as _asyncio
+            _asyncio.create_task(
+                self._memory.encode_and_store(
+                    user_id=event.user_id,
+                    text=text,
+                    source=f"ticket:{ticket.ticket_id}",
+                ),
+            )
+
+        # 2. 调用 Agent（带上完整对话历史 + 记忆块 + 世界观块）
         settings = get_settings()
+        # PII 脱敏: system_prompt (含用户信息注入块) 送入 agent 前脱敏
+        safe_prompt = self._pii.sanitize_input(system_prompt) if self._pii is not None else system_prompt
         history = self._build_conversation_messages(
-            system_prompt=system_prompt,
+            system_prompt=safe_prompt,
             ticket=ticket,
             budget_chars=settings.agent.context_char_budget,
         )
+        # 关键词触发的世界观注入：Lorebook 按用户消息关键词匹配，
+        # 命中的条目内容作为额外上下文供 Agent 参考（如退货政策、发货时效等）
+        lorebook_block = ""
+        if self._lorebook is not None and event.text:
+            lorebook_block = self._lorebook.query(user_message=event.text)
+
+        # RAG 知识库召回: 用户消息相关 chunks → 注入 system prompt (citation 溯源)
+        knowledge_block = ""
+        if self._knowledge is not None and text:
+            try:
+                knowledge_block = await asyncio.wait_for(
+                    self._knowledge.build_context(text, top_k=5, max_chars=2000),
+                    timeout=8.0,
+                )
+            except (TimeoutError, Exception) as e:
+                log.warning("knowledge_recall_failed", error=str(e))
+
+        # 合并系统提示: 脱敏后的 system_prompt + lorebook + RAG knowledge
+        augmented_prompt = safe_prompt
+        if lorebook_block:
+            augmented_prompt += f"\n\n{lorebook_block}"
+        if knowledge_block:
+            augmented_prompt += f"\n\n{knowledge_block}"
+
         try:
-            agent_result = await asyncio.wait_for(
-                self._agent.run(
-                    raw_message=text,
-                    chat_id=event.chat_id,
-                    user_id=event.user_id,
-                    channel=event.channel,
-                    system_prompt=system_prompt,
-                    memory_block=memory_block,
-                    messages=history,
-                ),
-                timeout=self._max_agent_timeout,
-            )
+            # 并发限流：超限时等待而非直接拒绝，避免用户消息丢失
+            run_cm = self._semaphore if self._semaphore else contextlib.nullcontext()
+            async with run_cm:
+                agent_result = await asyncio.wait_for(
+                    self._agent.run(
+                        raw_message=text,
+                        chat_id=event.chat_id,
+                        user_id=event.user_id,
+                        channel=event.channel,
+                        system_prompt=augmented_prompt,
+                        memory_block=memory_block,
+                        lorebook_block=lorebook_block,
+                        messages=history,
+                    ),
+                    timeout=self._max_agent_timeout,
+                )
         except TimeoutError:
             log.warning("agent_timeout", chat_id=event.chat_id)
             return await self._escalate_and_respond(
@@ -228,7 +339,9 @@ class CustomerServicePipeline:
                 send_func=send_func,
             )
 
-        final_reply = agent_result.get("final_reply", "")
+        # PII 脱敏: Agent 回复送出前先脱敏
+        raw_reply = agent_result.get("final_reply", "")
+        final_reply = self._pii.sanitize_output(raw_reply) if self._pii is not None else raw_reply
         escalate_reason = agent_result.get("escalate_reason", "")
         confidence = float(agent_result.get("confidence", 0.0))
 
@@ -298,6 +411,14 @@ class CustomerServicePipeline:
 
         self._queue.enqueue(ticket, reason=reason)
 
+        # 审计日志: 升级事件 (fire-and-forget, 失败仅告警)
+        self._record_audit(
+            "ticket.escalated",
+            actor="agent",
+            target=ticket.ticket_id,
+            detail=reason,
+        )
+
         log.info("ticket_escalated", ticket_id=ticket.ticket_id, reason=reason)
 
         if send_func:
@@ -322,6 +443,16 @@ class CustomerServicePipeline:
             reply_text=reply_text,
             escalation_reason=reason,
         )
+
+
+    def _record_audit(self, action: str, actor: str, target: str = "", detail: str = "") -> None:
+        """fire-and-forget 写入审计日志 (失败仅 warning, 不阻塞主流程)。"""
+        if self._audit is None:
+            return
+        try:
+            self._audit.record(action=action, actor=actor, target=target, detail=detail)
+        except Exception as e:
+            log.warning("pipeline_audit_failed", action=action, error=str(e))
 
 
 __all__ = ["CustomerServicePipeline", "PipelineResult"]

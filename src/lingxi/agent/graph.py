@@ -9,7 +9,7 @@
 """
 from __future__ import annotations
 
-from functools import lru_cache, partial
+from functools import cache, partial
 from typing import Any
 
 from langgraph.checkpoint.memory import MemorySaver
@@ -174,7 +174,7 @@ def _create_default_checkpointer() -> Any:
     （pyproject 已锁定依赖）；未安装时优雅降级 MemorySaver（进程内有效）。
     """
     try:
-        from langgraph.checkpoint.sqlite.aio import AsyncSqliteSaver
+        from langgraph.checkpoint.sqlite.aio import AsyncSqliteSaver  # noqa: PLC0415
 
         db_path = get_settings().memory.db_path
         log.info("sqlite_checkpointer_enabled", db_path=db_path)
@@ -184,7 +184,7 @@ def _create_default_checkpointer() -> Any:
         return MemorySaver()
 
 
-@lru_cache(maxsize=1)
+@cache
 def get_agent(
     registry: ToolRegistry | None = None,
     permission_level: PermissionLevel = 1,

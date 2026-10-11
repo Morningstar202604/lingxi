@@ -178,7 +178,8 @@ def _parse_reason_output(content: str, tool_calls_raw: list[Any] | None) -> dict
     # 其次：文本中的 JSON 块
     text = content.strip()
     if text.startswith("```"):
-        text = text.split("\n", 1)[1] if "\n" in text else text
+        # 去掉首行 ``` 或 ```json；单行 fenced（```{"a":1}```）也正确处理
+        text = text.removeprefix("```json").removeprefix("```").removeprefix("\n")
         if text.endswith("```"):
             text = text[:-3]
     try:

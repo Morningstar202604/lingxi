@@ -177,6 +177,7 @@ class MemoryPipeline:
             item.confidence *= 0.5
             if item.confidence < 0.2:
                 item.status = "degraded"
+            log.debug("memory_contradicted", memory_id=memory_id, evidence=evidence[:200], new_confidence=item.confidence)
 
     # ── 遗忘 ──
 
@@ -203,6 +204,91 @@ class MemoryPipeline:
             m for m in self._memories.values()
             if m.user_id == user_id and m.status != "forgotten"
         ]
+
+    # ── 编码 (litellm 后端) ──
+
+    async def encode_and_store(
+        self,
+        user_id: str,
+        text: str,
+        *,
+        max_facts: int = 3,
+        source: str = "",
+    ) -> list[MemoryItem]:
+        """从一段对话中提取结构化事实并自动存储 (封装 store())。
+
+        使用 litellm.acompletion 做零代码 LLM 调用，与 agent/nodes.py
+        共用同一套 litellm 路由/鉴权配置 —— 不手搓 httpx, 不重复管理 key。
+        LiteLLM 已是本仓库核心依赖 (见 pyproject.toml)。
+
+        抽取失败时静默降级：不抛异常、不中断对话，只是本轮不产出新记忆。
+        """
+        import uuid as _uuid
+
+        facts = await self._llm_extract_facts(text, max_facts=max_facts)
+        items: list[MemoryItem] = []
+        for fact_text in facts:
+            item = MemoryItem(
+                memory_id=_uuid.uuid4().hex[:12],
+                user_id=user_id,
+                fact=fact_text.strip(),
+                source=source,
+            )
+            self.store(item)
+            items.append(item)
+        if items:
+            log.debug("memories_encoded", user_id=user_id, count=len(items))
+        return items
+
+    @staticmethod
+    async def _llm_extract_facts(text: str, max_facts: int = 3) -> list[str]:
+        """用 litellm 从自然语言中提取事实断言列表。
+
+        返回值: 每个元素是一条简短事实字符串, 如 "用户是素食主义者"。
+        失败 (无 key / 网络问题 / 解析异常) 返回空列表, 不抛异常。
+        """
+        import asyncio as _asyncio
+
+        from lingxi.config import get_settings
+        model = get_settings().llm.model
+
+        try:
+            import litellm
+        except ImportError:
+            return []
+
+        prompt = (
+            f"从以下对话中提取最多 {max_facts} 条用户相关的事实断言。每条事实应该:\n"
+            "- 简短陈述句, 不超过 30 字\n"
+            "- 关于用户偏好/历史/需求/约束的事实信息\n"
+            "- 只提取可以概括长期记忆的内容, 忽略寒暄和一次性操作\n"
+            "- 用中文返回, 每条一行, 不加编号\n\n"
+            f"对话内容:\n{text[:1000]}\n\n"
+            "事实列表:"
+        )
+        try:
+            resp = await _asyncio.wait_for(
+                litellm.acompletion(
+                    model=model,
+                    messages=[{"role": "user", "content": prompt}],
+                    max_tokens=200,
+                    temperature=0.0,
+                ),
+                timeout=8.0,
+            )
+            raw = resp.choices[0].message.content or ""
+        except Exception as e:
+            log.debug("memory_encode_failed", error=str(e))
+            return []
+
+        facts: list[str] = []
+        for line in raw.strip().split("\n"):
+            line = line.strip().lstrip("-•*0123456789.").strip()
+            if line and len(line) > 5:
+                facts.append(line)
+            if len(facts) >= max_facts:
+                break
+        return facts
 
     @property
     def total_memories(self) -> int:

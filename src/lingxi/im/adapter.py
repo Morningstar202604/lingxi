@@ -38,26 +38,10 @@ _CQ_UNESCAPE = [
     ("&amp;", "&"),
 ]
 
-# 转义映射（发送时使用）
-_CQ_ESCAPE = [
-    ("&", "&amp;"),
-    (",", "&#44;"),
-    ("[", "&#91;"),
-    ("]", "&#93;"),
-]
-
-
 def _cq_unescape(value: str) -> str:
     """CQ 码参数值反转义。"""
     for encoded, decoded in _CQ_UNESCAPE:
         value = value.replace(encoded, decoded)
-    return value
-
-
-def _cq_escape(value: str) -> str:
-    """CQ 码参数值转义。"""
-    for plain, escaped in _CQ_ESCAPE:
-        value = value.replace(plain, escaped)
     return value
 
 

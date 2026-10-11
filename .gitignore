@@ -22,8 +22,10 @@ data/
 *.db
 *.sqlite3
 
-# Testing
+# Testing & tooling caches
 .pytest_cache/
+.mypy_cache/
+.ruff_cache/
 htmlcov/
 .coverage
 coverage.xml

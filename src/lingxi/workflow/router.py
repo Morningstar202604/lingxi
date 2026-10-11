@@ -1,0 +1,176 @@
+"""Workflow DAG 可视化管理 API 路由。
+
+🔗 工程逻辑
+    提供四个 REST 端点:
+    - GET  /api/workflow/graph           → 默认 DAG 的 Mermaid code (plain text)
+    - GET  /api/workflow/graph/yaml      → 默认 DAG 的 YAML 定义
+    - POST /api/workflow/graph/validate  → 校验用户提交的 DAG (JSON body)
+    - POST /api/workflow/graph/preview   → 用户提交 YAML → 返回 Mermaid 预览
+
+    认证: admin_token header (与 dashboard_api 保持一致)
+
+🤖 AI 避坑
+    - /graph 返回 text/plain (不是 JSON)，让浏览器直接渲染
+    - validate 必须调用 validate_dag() 并返回结构化错误
+    - preview 不持久化 YAML，仅做即时转化
+"""
+from __future__ import annotations
+
+import secrets
+from typing import Any
+
+from fastapi import APIRouter, Header, HTTPException, Response
+
+from lingxi.config.settings import get_settings
+from lingxi.core.logging import get_logger
+from lingxi.workflow.builder import (
+    build_default_pipeline_dag,
+    from_yaml,
+    to_yaml,
+)
+from lingxi.workflow.mermaid import to_mermaid
+from lingxi.workflow.validator import validate_dag
+
+log = get_logger(__name__)
+
+# 与 SecurityConfig.admin_token 的默认值一致，用于识别"未改配置"
+_DEFAULT_ADMIN_TOKEN = "change-me-in-production"
+
+
+def create_workflow_router() -> APIRouter:
+    """工厂函数：创建并返回 workflow 路由。
+
+    用法::
+
+        from lingxi.workflow.router import create_workflow_router
+        app.include_router(create_workflow_router())
+    """
+    router = APIRouter(tags=["workflow"])
+
+    def _check_admin(x_admin_token: str | None = Header(None)) -> None:
+        """Dashboard 管理面认证 — 与 dashboard_api.py 保持一致的策略。"""
+        settings = get_settings()
+        expected = settings.security.admin_token.get_secret_value()
+
+        if expected == _DEFAULT_ADMIN_TOKEN and not settings.debug:
+            raise HTTPException(
+                status_code=503,
+                detail=(
+                    "Dashboard 未配置管理凭据：请设置 "
+                    "LINGXI_SECURITY__ADMIN_TOKEN 环境变量"
+                ),
+            )
+
+        if not x_admin_token or not secrets.compare_digest(x_admin_token, expected):
+            raise HTTPException(status_code=401, detail="Unauthorized")
+
+    @router.get("/graph")
+    async def get_graph(
+        x_admin_token: str | None = Header(None),
+    ) -> Response:
+        """返回默认 DAG 的 Mermaid 流程图代码。
+
+        可直接粘贴到 mermaid.live / Notion / GitHub Markdown 渲染。
+        """
+        _check_admin(x_admin_token)
+        dag = build_default_pipeline_dag()
+        mermaid_code = to_mermaid(dag, title=dag.name)
+        return Response(
+            content=mermaid_code,
+            media_type="text/plain; charset=utf-8",
+        )
+
+    @router.get("/graph/yaml")
+    async def get_graph_yaml(
+        x_admin_token: str | None = Header(None),
+    ) -> Response:
+        """返回默认 DAG 的 YAML 定义。
+
+        用户可下载 → 修改 → POST /validate 校验 → POST /preview 预览。
+        """
+        _check_admin(x_admin_token)
+        dag = build_default_pipeline_dag()
+        yaml_content = to_yaml(dag)
+        return Response(
+            content=yaml_content,
+            media_type="application/x-yaml; charset=utf-8",
+        )
+
+    @router.post("/graph/validate")
+    async def post_validate(
+        body: dict[str, Any],
+        x_admin_token: str | None = Header(None),
+    ) -> dict[str, Any]:
+        """校验用户提交的 DAG (JSON body)。
+
+        请求体是 WorkflowDAG 的 JSON 格式。
+        返回 {"valid": true} 或 {"valid": false, "errors": [...]}。
+        """
+        _check_admin(x_admin_token)
+        try:
+            from lingxi.workflow.models import WorkflowDAG
+
+            dag = WorkflowDAG(**body)
+        except Exception as e:
+            raise HTTPException(
+                status_code=422,
+                detail=f"DAG 格式错误: {e}",
+            ) from e
+
+        errors = validate_dag(dag)
+        return {
+            "valid": len(errors) == 0,
+            "errors": errors,
+            "node_count": len(dag.nodes),
+            "edge_count": len(dag.edges),
+            "entry_nodes": dag.entry_nodes(),
+            "exit_nodes": dag.exit_nodes(),
+        }
+
+    @router.post("/graph/preview")
+    async def post_preview(
+        body: dict[str, Any],
+        x_admin_token: str | None = Header(None),
+    ) -> Response:
+        """用户提交 YAML → 校验 → 返回 Mermaid 预览。
+
+        请求体: {"yaml": "..."}
+        """
+        _check_admin(x_admin_token)
+
+        yaml_str = body.get("yaml", "")
+        if not yaml_str:
+            raise HTTPException(
+                status_code=422,
+                detail="缺少 'yaml' 字段",
+            )
+
+        try:
+            dag = from_yaml(yaml_str)
+        except Exception as e:
+            raise HTTPException(
+                status_code=422,
+                detail=f"YAML 解析失败: {e}",
+            ) from e
+
+        errors = validate_dag(dag)
+        if errors:
+            raise HTTPException(
+                status_code=422,
+                detail=f"DAG 校验失败: {errors}",
+            )
+
+        mermaid_code = to_mermaid(dag, title=dag.name)
+        return Response(
+            content=mermaid_code,
+            media_type="text/plain; charset=utf-8",
+        )
+
+    return router
+
+
+# 默认导出一个可直接 include 的 router 实例
+# (向后兼容，不需要传参的场景)
+router = create_workflow_router()
+
+__all__ = ["create_workflow_router", "router"]

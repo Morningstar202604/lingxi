@@ -19,10 +19,11 @@
 """
 from __future__ import annotations
 
+import contextlib
 from datetime import datetime
 
 from lingxi.core import get_logger
-from lingxi.persona.schema import EmotionLevel, PersonaConfig, TurnStage
+from lingxi.persona.schema import EmotionLevel, KeywordRule, PersonaConfig, TurnStage
 
 log = get_logger(__name__)
 
@@ -42,11 +43,23 @@ class PersonaInjector:
         current_time: datetime | None = None,
         extra_context: str = "",
         memory_block: str = "",
+        lorebook_block: str = "",
+        user_message: str = "",
     ) -> str:
         """构建完整的 system prompt."""
         parts: list[str] = []
         p = self._persona
         m = p.modules
+
+        # ── 0. 关键词触发规则 (KeywordRule) ──
+        keyword_result = self._evaluate_keywords(user_message, p.keyword_rules) if m.keyword_triggers and user_message else None
+        if keyword_result is not None:
+            keyword_action, keyword_payload = keyword_result
+            if keyword_action == "inject_prompt" and keyword_payload:
+                parts.append(f"[关键词触发的上下文]\n{keyword_payload}")
+            elif keyword_action == "switch_emotion" and keyword_payload:
+                with contextlib.suppress(ValueError):
+                    emotion = EmotionLevel(keyword_payload)
 
         # ── 1. 身份锚（不可覆盖）──
         parts.append(self._render_identity(p))
@@ -63,6 +76,10 @@ class PersonaInjector:
             parts.append(f"[当前情绪基调: {self._emotion_desc(emotion)}]")
         if m.memory_injection and memory_block:
             parts.append(f"[用户记忆]\n{memory_block}")
+
+        # 世界观块（Lorebook 关键词触发）：仅在有时注入，避免空块撑大 prompt
+        if lorebook_block:
+            parts.append(f"[世界观 / 业务规则]\n{lorebook_block}")
 
         # ── 自定义注入 ──
         if p.custom_prompts:
@@ -205,6 +222,37 @@ class PersonaInjector:
             TurnStage.RESOLVING: "解决问题，已掌握足够信息开始行动",
             TurnStage.CLOSING: "收尾确认，验证用户满意度",
         }[stage]
+
+    @staticmethod
+    def _evaluate_keywords(
+        user_message: str,
+        rules: list[KeywordRule] | None = None,
+    ) -> tuple[str, str] | None:
+        """匹配用户消息中的关键词规则, 返回 (action, payload) 或 None。
+
+        匹配逻辑: 精确子串匹配 (中文友好)。多条命中时返回 priority 最高的规则。
+        action 支持:
+          - inject_prompt: payload 作为额外上下文注入 system prompt
+          - switch_emotion: payload 指定 EmotionLevel 值, 切换回复情绪
+          - escalate: payload 作为升级原因, 由 pipeline 处理
+        """
+        if not rules or not user_message:
+            return None
+        text = user_message.lower()
+        matched: list[tuple[int, KeywordRule]] = []
+        for rule in rules:
+            if any(kw.lower() in text for kw in rule.keywords):
+                matched.append((rule.priority, rule))
+
+        if not matched:
+            return None
+        # priority 最高的规则胜出
+        matched.sort(key=lambda x: x[0], reverse=True)
+        best = matched[0][1]
+        if best.action == "escalate":
+            # escalate 不在这里处理, 返回特殊标记让 pipeline 识别
+            return ("escalate", best.payload or "keyword_escalation")
+        return (best.action, best.payload)
 
     @staticmethod
     def _emotion_desc(emotion: EmotionLevel) -> str:

@@ -329,7 +329,8 @@ class TestDefaultCheckpointer:
     @pytest.mark.asyncio
     async def test_sqlite_persistence_when_package_available(self) -> None:
         """配套包已装 → 工厂返回的 async CM 进入后必须是 AsyncSqliteSaver。"""
-        from langgraph.checkpoint.sqlite.aio import AsyncSqliteSaver
+        sqlite_aio = pytest.importorskip("langgraph.checkpoint.sqlite.aio")
+        AsyncSqliteSaver = sqlite_aio.AsyncSqliteSaver  # noqa: N806
 
         cp = _create_default_checkpointer()
         saver = await cp.__aenter__()

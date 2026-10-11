@@ -5,10 +5,12 @@ from typing import Any
 from unittest.mock import AsyncMock, MagicMock
 
 import pytest
+from fastapi import FastAPI
 from fastapi.testclient import TestClient
 
 from lingxi.agent.graph import ZhiXiAgent
 from lingxi.agent.tools import _create_default_registry
+from lingxi.config import get_settings
 from lingxi.core.protocol import (
     ChannelType,
     IMEvent,
@@ -453,3 +455,55 @@ class TestConversationHistory:
         msgs = captured[-1].get("messages") or []
         total = sum(len(str(m.get("content", ""))) for m in msgs)
         assert total <= 12000, f"历史未受预算约束，messages 总长 {total} 字符"
+
+
+# ─────────────── Dashboard 服务化 + 契约对齐（回归锁：AUDIT #2 #3 #27 #26） ───────────────
+
+
+class TestDashboardServing:
+    """Dashboard 必须能被真实启动（此前 uvicorn 零引用，只能在测试里 TestClient）。"""
+
+    def test_engine_exposes_dashboard_app(self) -> None:
+        from lingxi.__main__ import build_default_engine
+
+        engine = build_default_engine()
+        app = engine.dashboard_app()
+        assert isinstance(app, FastAPI)
+        # app 必须共享 engine 的存储（否则前端看到的是另一个空实例）
+        routes = {r.path for r in app.routes}
+        assert "/api/dashboard/summary" in routes
+        assert "/api/tickets" in routes
+        assert "/api/queue" in routes
+
+    def test_ticket_list_sorted_by_recent_activity(self) -> None:
+        """/api/tickets 必须按 updated_at 降序（前端 slice(0,10) 取的是"最近"）。"""
+        store = TicketStore()
+        old = store.get_or_create("old_chat", user_id="u1")
+        old.transition(TicketStatus.PROCESSING)
+        new = store.get_or_create("new_chat", user_id="u2")
+        new.transition(TicketStatus.PROCESSING)
+        old.updated_at = 1.0        # 明确早于 new
+        new.updated_at = 9999.0
+
+        client = TestClient(create_dashboard_app(store, EscalationQueue()))
+        resp = client.get(
+            "/api/tickets",
+            headers={"x-admin-token": get_settings().security.admin_token.get_secret_value()},
+        )
+        assert resp.status_code in (200, 503), resp.text
+        if resp.status_code == 200:
+            ids = [t["chat_id"] for t in resp.json()]
+            assert ids.index("new_chat") < ids.index("old_chat"), f"未按活跃度排序: {ids}"
+
+    def test_queue_claim_contract_status_codes(self) -> None:
+        """空队列必须 404（前端按此返回 null），鉴权失败必须 401。"""
+        client = TestClient(create_dashboard_app(TicketStore(), EscalationQueue()))
+        token = get_settings().security.admin_token.get_secret_value()
+
+        unauth = client.post("/api/queue/claim?agent_id=a1")
+        assert unauth.status_code in (401, 503)
+
+        empty = client.post(
+            "/api/queue/claim?agent_id=a1", headers={"x-admin-token": token}
+        )
+        assert empty.status_code in (404, 503), empty.text

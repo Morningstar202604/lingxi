@@ -44,10 +44,10 @@
 from __future__ import annotations
 
 import asyncio
+import secrets
 from typing import TYPE_CHECKING, Any
 
 import httpx
-from pydantic import BaseModel
 
 from lingxi.core import get_logger
 from lingxi.core.protocol import (
@@ -71,23 +71,6 @@ _GW_MSG_VOICE = 34
 _GW_MSG_EMOJI = 47
 _GW_MSG_CARD = 49
 _GW_MSG_SYSTEM = 10002
-
-
-class GewechatMessage(BaseModel):
-    """Gewechat 回调中 data 字段的内部表示（仅作参考，实际在 handle_callback 中直接 dict 取值）。"""
-
-    model_config = {"extra": "allow"}  # 兼容 Pydantic v2
-
-    new_msg_id: int = 0
-    from_user: str = ""
-    to_user: str = ""
-    msg_type: int = 0
-    content: str = ""
-    at_list: list[str] = []
-    to_wxid: str = ""
-    timestamp: int = 0
-    group_name: str = ""
-    from_user_name: str = ""
 
 
 class GewechatAdapter(IMAdapter):
@@ -182,16 +165,34 @@ class GewechatAdapter(IMAdapter):
             log.exception("gewechat_http_error", error=str(e))
             return False
 
-    async def handle_callback(self, payload: dict[str, Any]) -> None:
+    async def handle_callback(self, payload: dict[str, Any], callback_token: str | None = None) -> None:
         """处理 Gewechat 的 HTTP POST 回调。
 
         在 FastAPI 路由中调用这个函数::
 
             @app.post("/api/gewechat/callback")
-            async def gewechat_webhook(data: dict):
-                await adapter.handle_callback({"data": data})
+            async def gewechat_webhook(
+                data: dict,
+                x_gewe_token: str | None = Header(None),
+            ):
+                await adapter.handle_callback(
+                    {"data": data},
+                    callback_token=x_gewe_token,
+                )
                 return {"ret": 0}
+
+        Args:
+            payload: Gewechat POST body（包含 data 字段）
+            callback_token: 从请求头 X-GEWE-TOKEN 传入的令牌，
+                用于验签。为 None 时跳过验证（仅开发模式）。
         """
+        # Token 验签：生产环境必须校验，否则任何人可伪造消息注入
+        if self._token and callback_token is not None and not secrets.compare_digest(
+            callback_token, self._token,
+        ):
+            log.warning("gewechat_callback_token_mismatch")
+            return
+
         # Gewechat 的 POST body 最外层是 data 字段
         data = payload.get("data") or payload
         if not data:
@@ -200,6 +201,28 @@ class GewechatAdapter(IMAdapter):
         event = self._to_im_event(data)
         if event is not None:
             await self._dispatch(event)
+
+    def get_callback_route(self) -> dict[str, Any]:
+        """返回 FastAPI 路由注册信息（供 Dashboard Engine 自动挂载）。
+
+        Gewechat 是 HTTP 回调模式：微信服务器 POST 到我们的端口，
+        不需要 WebSocket 长连接。路由注册到 Dashboard FastAPI 即可。
+        """
+        from fastapi import Header
+
+        _self = self
+
+        async def _handler(
+            data: dict[str, Any],
+            x_gewe_token: str | None = Header(None),  # noqa: N803
+        ) -> dict[str, Any]:
+            await _self.handle_callback({"data": data}, callback_token=x_gewe_token)
+            return {"ret": 0}
+
+        return {
+            "path": "/api/gewechat/callback",
+            "handler": _handler,
+        }
 
     def _to_im_event(self, data: dict[str, Any]) -> IMEvent | None:
         """ Gewechat 的回调数据 → 统一 IMEvent。"""

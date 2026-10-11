@@ -21,7 +21,10 @@ import time
 from dataclasses import dataclass, field
 from typing import Any
 
+from lingxi.core import get_logger
 from lingxi.flow.ticket import Ticket, TicketCategory
+
+log = get_logger(__name__)
 
 # 投诉 > 售后 > 咨询 > 其他
 _CATEGORY_PRIORITY: dict[TicketCategory, int] = {
@@ -58,14 +61,48 @@ class QueueEntry:
 
 
 class EscalationQueue:
-    """内存中的升级队列（生产环境应使用 Redis Sorted Set）。"""
+    """内存中的升级队列 (生产环境应使用 Redis Sorted Set)。
 
-    def __init__(self) -> None:
+    内置 asyncio.Queue 事件总线, 供 SSE 实时推送:
+    - enqueue() 时发布 "escalated" 事件
+    - dequeue() 时发布 "claimed" 事件
+    前端 EventSource("/api/events") 订阅获取实时通知。
+    """
+
+    def __init__(self, max_subscribers: int = 16) -> None:
         self._entries: dict[str, QueueEntry] = {}  # ticket_id → entry
         self._lock = asyncio.Lock()  # 原子 claim
+        self._subs: set[asyncio.Queue[dict[str, Any]]] = set()
+        self._max_subs = max_subscribers
+
+    # ── Pub/Sub (SSE realtime) ──
+
+    def subscribe(self) -> asyncio.Queue[dict[str, Any]]:
+        """订阅队列事件, 返回一个 asyncio.Queue 作为事件流。"""
+        q: asyncio.Queue[dict[str, Any]] = asyncio.Queue(maxsize=64)
+        if len(self._subs) >= self._max_subs:
+            log.warning("escalation_subscribers_full", max=self._max_subs)
+            return q
+        self._subs.add(q)
+        return q
+
+    def unsubscribe(self, q: asyncio.Queue[dict[str, Any]]) -> None:
+        self._subs.discard(q)
+
+    def _publish(self, event_type: str, data: dict[str, Any]) -> None:
+        """广播事件到所有订阅者。"""
+        msg = {"event": event_type, "data": data, "ts": time.time()}
+        dead: list[asyncio.Queue[dict[str, Any]]] = []
+        for q in self._subs:
+            try:
+                q.put_nowait(msg)
+            except asyncio.QueueFull:
+                dead.append(q)
+        for q in dead:
+            self._subs.discard(q)
 
     def enqueue(self, ticket: Ticket, reason: str) -> QueueEntry:
-        """将工单加入队列。"""
+        """将工单加入队列。发布 "escalated" 事件。"""
         entry = QueueEntry(
             ticket_id=ticket.ticket_id,
             chat_id=ticket.chat_id,
@@ -73,10 +110,15 @@ class EscalationQueue:
             reason=reason,
         )
         self._entries[ticket.ticket_id] = entry
+        self._publish("escalated", {
+            "ticket_id": entry.ticket_id,
+            "category": ticket.category.value,
+            "reason": reason,
+        })
         return entry
 
     async def dequeue(self, agent_id: str) -> QueueEntry | None:
-        """坐席原子认领（asyncio.Lock 防并发抢单）。"""
+        """坐席原子认领 (asyncio.Lock 防并发抢单), 发布 "claimed" 事件。"""
         async with self._lock:
             avail = [e for e in self._entries.values() if not e.is_claimed]
             if not avail:
@@ -85,11 +127,17 @@ class EscalationQueue:
             entry = avail[0]
             entry.claimed_by = agent_id
             entry.claimed_at = time.time()
+            self._publish("claimed", {
+                "ticket_id": entry.ticket_id,
+                "agent_id": agent_id,
+            })
             return entry
 
     def complete(self, ticket_id: str) -> None:
-        """从队列中移除（已解决或关闭）。"""
-        self._entries.pop(ticket_id, None)
+        """从队列中移除 (已解决或关闭), 发布 "completed" 事件。"""
+        entry = self._entries.pop(ticket_id, None)
+        if entry is not None:
+            self._publish("completed", {"ticket_id": ticket_id})
 
     def list_pending(self) -> list[QueueEntry]:
         """返回所有未认领的条目，按优先级排序。"""

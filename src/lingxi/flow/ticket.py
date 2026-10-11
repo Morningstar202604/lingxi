@@ -42,7 +42,7 @@ class TicketCategory(StrEnum):
 
 # 合法状态转换
 _VALID_TRANSITIONS: dict[TicketStatus, set[TicketStatus]] = {
-    TicketStatus.INTAKE: {TicketStatus.PROCESSING, TicketStatus.CLOSED},
+    TicketStatus.INTAKE: {TicketStatus.PROCESSING, TicketStatus.ESCALATED, TicketStatus.CLOSED},
     TicketStatus.PROCESSING: {
         TicketStatus.WAITING_USER, TicketStatus.ESCALATED,
         TicketStatus.RESOLVED, TicketStatus.CLOSED,
@@ -82,6 +82,7 @@ class Ticket:
     created_at: float = field(default_factory=time.time)
     updated_at: float = field(default_factory=time.time)
     escalation_reason: str = ""
+    assigned_agent_id: str = ""   # 已分配坐席 (seat username)
 
     def transition(self, new_status: TicketStatus) -> None:
         """安全的状态转换。不合法则抛异常。"""

@@ -1,49 +1,70 @@
 [project]
 name = "lingxi"
-version = "0.1.0"
-description = "智犀 (ZhiXi) — 智辨已知，犀照善为。二十四小时在线的全栈数字员工引擎。"
+version = "0.2.0"
+description = "智犀 (ZhiXi) — 智辨已知，犀照善为。7×24 全栈数字员工引擎 · IM 桥接 + 知识库 + RBAC + A/B Testing + Prometheus"
 requires-python = ">=3.11"
 readme = "README.md"
 license = { text = "MIT" }
 authors = [{ name = "LingXi Team" }]
-keywords = ["agent", "ai", "customer-service", "qq", "wechat", "onebot"]
+keywords = [
+    "agent", "ai", "customer-service", "qq", "wechat", "onebot",
+    "langgraph", "mcp", "rbac", "prometheus", "ab-testing",
+    "knowledge-base", "literag", "sse-streaming",
+]
 
 dependencies = [
     # ── Web 框架 ──
     "fastapi>=0.115.0",
     "uvicorn[standard]>=0.32.0",
     "httpx>=0.27.0",
-    "websockets>=13.0",
+    # websockets 14.0+: napcat.py 使用 additional_headers 参数
+    "websockets>=14.0",
+    "sse-starlette>=2.1.0",
     # ── 数据 & 校验 ──
     "pydantic>=2.9.0",
     "pydantic-settings>=2.5.0",
-    "pyyaml>=6.0",
+    "orjson>=3.10.0",
+    # ── 配置加载（flow/rules.py, memory/lorebook.py, workflow/builder.py）──
+    "PyYAML>=6.0",
+    # ── 鉴权（auth/jwt.py）──
+    "PyJWT>=2.9.0",
+    # ── Token 计数（knowledge/splitter.py）──
+    "tiktoken>=0.7.0",
     # ── Agent 编排 ──
     # langgraph 1.x 起 sqlite checkpointer 拆为官方配套包；锁大版本防 API 漂移
     "langgraph>=1.2,<2",
     "langgraph-checkpoint-sqlite>=3.1,<4",
-    "langchain-core>=0.3.0",
-    "langchain>=0.3.0",
-    # ── 记忆 & 检索 ──
-    "mem0ai>=0.1.0",
-    "neo4j>=5.24.0",
-    "networkx>=3.4.0",
+    # ── 持久化 / 检索（默认启动路径即加载，非可选）──
+    # flow/persistence.py:78 _SqliteWriter 与 agent/graph.py 的 AsyncSqliteSaver
+    "aiosqlite>=0.20.0",
+    # knowledge/vector_store.py:214 向量库；__main__.py:213 默认装配 KnowledgeService
+    "chromadb>=0.5.0",
     # ── LLM 路由 ──
     "litellm>=1.52.0",
     # ── 日志 ──
     "structlog>=24.4.0",
-    # ── 工具 ──
-    "python-dotenv>=1.0.0",
-    "click>=8.1.0",
+    # ── 指标 ──
+    "prometheus-client>=0.21.0",
 ]
 
 [project.optional-dependencies]
+# 可选依赖：启用 Mem0 语义召回 / Neo4j 图谱后安装对应 extra
+#   pip install lingxi[mem0]
+#   pip install lingxi[neo4j]
+mem0 = ["mem0ai>=0.1.0"]
+neo4j = ["neo4j>=5.24.0", "networkx>=3.4.0"]
+graph = ["networkx>=3.4.0"]
+# flow/postgres.py 的 PostgreSQL 后端（当前尚未接入默认启动路径，见 docs/AUDIT）
+postgres = ["asyncpg>=0.30.0"]
 dev = [
     "pytest>=8.3.0",
     "pytest-asyncio>=0.24.0",
     "pytest-cov>=5.0.0",
-    "ruff>=0.7.0",
-    "mypy>=1.13.0",
+    # 门禁工具的版本必须与 .pre-commit-config.yaml 的 rev 对齐并锁上界：
+    # 实测 ruff 0.7.0 报 3 处、0.16.8 报 0 处，版本漂移会让同一个门禁结论不一致。
+    "ruff>=0.16.8,<0.17",
+    "mypy>=2.3,<3",
+    "types-PyYAML>=6.0",
     "pre-commit>=4.0.0",
 ]
 
@@ -75,10 +96,18 @@ asyncio_default_fixture_loop_scope = "function"
 addopts = "-v --tb=short -W ignore::DeprecationWarning:starlette.testclient -W ignore::DeprecationWarning:anyio._lazyimport"
 pythonpath = ["src"]
 filterwarnings = [
+    # pytest 的 filterwarnings 语义是「后一条覆盖前一条」，所以兜底 "error"
+    # 必须排在最前，否则它会把下面所有豁免全部屏蔽掉（此前正是这个顺序错误，
+    # 导致作者写的 ignore 从未生效，套件在 Windows 上随机嫁祸给当时正在跑的用例）。
+    "error",
     # anyio 旧版别名被 starlette/fastapi 触发的第三方弃用警告，不影响本仓库
     "ignore:.*BlockingPortal.*:DeprecationWarning",
-    # 其余所有 warning 升级为 error（严格模式）
-    "error",
+    # PyJWT 在短 secret（测试用）时抛 InsecureKeyLengthWarning
+    "ignore::jwt.warnings.InsecureKeyLengthWarning",
+    # 第三方（litellm/httpx）在进程退出时 socket 与 event loop 未关闭的
+    # unraisable 竞态。注意：本仓库自身的泄漏已在 flow/persistence.py 修掉，
+    # 此豁免只为第三方噪音保留，不要再往这里加宽。
+    "ignore::pytest.PytestUnraisableExceptionWarning",
 ]
 
 # ── Mypy ──
@@ -97,4 +126,10 @@ mypy_path = "src"
 
 [[tool.mypy.overrides]]
 module = ["litellm.*"]
+ignore_missing_imports = true
+
+# asyncpg 只在 flow/postgres.py 的可选后端里用到（未装于默认环境）；
+# chromadb 是被 __main__.py:213 默认装配的重量级依赖，官方不提供 stub。
+[[tool.mypy.overrides]]
+module = ["asyncpg.*", "chromadb.*"]
 ignore_missing_imports = true

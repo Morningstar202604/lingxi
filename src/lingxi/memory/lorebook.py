@@ -70,6 +70,38 @@ class Lorebook:
 
         return "\n\n".join(parts)
 
+    @staticmethod
+    def from_yaml(path: str) -> Lorebook:
+        """从 YAML 文件加载 Lorebook 条目。
+
+        YAML 格式::
+
+            - entry_id: return_policy
+              keywords: ["退货", "退款"]
+              content: "退货政策：7天内可退"
+              priority: 10
+
+        依赖 PyYAML (已是本仓库间接依赖 via pydantic-settings)。
+        """
+        import yaml
+
+        entries: list[LorebookEntry] = []
+        with open(path, encoding="utf-8") as f:
+            data = yaml.safe_load(f) or []
+        if not isinstance(data, list):
+            return Lorebook(entries=entries)
+        for raw in data:
+            try:
+                entries.append(LorebookEntry(
+                    entry_id=str(raw.get("entry_id", "")),
+                    keywords=[str(k) for k in raw.get("keywords", [])] or [],
+                    content=str(raw.get("content", "")),
+                    priority=int(raw.get("priority", 0)),
+                ))
+            except (TypeError, ValueError):
+                continue
+        return Lorebook(entries=entries)
+
     @property
     def size(self) -> int:
         return len(self._entries)

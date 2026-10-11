@@ -235,7 +235,11 @@ class NapCatAdapter(IMAdapter):
                 if "post_type" not in data:
                     continue
 
-                event = self._to_im_event(data)
+                try:
+                    event = self._to_im_event(data)
+                except Exception as e:
+                    log.warning("malformed_event_skipped", error=str(e)[:120])
+                    continue
                 if event is not None:
                     await self._dispatch(event)
 

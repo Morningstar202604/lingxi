@@ -18,7 +18,6 @@ export default function DashboardPage() {
   const [queue, setQueue] = useState<QueueSnapshot | null>(null);
   const [recent, setRecent] = useState<TicketSummary[]>([]);
   const [error, setError] = useState<string | null>(null);
-  const [clock, setClock] = useState("");
 
   const load = useCallback(async () => {
     try {
@@ -36,33 +35,11 @@ export default function DashboardPage() {
     }
   }, []);
 
-  // 时钟
-  useEffect(() => {
-    const tick = () =>
-      setClock(
-        new Date().toLocaleTimeString("zh-CN", {
-          hour: "2-digit",
-          minute: "2-digit",
-          second: "2-digit",
-        }),
-      );
-    tick();
-    const id = setInterval(tick, 1000);
-    return () => clearInterval(id);
-  }, []);
-
-  // 轮询实时数据
   useEffect(() => {
     load();
     const id = setInterval(load, 5_000);
     return () => clearInterval(id);
   }, [load]);
-
-  // 实时时钟注入 header
-  useEffect(() => {
-    const el = document.getElementById("clock");
-    if (el) el.textContent = clock;
-  }, [clock]);
 
   if (error) {
     return (
@@ -137,32 +114,6 @@ export default function DashboardPage() {
         </div>
       </section>
 
-      {/* 会话日志占位 */}
-      <section>
-        <h3 className="text-xs font-medium text-lingxi-muted uppercase tracking-wider mb-3">
-          系统日志
-        </h3>
-        <div className="card">
-          <div className="font-mono text-[11px] text-lingxi-muted space-y-1 max-h-48 overflow-y-auto">
-            <p>
-              <span className="text-lingxi-green">[INFO]</span>{" "}
-              智犀引擎已启动 · NapCat QQ 适配器就绪 · Gewechat 适配器就绪
-            </p>
-            <p>
-              <span className="text-lingxi-green">[INFO]</span>{" "}
-              LangGraph 编排器已编译 · MemorySaver Checkpoint 已启用
-            </p>
-            <p>
-              <span className="text-lingxi-green">[INFO]</span>{" "}
-              MCP 工具已注册 (shell / send_message / knowledge_search)
-            </p>
-            <p>
-              <span className="text-lingxi-orange">[WARN]</span>{" "}
-              等待 IM 消息接入...
-            </p>
-          </div>
-        </div>
-      </section>
     </div>
   );
 }
