@@ -24,6 +24,8 @@ export interface DashboardSummary {
   escalated: number;
   processing: number;
   waiting_user: number;
+  resolved: number;
+  resolution_rate: number;
   queue: {
     pending_count: number;
     claimed_count: number;
@@ -35,6 +37,24 @@ export interface DashboardSummary {
       wait_seconds: number;
     }>;
   };
+  sla: {
+    total: number;
+    breached: number;
+    compliant: number;
+    breach_rate: number;
+  };
+  seats: {
+    total_seats: number;
+    online_seats: number;
+    busy_seats: number;
+    idle_seats: number;
+    total_capacity: number;
+    used_capacity: number;
+    utilization_rate: number;
+    total_handled: number;
+    avg_response_seconds: number;
+  };
+  avg_wait_seconds: number;
 }
 
 export interface TicketSummary {

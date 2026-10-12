@@ -37,6 +37,7 @@ from sse_starlette.sse import EventSourceResponse
 from lingxi.config import get_settings
 from lingxi.core import get_logger
 from lingxi.core.logging import memory_handler
+from lingxi.flow.sla import format_sla_status
 from lingxi.flow.ticket import TicketStatus
 from lingxi.persona.guardrails import detect_injection
 from lingxi.persona.injector import PersonaInjector
@@ -201,12 +202,57 @@ def create_dashboard_app(
         waiting = [t for t in active if t.status.value == "waiting_user"]
         queue_snapshot = queue.snapshot()
 
+        # SLA 统计
+        sla_results = sla_monitor.check_all(active) if sla_monitor else []
+        sla_summary = format_sla_status(sla_results) if sla_results else {
+            "total": 0, "breached": 0, "compliant": 0, "breach_rate": 0.0
+        }
+
+        # 坐席统计
+        seat_metrics = {}
+        if seat_store:
+            all_seats = seat_store.list_all()
+            online_seats = [s for s in all_seats if s.status.value in ("idle", "busy")]
+            busy_seats = [s for s in online_seats if s.status.value == "busy"]
+            total_capacity = sum(s.max_concurrent for s in online_seats)
+            used_capacity = sum(s.current_ticket_count for s in busy_seats)
+            total_handled = sum(s.total_handled for s in all_seats)
+            avg_response = sum(s.avg_response_seconds for s in all_seats) / max(1, len(all_seats))
+            seat_metrics = {
+                "total_seats": len(all_seats),
+                "online_seats": len(online_seats),
+                "busy_seats": len(busy_seats),
+                "idle_seats": len([s for s in online_seats if s.status.value == "idle"]),
+                "total_capacity": total_capacity,
+                "used_capacity": used_capacity,
+                "utilization_rate": used_capacity / max(1, total_capacity),
+                "total_handled": total_handled,
+                "avg_response_seconds": round(avg_response, 1),
+            }
+
+        # 解决率（本轮会话内）
+        resolved = [t for t in active if t.status.value in ("resolved", "closed")]
+        resolution_rate = len(resolved) / max(1, len(active))
+
+        # 平均等待时长（升级队列）
+        avg_wait = queue_snapshot.get("longest_wait", 0)
+        pending = queue_snapshot.get("pending_count", 0)
+        if pending > 0:
+            top5 = queue_snapshot.get("top_5_pending", [])
+            if top5:
+                avg_wait = sum(t.get("wait_seconds", 0) for t in top5) / len(top5)
+
         return {
             "active_tickets": len(active),
             "escalated": len(escalated),
             "processing": len(processing),
             "waiting_user": len(waiting),
+            "resolved": len(resolved),
+            "resolution_rate": round(resolution_rate, 3),
             "queue": queue_snapshot,
+            "sla": sla_summary,
+            "seats": seat_metrics,
+            "avg_wait_seconds": round(avg_wait, 1),
         }
 
     @app.get("/api/tickets")

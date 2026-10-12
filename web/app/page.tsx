@@ -132,8 +132,18 @@ export default function DashboardPage() {
             escalated={summary.escalated}
             processing={summary.processing}
             waiting={summary.waiting_user}
+            resolved={summary.resolved ?? 0}
+            resolutionRate={summary.resolution_rate ?? 0}
             queuePending={summary.queue.pending_count}
             longestWait={summary.queue.longest_wait}
+            avgWait={summary.avg_wait_seconds ?? 0}
+            slaBreachRate={summary.sla?.breach_rate ?? 0}
+            slaCompliant={summary.sla?.compliant ?? 0}
+            seatsOnline={summary.seats?.online_seats ?? 0}
+            seatsBusy={summary.seats?.busy_seats ?? 0}
+            seatsUtilization={summary.seats?.utilization_rate ?? 0}
+            totalHandled={summary.seats?.total_handled ?? 0}
+            avgResponseSec={summary.seats?.avg_response_seconds ?? 0}
           />
         ) : (
           <div className="grid grid-cols-2 md:grid-cols-3 lg:grid-cols-6 gap-3">
