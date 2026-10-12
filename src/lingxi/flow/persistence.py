@@ -671,6 +671,15 @@ class PersistentMemoryPipeline:
     def total_memories(self) -> int:
         return self._inner.total_memories
 
+    def recall_hybrid(
+        self,
+        user_id: str,
+        query: str,
+        top_k: int = 5,
+        min_confidence: float = 0.3,
+    ) -> Any:
+        return self._inner.recall_hybrid(user_id, query, top_k, min_confidence)
+
 
 # ── 全局单例 writer (三表共用一个 sqlite 文件) ───────────────────
 

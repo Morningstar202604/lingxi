@@ -28,7 +28,11 @@
 """
 from __future__ import annotations
 
+import asyncio
+import contextlib
 import json
+import threading
+import time
 from datetime import UTC, datetime
 from typing import Any
 
@@ -410,10 +414,40 @@ class PostgresEscalationQueue:
     def __init__(self, writer: PostgresWriter, *, ticket_store: PostgresTicketStore | None = None) -> None:
         self.writer = writer
         self._ticket_store = ticket_store
+        # In-process pub/sub for SSE (same as EscalationQueue)
+        self._subs: set[asyncio.Queue[dict[str, Any]]] = set()
+        self._max_subs = 64
 
     def attach_store(self, store: PostgresTicketStore) -> None:
         """关联 ticket store（用于 dequeue 时查完整工单）。"""
         self._ticket_store = store
+
+    # -- Pub/Sub (SSE realtime) --
+    def subscribe(self) -> asyncio.Queue[dict[str, Any]]:
+        """订阅队列事件, 返回一个 asyncio.Queue 作为事件流。"""
+        import asyncio
+        q: asyncio.Queue[dict[str, Any]] = asyncio.Queue(maxsize=64)
+        if len(self._subs) >= self._max_subs:
+            log.warning("escalation_subscribers_full", max=self._max_subs)
+            return q
+        self._subs.add(q)
+        return q
+
+    def unsubscribe(self, q: asyncio.Queue[dict[str, Any]]) -> None:
+        self._subs.discard(q)
+
+    def _publish(self, event_type: str, data: dict[str, Any]) -> None:
+        """广播事件到所有订阅者。"""
+        import time
+        msg = {"event": event_type, "data": data, "ts": time.time()}
+        dead: list[asyncio.Queue[dict[str, Any]]] = []
+        for q in self._subs:
+            try:
+                q.put_nowait(msg)
+            except asyncio.QueueFull:
+                dead.append(q)
+        for q in dead:
+            self._subs.discard(q)
 
     # -- Queue operations -------------------------------------------------
 
@@ -430,6 +464,12 @@ class PostgresEscalationQueue:
             reason,
         )
         log.debug("pg_queue_enqueued", ticket_id=ticket.ticket_id, reason=reason)
+        self._publish("escalated", {
+            "ticket_id": ticket.ticket_id,
+            "chat_id": ticket.chat_id,
+            "category": ticket.category.value,
+            "reason": reason,
+        })
 
     async def dequeue(self, agent_id: str) -> Any:
         """原子出队 — 认领最早的未认领条目并删除。
@@ -452,6 +492,10 @@ class PostgresEscalationQueue:
 
         ticket_id: str = row["ticket_id"]
         log.debug("pg_queue_dequeued", ticket_id=ticket_id, agent_id=agent_id)
+        self._publish("claimed", {
+            "ticket_id": ticket_id,
+            "agent_id": agent_id,
+        })
 
         if self._ticket_store is not None:
             return await self._ticket_store.get(ticket_id)
@@ -463,6 +507,9 @@ class PostgresEscalationQueue:
             "DELETE FROM queue_entries WHERE ticket_id = $1", ticket_id
         )
         log.debug("pg_queue_completed", ticket_id=ticket_id)
+        self._publish("completed", {
+            "ticket_id": ticket_id,
+        })
 
     async def list_pending(self, limit: int = 100) -> list[str]:
         """列出所有未认领的 ticket_id。"""
@@ -621,12 +668,208 @@ def _rebuild_memory(d: dict[str, Any]) -> Any:
     )
 
 
+# ── 同步包装器：在后台事件循环线程中运行 async 方法 ─────────────────────
+
+class _AsyncRunner:
+    """后台事件循环线程，用于同步调用 async 方法。"""
+
+    _thread: threading.Thread | None = None
+    _loop: asyncio.AbstractEventLoop | None = None
+    _stopped: threading.Event
+
+    def __init__(self) -> None:
+        self._stopped = threading.Event()
+        self._start()
+
+    def _start(self) -> None:
+        def _run_loop() -> None:
+            loop = asyncio.new_event_loop()
+            asyncio.set_event_loop(loop)
+            self._loop = loop
+            self._stopped.clear()
+            loop.run_forever()
+
+        self._thread = threading.Thread(target=_run_loop, name="pg-async-runner", daemon=True)
+        self._thread.start()
+        # 等待 loop 就绪
+        while self._loop is None:
+            time.sleep(0.001)
+
+    def run(self, coro: Any) -> Any:
+        """同步运行 coroutine，返回结果或抛出异常。"""
+        if self._loop is None or self._stopped.is_set():
+            raise RuntimeError("Async runner not started or stopped")
+        future = asyncio.run_coroutine_threadsafe(coro, self._loop)
+        return future.result()
+
+    def stop(self) -> None:
+        if self._loop and not self._stopped.is_set():
+            self._stopped.set()
+            self._loop.call_soon_threadsafe(self._loop.stop)
+            if self._thread:
+                self._thread.join(timeout=2.0)
+
+
+_async_runner: _AsyncRunner | None = None
+
+
+def _get_runner() -> _AsyncRunner:
+    global _async_runner
+    if _async_runner is None:
+        _async_runner = _AsyncRunner()
+    return _async_runner
+
+
+class SyncPostgresTicketStore:
+    """PostgresTicketStore 的同步包装器。"""
+
+    def __init__(self, async_store: PostgresTicketStore) -> None:
+        self._async = async_store
+        self._runner = _get_runner()
+
+    def create(self, chat_id: str, user_id: str = "", channel: str = "") -> Any:
+        return self._runner.run(self._async.create(chat_id, user_id, channel))
+
+    def get(self, ticket_id: str) -> Any:
+        return self._runner.run(self._async.get(ticket_id))
+
+    def save(self, ticket: Any) -> None:
+        self._runner.run(self._async.save(ticket))
+
+    def list_active(self, limit: int = 100) -> list[Any]:
+        return self._runner.run(self._async.list_active(limit))  # type: ignore[no-any-return]
+
+    def list_idle(self, limit: int = 100) -> list[Any]:
+        return self._runner.run(self._async.list_idle(limit))  # type: ignore[no-any-return]
+
+
+class SyncPostgresEscalationQueue:
+    """PostgresEscalationQueue 的同步包装器。"""
+
+    def __init__(self, async_queue: PostgresEscalationQueue) -> None:
+        self._async = async_queue
+        self._runner = _get_runner()
+
+    def attach_store(self, store: SyncPostgresTicketStore) -> None:
+        # 传入的 store 是同步包装器，需要解包出 async store
+        self._async.attach_store(store._async)
+
+    def enqueue(self, ticket: Any, *, reason: str = "") -> None:
+        self._runner.run(self._async.enqueue(ticket, reason=reason))
+
+    def dequeue(self, agent_id: str) -> Any:
+        return self._runner.run(self._async.dequeue(agent_id))
+
+    def complete(self, ticket_id: str) -> None:
+        self._runner.run(self._async.complete(ticket_id))
+
+    # -- Pub/Sub (SSE realtime) --
+
+    def subscribe(self) -> Any:
+        """订阅队列事件, 返回一个 asyncio.Queue 作为事件流。"""
+        return self._runner.run(self._async.subscribe())
+
+    def unsubscribe(self, q: Any) -> None:
+        # unsubscribe returns None, discard the result
+        self._runner.run(self._async.unsubscribe(q))  # type: ignore[func-returns-value]
+
+    def list_pending(self, limit: int = 100) -> list[str]:
+        return self._runner.run(self._async.list_pending(limit))  # type: ignore[no-any-return]
+
+    def list_claimed(self, agent_id: str | None = None, limit: int = 100) -> list[str]:
+        return self._runner.run(self._async.list_claimed(agent_id, limit))  # type: ignore[no-any-return]
+
+    def pending_count(self) -> int:
+        return self._runner.run(self._async.pending_count())  # type: ignore[no-any-return]
+
+    def size(self) -> int:
+        return self.pending_count()
+
+
+class SyncPostgresMemoryPipeline:
+    """PostgresMemoryPipeline 的同步包装器，含 recall_hybrid。"""
+
+    writer: PostgresWriter
+
+    def __init__(self, async_pipe: PostgresMemoryPipeline, graph: Any = None) -> None:
+        self._async = async_pipe
+        self.writer = async_pipe.writer
+        self._graph = graph
+        self._runner = _get_runner()
+
+    # -- sync wrappers for async methods --
+
+    def store(self, user_id: str, items: list[Any]) -> None:
+        self._runner.run(self._async.store(user_id, items))
+
+    def recall(
+        self,
+        user_id: str,
+        query: str,
+        top_k: int = 5,
+        min_confidence: float = 0.3,
+    ) -> list[Any]:
+        return self._runner.run(self._async.recall(user_id, query, top_k, min_confidence))  # type: ignore[no-any-return]
+
+    # -- recall_hybrid: 字面召回 + 图谱召回（去重后按原顺序合并） --
+
+    def recall_hybrid(
+        self,
+        user_id: str,
+        query: str,
+        top_k: int = 5,
+        min_confidence: float = 0.3,
+    ) -> Any:
+        """字面召回 + 图谱召回（去重后按原顺序合并）。"""
+        from lingxi.memory.pipeline import MemoryRecallResult
+
+        # 1. 字面召回
+        literal_items = self.recall(user_id, query, top_k, min_confidence)
+
+        # 2. 图谱召回（若有 graph）
+        graph_items: list[Any] = []
+        if self._graph is not None:
+            with contextlib.suppress(Exception):
+                graph_items = self._runner.run(
+                    self._graph.recall_related(user_id, query, top_k)
+                )
+
+        # 3. 去重合并：按 memory_id 去重，保持首次出现顺序
+        seen: set[str] = set()
+        merged: list[Any] = []
+        for item in literal_items + graph_items:
+            mid = getattr(item, "memory_id", None)
+            if mid and mid not in seen:
+                seen.add(mid)
+                merged.append(item)
+        return MemoryRecallResult(
+            items=merged[:top_k],
+            total_candidates=len(literal_items) + len(graph_items),
+        )
+
+    # -- 透传其它同步接口（如有）--
+
+    @property
+    def graph(self) -> Any:
+        return self._graph
+
+    @property
+    def total_memories(self) -> int:
+        # 无法同步获取，返回 0 占位
+        return 0
+
+
+# ── 导出 ────────────────────────────────────────────────────────────────
+
 __all__ = [
     "HAS_ASYNC_PG",
     "PostgresWriter",
     "PostgresTicketStore",
     "PostgresEscalationQueue",
     "PostgresMemoryPipeline",
+    "SyncPostgresTicketStore",
+    "SyncPostgresEscalationQueue",
+    "SyncPostgresMemoryPipeline",
     "_ticket_from_row",
     "_queue_entry_from_row",
     "_memory_from_row",

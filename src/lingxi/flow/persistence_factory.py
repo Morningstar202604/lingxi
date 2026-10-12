@@ -31,11 +31,13 @@ log = get_logger(__name__)
 
 async def create_stores(
     settings: Any = None,
+    graph: Any = None,
 ) -> tuple[Any, Any, Any]:
     """根据配置创建 tickets / queue / memory 三个持久化仓库。
 
     Args:
         settings: 可选，传入自定义 Settings 实例。默认用全局单例。
+        graph: 可选，实体图谱存储。仅 SQLite 后端使用。
 
     Returns:
         (ticket_store, escalation_queue, memory_pipeline)
@@ -51,7 +53,7 @@ async def create_stores(
 
     if backend == "postgresql":
         try:
-            return await _create_postgres_stores(settings)
+            return await _create_postgres_stores(settings, graph)
         except Exception as e:
             log.error("postgres_backend_failed", error=str(e))
             raise RuntimeError(
@@ -61,10 +63,10 @@ async def create_stores(
     elif backend == "memory":
         return _create_memory_stores()
     else:  # "sqlite"
-        return _create_sqlite_stores(settings)
+        return _create_sqlite_stores(settings, graph)
 
 
-def _create_sqlite_stores(settings: Any) -> tuple[Any, Any, Any]:
+def _create_sqlite_stores(settings: Any, graph: Any = None) -> tuple[Any, Any, Any]:
     """创建 SQLite 持久化三件套。"""
     from lingxi.flow.persistence import (
         PersistentEscalationQueue,
@@ -78,7 +80,7 @@ def _create_sqlite_stores(settings: Any) -> tuple[Any, Any, Any]:
 
     tickets = PersistentTicketStore(writer)
     esc_queue = PersistentEscalationQueue(writer)
-    memory = PersistentMemoryPipeline(writer)
+    memory = PersistentMemoryPipeline(writer, graph=graph)
 
     # hydrate from disk
     tickets._hydrate()
@@ -99,13 +101,16 @@ def _create_memory_stores() -> tuple[Any, Any, Any]:
     return TicketStore(), EscalationQueue(), MemoryPipeline()
 
 
-async def _create_postgres_stores(settings: Any) -> tuple[Any, Any, Any]:
-    """创建 PostgreSQL 持久化三件套。"""
+async def _create_postgres_stores(settings: Any, graph: Any = None) -> tuple[Any, Any, Any]:
+    """创建 PostgreSQL 持久化三件套（同步包装器，供 pipeline 直接调用）。"""
     from lingxi.flow.postgres import (
         PostgresEscalationQueue,
         PostgresMemoryPipeline,
         PostgresTicketStore,
         PostgresWriter,
+        SyncPostgresEscalationQueue,
+        SyncPostgresMemoryPipeline,
+        SyncPostgresTicketStore,
     )
 
     pg_cfg = settings.persistence.postgres
@@ -118,9 +123,17 @@ async def _create_postgres_stores(settings: Any) -> tuple[Any, Any, Any]:
     )
     await writer.init_schema()
 
-    tickets = PostgresTicketStore(writer)
-    queue = PostgresEscalationQueue(writer, ticket_store=tickets)
-    memory = PostgresMemoryPipeline(writer)
+    async_tickets = PostgresTicketStore(writer)
+    async_queue = PostgresEscalationQueue(writer, ticket_store=async_tickets)
+    async_memory = PostgresMemoryPipeline(writer)
+
+    # 包装为同步接口
+    tickets = SyncPostgresTicketStore(async_tickets)
+    queue = SyncPostgresEscalationQueue(async_queue)
+    memory = SyncPostgresMemoryPipeline(async_memory, graph=graph)
+
+    # 关联 queue 与 tickets（同步包装器层面）
+    queue.attach_store(tickets)
 
     log.info("postgres_stores_created")
     return tickets, queue, memory

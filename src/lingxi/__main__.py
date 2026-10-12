@@ -615,17 +615,25 @@ async def _build_persistent_engine(
     args: argparse.Namespace,
 ) -> Engine:
     """异步创建持久化存储 + 构建引擎。"""
-    from lingxi.flow.persistence import create_persistent_stores
+    from lingxi.flow.persistence_factory import create_stores
     from lingxi.memory.graph_store import SQLiteGraphStore
 
-    # 图谱随记忆一起持久化：否则持久化模式下实体图谱整体失效
-    # （编码不建边、recall_hybrid 图谱分支恒空、MCP graph://stats 不注册）
     settings = get_settings()
-    graph = SQLiteGraphStore(
-        str(settings.data_dir / settings.memory.graph_db_path),
-    )
-    tickets, queue, memory = await create_persistent_stores(db_path, graph=graph)
+    backend = settings.persistence.backend
+
+    # 图谱：SQLite 后端用 SQLiteGraphStore；PostgreSQL 暂无图谱后端，传 None
+    if backend == "postgresql":
+        graph = None
+    else:
+        # 图谱随记忆一起持久化：否则持久化模式下实体图谱整体失效
+        # （编码不建边、recall_hybrid 图谱分支恒空、MCP graph://stats 不注册）
+        graph = SQLiteGraphStore(
+            str(settings.data_dir / settings.memory.graph_db_path),
+        )
+
+    tickets, queue, memory = await create_stores(graph=graph)
     log.info("persistent_stores_created",
+             backend=backend,
              tickets=0,
              queue=queue.pending_count if hasattr(queue, 'pending_count') else 0,
              memories=memory.total_memories if hasattr(memory, 'total_memories') else 0)
