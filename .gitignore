@@ -20,7 +20,11 @@ env/
 # Data
 data/
 *.db
+*.db-shm
+*.db-wal
 *.sqlite3
+*.sqlite3-shm
+*.sqlite3-wal
 
 # Testing & tooling caches
 .pytest_cache/

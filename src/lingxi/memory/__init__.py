@@ -8,7 +8,13 @@
     - Mem0 不是必须依赖；系统应在无 Mem0 情况下也能运行
     - 切换 MemoryBackend 不应影响上层 pipeline 代码
 """
-from lingxi.memory.graph_store import Entity, GraphStore, InMemoryGraphStore, Relation
+from lingxi.memory.graph_store import (
+    Entity,
+    GraphStore,
+    InMemoryGraphStore,
+    Relation,
+    SQLiteGraphStore,
+)
 from lingxi.memory.lorebook import Lorebook, LorebookEntry
 from lingxi.memory.pipeline import (
     MemoryItem,
@@ -26,4 +32,5 @@ __all__ = [
     "MemoryPipeline",
     "MemoryRecallResult",
     "Relation",
+    "SQLiteGraphStore",
 ]

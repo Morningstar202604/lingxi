@@ -24,12 +24,18 @@
 """
 from __future__ import annotations
 
+import hashlib
+import secrets
 from typing import TYPE_CHECKING, Annotated
 
 from fastapi import Depends, Header, HTTPException, status
 from fastapi.security import HTTPAuthorizationCredentials, HTTPBearer
 
-from lingxi.auth.jwt import decode_access_token
+from lingxi.auth.jwt import (
+    JwtSecretNotConfiguredError,
+    decode_access_token,
+    resolve_signing_secret,
+)
 from lingxi.auth.models import ROLE_PERMISSIONS, Permission, User, UserStore, get_user_store
 from lingxi.config.settings import get_settings
 from lingxi.core.logging import get_logger
@@ -44,18 +50,21 @@ log = get_logger(__name__)
 security = HTTPBearer(auto_error=False)
 
 
-# ── API Key 静态映射 ────────────────────────────────────────────
+# ── API Key 配置读取 ──────────────────────────────────────────────
 
-_API_KEY_MAP: dict[str, dict[str, str]] = {
-    "zxk_admin_xxx": {
-        "username": "admin",
-        "description": "Default admin API key",
-    },
-    "zxk_operator_xxx": {
-        "username": "operator",
-        "description": "Default operator API key",
-    },
-}
+def _api_key_hashes() -> dict[str, str]:
+    """{username: sha256(key) hex}，来自 settings.auth.api_key_hashes。
+
+    旧实现在源码里硬编码了一张明文 key 表
+    （`"zxk_admin_xxx" → admin`），那等同于一个公开的后门口令：任何能读代码
+    的人都能带上这个 header 拿到管理员身份。现在 key 只以 sha256 摘要的形式
+    来自环境变量/配置，未配置时 API Key 认证整体关闭（返回空 dict → 一律 401）。
+    """
+    return get_settings().auth.api_key_hashes
+
+
+def _hash_api_key(key: str) -> str:
+    return hashlib.sha256(key.encode("utf-8")).hexdigest()
 
 
 # ── 依赖函数 ───────────────────────────────────────────────────
@@ -81,7 +90,14 @@ def get_current_user(
         )
 
     settings = get_settings()
-    secret = settings.auth.jwt_secret
+    try:
+        secret = resolve_signing_secret(settings.auth.jwt_secret)
+    except JwtSecretNotConfiguredError as e:
+        log.warning("jwt_secret_unconfigured", detail=str(e))
+        raise HTTPException(
+            status_code=status.HTTP_503_SERVICE_UNAVAILABLE,
+            detail="JWT signing secret is not configured",
+        ) from e
 
     payload = decode_access_token(credentials.credentials, secret)
     if payload is None:
@@ -160,15 +176,26 @@ def verify_api_key(
     """通过 X-API-Key header 认证。
 
     适用于自动化脚本、CLI 工具、不适合人类交互 Bearer token 的场景。
-    API Key 前缀: zxk_
+    Key 由部署方生成，其 sha256 摘要写入 LINGXI_AUTH__API_KEY_HASHES。
 
     Args:
         x_api_key: X-API-Key header 值
 
     Raises:
-        HTTPException(401): Key 无效
-        HTTPException(404): 映射用户不存在
+        HTTPException(401): 未配置 API Key、Key 缺失或无效
+        HTTPException(404): 映射的用户不存在
+        HTTPException(403): 映射的用户已被禁用
     """
+    candidates = _api_key_hashes()
+    if not candidates:
+        # 未配置任何 key = 这条认证路径关闭。绝不退化成"接受任意 key"。
+        log.warning("verify_api_key: no api_key_hashes configured, rejecting")
+        raise HTTPException(
+            status_code=status.HTTP_401_UNAUTHORIZED,
+            detail="API key authentication is not configured",
+            headers={"WWW-Authenticate": "ApiKey"},
+        )
+
     if x_api_key is None:
         raise HTTPException(
             status_code=status.HTTP_401_UNAUTHORIZED,
@@ -176,16 +203,24 @@ def verify_api_key(
             headers={"WWW-Authenticate": "ApiKey"},
         )
 
-    mapping = _API_KEY_MAP.get(x_api_key)
-    if mapping is None:
-        log.warning("verify_api_key: invalid key", key_prefix=x_api_key[:8] + "...")
+    digest = _hash_api_key(x_api_key)
+    # 逐个常量时间比对：用 dict.get(key) 直接命中会让"猜对多少位就早点返回"
+    # 变成可测量的时序信号，而这里的比较对象本身就是凭据的派生值。
+    username: str | None = None
+    for uname, expected in candidates.items():
+        if secrets.compare_digest(digest, expected.strip().lower()):
+            username = uname
+            break
+
+    if username is None:
+        # 刻意不打印 key 的任何片段（旧实现记了前 8 位，等于把凭据写进日志）
+        log.warning("verify_api_key: invalid key")
         raise HTTPException(
             status_code=status.HTTP_401_UNAUTHORIZED,
             detail="Invalid API key",
             headers={"WWW-Authenticate": "ApiKey"},
         )
 
-    username = mapping["username"]
     store: UserStore = get_user_store()
     user = store.get(username)
     if user is None:
@@ -197,7 +232,7 @@ def verify_api_key(
 
     if user.disabled:
         raise HTTPException(
-            status_code=status.HTTP_401_UNAUTHORIZED,
+            status_code=status.HTTP_403_FORBIDDEN,
             detail="User mapped by API key is disabled",
         )
 

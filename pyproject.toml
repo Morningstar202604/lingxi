@@ -128,6 +128,11 @@ mypy_path = "src"
 module = ["litellm.*"]
 ignore_missing_imports = true
 
+# langgraph.config（stream writer）随 1.x 版本新增，官方未发独立 stub
+[[tool.mypy.overrides]]
+module = ["langgraph.config"]
+ignore_missing_imports = true
+
 # asyncpg 只在 flow/postgres.py 的可选后端里用到（未装于默认环境）；
 # chromadb 是被 __main__.py:213 默认装配的重量级依赖，官方不提供 stub。
 [[tool.mypy.overrides]]

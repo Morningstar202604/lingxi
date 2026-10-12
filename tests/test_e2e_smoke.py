@@ -15,7 +15,6 @@ import pytest
 from fastapi.testclient import TestClient
 
 from lingxi.agent.graph import ZhiXiAgent
-from lingxi.agent.tools import _create_default_registry
 from lingxi.core.protocol import (
     ChannelType,
     IMEvent,
@@ -55,7 +54,6 @@ class TestE2EHappyPath:
         """完整链路: 模拟 IM 事件 → Pipeline → Ticket 存储 → Dashboard API 返回。"""
         store = TicketStore()
         queue = EscalationQueue()
-        reg = _create_default_registry()
 
         # Mock Agent 返回直接回复
         agent = MagicMock(spec=ZhiXiAgent)
@@ -70,7 +68,6 @@ class TestE2EHappyPath:
             agent=agent,
             ticket_store=store,
             escalation_queue=queue,
-            registry=reg,
         )
 
         event = IMEvent(

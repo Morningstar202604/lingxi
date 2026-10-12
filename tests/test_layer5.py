@@ -277,8 +277,7 @@ class TestPipeline:
     @pytest.mark.asyncio
     async def test_handle_event_empty_text(self) -> None:
         """纯空白消息（无文字无图片）现在不丢：建 ticket + 返回兜底回复。"""
-        reg = _create_default_registry()
-        agent = ZhiXiAgent(registry=reg, max_steps=1)
+        agent = ZhiXiAgent(registry=_create_default_registry(), max_steps=1)
         store = TicketStore()
         queue = EscalationQueue()
 
@@ -286,7 +285,6 @@ class TestPipeline:
             agent=agent,
             ticket_store=store,
             escalation_queue=queue,
-            registry=reg,
         )
 
         event = IMEvent(
@@ -305,7 +303,6 @@ class TestPipeline:
 
     @pytest.mark.asyncio
     async def test_handle_event_creates_ticket(self) -> None:
-        reg = _create_default_registry()
         agent = MagicMock(spec=ZhiXiAgent)
         agent.run = AsyncMock(return_value={
             "final_reply": "这是回复",
@@ -321,7 +318,6 @@ class TestPipeline:
             agent=agent,
             ticket_store=store,
             escalation_queue=queue,
-            registry=reg,
         )
 
         event = IMEvent(
@@ -341,7 +337,6 @@ class TestPipeline:
 
     @pytest.mark.asyncio
     async def test_handle_event_escalate_on_timeout(self) -> None:
-        reg = _create_default_registry()
         agent = MagicMock(spec=ZhiXiAgent)
 
         async def _slow(**kwargs: Any) -> dict[str, Any]:
@@ -358,7 +353,6 @@ class TestPipeline:
             agent=agent,
             ticket_store=store,
             escalation_queue=queue,
-            registry=reg,
             max_agent_timeout=0.1,  # 极短超时
         )
 
@@ -415,7 +409,6 @@ class TestConversationHistory:
             agent=agent,
             ticket_store=TicketStore(),
             escalation_queue=EscalationQueue(),
-            registry=_create_default_registry(),
         )
 
         await pipe.handle_event(self._event("我的订单号是 A123"), system_prompt="SP")
@@ -445,7 +438,6 @@ class TestConversationHistory:
             agent=agent,
             ticket_store=TicketStore(),
             escalation_queue=EscalationQueue(),
-            registry=_create_default_registry(),
         )
 
         for i in range(30):

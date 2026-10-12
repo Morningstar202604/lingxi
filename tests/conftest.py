@@ -61,7 +61,7 @@ def test_settings(tmp_data_dir: Path) -> Settings:
         log_level="DEBUG",
         onebot=OneBotConfig(ws_url="ws://test:3001"),
         llm=LLMConfig(model="test-model"),
-        memory=MemoryConfig(backend="local"),
+        memory=MemoryConfig(),
         agent=AgentConfig(react_steps=2),
         security=SecurityConfig(permission_model="open"),
     )

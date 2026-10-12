@@ -27,9 +27,12 @@ import contextlib
 import json
 import queue
 import threading
-from typing import Any
+from typing import TYPE_CHECKING, Any
 
 from lingxi.core import get_logger
+
+if TYPE_CHECKING:
+    from lingxi.memory.graph_store import GraphStore
 
 log = get_logger(__name__)
 
@@ -584,19 +587,36 @@ class PersistentEscalationQueue:
 class PersistentMemoryPipeline:
     """MemoryPipeline 的 SQLite 写通版本。
 
-    内部持有 MemoryPipeline 实例, 写操作 (store/update/contradict/forget) 额外落盘。
-    encode_and_store 是 async 方法, 可直接 await SQLite 写入。
+    内部持有 MemoryPipeline 实例, 写操作 (store/update/contradict/forget)
+    额外落盘。encode_and_store 是 async 方法, 可直接 await SQLite 写入。
+
+    🔗 graph 必须透传：此前 `MemoryPipeline()` 无参构造，
+    持久化模式下实体图谱整体失效（编码不建边、
+    `recall_hybrid` 的图谱分支恒空、MCP `graph://stats`
+    资源因 `getattr(memory, "graph")` 为 None 而不注册）。
     """
 
-    def __init__(self, writer: _SqliteWriter) -> None:
+    def __init__(
+        self,
+        writer: _SqliteWriter,
+        graph: GraphStore | None = None,
+    ) -> None:
         from lingxi.memory.pipeline import MemoryPipeline
         self._writer = writer
-        self._inner = MemoryPipeline()
+        self._inner = MemoryPipeline(graph=graph)
+
+    @property
+    def graph(self) -> GraphStore | None:
+        return self._inner.graph
 
     @classmethod
-    async def create(cls, db_path: str) -> PersistentMemoryPipeline:
+    async def create(
+        cls,
+        db_path: str,
+        graph: GraphStore | None = None,
+    ) -> PersistentMemoryPipeline:
         writer = _SqliteWriter(db_path)
-        inst = cls(writer)
+        inst = cls(writer, graph=graph)
         inst._hydrate()
         return inst
 
@@ -665,16 +685,23 @@ def get_or_create_writer(db_path: str) -> _SqliteWriter:
     return _default_writer
 
 
-async def create_persistent_stores(db_path: str) -> tuple[PersistentTicketStore, PersistentEscalationQueue, PersistentMemoryPipeline]:
+async def create_persistent_stores(
+    db_path: str,
+    graph: GraphStore | None = None,
+) -> tuple[PersistentTicketStore, PersistentEscalationQueue, PersistentMemoryPipeline]:
     """创建三个持久化存储, 共享同一个 SQLite writer 和 db 文件。
 
     使用场景:
         tickets, queue, memory = await create_persistent_stores("data/lingxi.db")
+
+    graph: 实体图谱存储。传入则记忆编码同步建边、
+    recall_hybrid 的图谱分支生效；不传则记忆链路照常
+    工作但图谱能力退化为纯字面匹配。
     """
     writer = get_or_create_writer(db_path)
     tickets = PersistentTicketStore(writer)
     esc_queue = PersistentEscalationQueue(writer)
-    memory = PersistentMemoryPipeline(writer)
+    memory = PersistentMemoryPipeline(writer, graph=graph)
     # 共享 writer 已经建好表, 直接 hydrate
     tickets._hydrate()
     esc_queue._hydrate()

@@ -21,7 +21,7 @@ from collections.abc import Callable, Coroutine
 from dataclasses import dataclass
 from typing import TYPE_CHECKING, Any
 
-from lingxi.agent.tools import ToolRegistry, register_tool_bridge
+from lingxi.agent.tools import register_tool_bridge
 from lingxi.config import get_settings
 from lingxi.core import get_logger
 from lingxi.core.protocol import ChannelType, IMEvent, OutboundMessage
@@ -67,7 +67,6 @@ class CustomerServicePipeline:
         agent: ZhiXiAgent,
         ticket_store: TicketStore,
         escalation_queue: EscalationQueue,
-        registry: ToolRegistry,
         confidence_threshold: float = 0.6,
         max_agent_timeout: float = 45.0,
         memory_pipeline: Any = None,
@@ -81,13 +80,11 @@ class CustomerServicePipeline:
         self._agent = agent
         self._tickets = ticket_store
         self._queue = escalation_queue
-        self._registry = registry
         self._confidence_threshold = confidence_threshold
         self._max_agent_timeout = max_agent_timeout
         self._memory = memory_pipeline
         self._lorebook = lorebook
         self._knowledge = knowledge
-        self._send_func = send_message_func
         self._rule_engine = rule_engine
         # Phase 2/3: PII 脱敏与审计
         self._pii = pii_guard
@@ -176,9 +173,13 @@ class CustomerServicePipeline:
         memory_block: str = "",
         keyword_escalate_reason: str = "",
         send_func: SendFunc | None = None,
-        current_permission: PermissionLevel = 1,  # noqa: ARG002
+        current_permission: PermissionLevel | None = None,
     ) -> PipelineResult:
-        """处理一条 IM 事件（主入口）。"""
+        """处理一条 IM 事件（主入口）。
+
+        current_permission 由调用方按 user/chat 解析（resolve_permission_level），
+        传入后会写进 AgentState 供 execute_tool 节点鉴权；None 则用引擎默认值。
+        """
         text = event.text.strip()
         if not text:
             # 处理非文本消息（图片/语音/文件）：放行到后续 Agent 处理
@@ -327,6 +328,7 @@ class CustomerServicePipeline:
                         memory_block=memory_block,
                         lorebook_block=lorebook_block,
                         messages=history,
+                        permission_level=current_permission,
                     ),
                     timeout=self._max_agent_timeout,
                 )

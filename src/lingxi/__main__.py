@@ -20,7 +20,7 @@ from __future__ import annotations
 import argparse
 import asyncio
 from dataclasses import dataclass
-from typing import TYPE_CHECKING, Any
+from typing import TYPE_CHECKING, Any, cast
 
 from lingxi import __version__
 from lingxi.agent.graph import get_agent
@@ -34,7 +34,9 @@ from lingxi.flow.ticket import TicketStore
 from lingxi.im.gewechat import GewechatAdapter
 from lingxi.im.napcat import NapCatAdapter
 from lingxi.memory import MemoryPipeline
+from lingxi.memory.graph_store import InMemoryGraphStore, SQLiteGraphStore
 from lingxi.memory.lorebook import Lorebook, LorebookEntry
+from lingxi.persona.guardrails import resolve_permission_level
 from lingxi.persona.injector import PersonaInjector
 from lingxi.persona.schema import PersonaConfig
 
@@ -61,9 +63,6 @@ if TYPE_CHECKING:
 
 log = get_logger(__name__)
 
-# L1：读 + 低风险写（发消息/建工单），与 BLUEPRINT 权限分级对齐
-_PERMISSION_LEVEL: PermissionLevel = 1
-
 
 @dataclass
 class Engine:
@@ -87,22 +86,35 @@ class Engine:
     audit_log: Any = None  # AuditLog | None
     summarizer: Any = None  # SessionSummarizer | None
     pii_guard: Any = None  # PIIGuard | None
+    experiment_engine: Any = None  # ExperimentEngine | None
+    seat_store: Any = None  # SeatStore | None
+    assigner: Any = None  # TicketAssigner | None
+    permission_level: PermissionLevel = 1  # 未命中 permission_rules 时的基线等级
 
     def dashboard_app(self) -> Any:
         """构建与本引擎共享存储的 Dashboard FastAPI 应用。
 
-        此前 create_dashboard_app 只在测试里被调用，没有任何进程入口
-        能启动 HTTP 服务（uvicorn 在 src/ 中零引用），前端永远连不上
-        （见 docs/AUDIT-2026-10-10.md #3）。这里补上服务化能力。
+        ⚠️ 此前这里只传了存储类，agent / experiment_engine / auth_enabled 全是
+        None，而 dashboard_api.py 正是靠 `if xxx is not None` 决定是否注册路由 ——
+        于是生产进程里 SSE 流式端点、A/B 实验端点、JWT 鉴权端点**一个都没挂上**
+        （前端 6 处请求 /api/experiments 必然 404）。单元测试因为自己显式传参
+        所以发现不了。现在把引擎持有的组件全部透传。
         """
         sla_monitor = getattr(self, "_sla_monitor", None)
         rule_engine = getattr(self, "_rule_engine", None)
+        settings = get_settings()
         app = create_dashboard_app(
             self.tickets, self.queue, self.knowledge,
             sla_monitor=sla_monitor,
             rule_engine=rule_engine,
             audit_log=getattr(self, "audit_log", None),
             summarizer=getattr(self, "summarizer", None),
+            agent=self.agent,
+            experiment_engine=getattr(self, "experiment_engine", None),
+            auth_enabled=settings.auth.enabled,
+            seat_store=getattr(self, "seat_store", None),
+            assigner=getattr(self, "assigner", None),
+            persona_config=self.injector._persona,
         )
         # 注册 Gewechat 回调路由 (HTTP POST from 微信服务器)
         for adapter in self.adapters:
@@ -163,6 +175,9 @@ class Engine:
             await asyncio.gather(*adapter_runs, self.serve_dashboard(dashboard_host, dashboard_port))
         finally:
             auto_close_task.cancel()
+            aclose = getattr(self.agent, "aclose", None)
+            if callable(aclose):
+                await aclose()
 
 
 def build_default_engine(
@@ -205,7 +220,16 @@ def build_default_engine(
     if escalation_queue is None:
         escalation_queue = EscalationQueue()
     if memory_pipeline is None:
-        memory_pipeline = MemoryPipeline()
+        # 传入实体图谱：编码出的记忆会抽出实体并建图，
+        # 否则 MemoryItem.entities 恒为空、graph_store 整块无人使用。
+        # 生产用 SQLite（重启不丢）；不持久化时用内存实现。
+        if settings.memory.persistent:
+            graph_store: Any = SQLiteGraphStore(
+                str(settings.data_dir / settings.memory.graph_db_path),
+            )
+        else:
+            graph_store = InMemoryGraphStore()
+        memory_pipeline = MemoryPipeline(graph=graph_store)
 
     memory = memory_pipeline
     tickets = ticket_store
@@ -243,11 +267,30 @@ def build_default_engine(
     registry = _create_default_registry(
         blocked_commands=settings.security.blocked_commands,
     )
+    # 权限基线来自配置（SecurityConfig.default_permission_level），
+    # 每条消息的实际等级由 resolve_permission_level 按 user/chat 解析。
+    permission_level = cast(
+        "PermissionLevel", settings.security.default_permission_level
+    )
     agent = get_agent(
         registry=registry,
-        permission_level=_PERMISSION_LEVEL,
+        permission_level=permission_level,
         max_steps=settings.agent.react_steps,
     )
+
+    # MCP 服务端：把同一份 ToolRegistry 暴露为 MCP / OpenAI 兼容协议，
+    # 供外部客户端（Cursor / Claude Desktop 等）复用引擎能力。
+    # resources/prompts 两个原语接的是真实数据源：知识库、人格配置、实体图谱。
+    from lingxi.mcp.primitives import build_default_registry as build_mcp_registry
+    from lingxi.mcp.primitives import set_resource_registry
+    from lingxi.mcp.server import init_mcp_server
+
+    init_mcp_server(registry, min_permission=permission_level)
+    set_resource_registry(build_mcp_registry(
+        knowledge=knowledge,
+        persona=injector._persona,
+        graph=getattr(memory, "graph", None),
+    ))
 
     async def _send(msg: OutboundMessage) -> None:
         """多通道智能路由：根据 msg.channel 选适配器发送。"""
@@ -284,7 +327,6 @@ def build_default_engine(
         agent=agent,
         ticket_store=tickets,
         escalation_queue=queue,
-        registry=registry,
         confidence_threshold=settings.agent.confidence_threshold,
         memory_pipeline=memory,
         send_message_func=_send,
@@ -301,7 +343,8 @@ def build_default_engine(
         lorebook_block = ""
         keyword_escalate_reason = ""
         if event.text:
-            memory_block = memory.recall(
+            # 混合召回：字面 n-gram + 实体图谱（共享实体但措辞不同的记忆也能命中）
+            memory_block = memory.recall_hybrid(
                 user_id=event.user_id, query=event.text,
             ).render_for_prompt()
             if lorebook is not None:
@@ -317,21 +360,41 @@ def build_default_engine(
             lorebook_block=lorebook_block,
             user_message=event.text,
         )
+        # 分级权限按 user/chat 解析（SecurityConfig.permission_rules），
+        # 不再是写死的全局常量（见 docs/AUDIT-2026-10-10.md #4）
+        level = resolve_permission_level(
+            user_id=event.user_id,
+            chat_id=event.chat_id,
+            default_level=permission_level,
+        )
         await pipeline.handle_event(
             event,
             system_prompt=system_prompt,
             memory_block=memory_block,
             keyword_escalate_reason=keyword_escalate_reason,
             send_func=_send,
-            current_permission=_PERMISSION_LEVEL,
+            current_permission=level,
         )
 
     # 所有适配器共享同一个事件处理入口
     for _adapter in adapters:
         _adapter._on_event = _on_event
 
+    # A/B 实验引擎：挂到 Dashboard 后 /api/experiments* 才存在（此前从未构造 → 404）
+    from lingxi.experiment import ExperimentEngine
+
+    experiment_engine = ExperimentEngine()
+
+    # 坐席管理：注册/状态/分配/利用率，供 dashboard 的 /api/seats* 使用
+    from lingxi.seat.assignment import TicketAssigner
+    from lingxi.seat.models import SeatStore
+
+    seat_store = SeatStore()
+    assigner = TicketAssigner(seat_store)
+
     log.info("engine_built", channels=im_channels, adapters=len(adapters),
-             persistent=hasattr(tickets, '_writer'))
+             persistent=hasattr(tickets, '_writer'),
+             permission_level=permission_level)
     return Engine(
         agent=agent,
         pipeline=pipeline,
@@ -347,6 +410,10 @@ def build_default_engine(
         audit_log=audit_log,
         summarizer=summarizer,
         pii_guard=pii_guard,
+        experiment_engine=experiment_engine,
+        seat_store=seat_store,
+        assigner=assigner,
+        permission_level=permission_level,
     )
 
 
@@ -549,8 +616,15 @@ async def _build_persistent_engine(
 ) -> Engine:
     """异步创建持久化存储 + 构建引擎。"""
     from lingxi.flow.persistence import create_persistent_stores
+    from lingxi.memory.graph_store import SQLiteGraphStore
 
-    tickets, queue, memory = await create_persistent_stores(db_path)
+    # 图谱随记忆一起持久化：否则持久化模式下实体图谱整体失效
+    # （编码不建边、recall_hybrid 图谱分支恒空、MCP graph://stats 不注册）
+    settings = get_settings()
+    graph = SQLiteGraphStore(
+        str(settings.data_dir / settings.memory.graph_db_path),
+    )
+    tickets, queue, memory = await create_persistent_stores(db_path, graph=graph)
     log.info("persistent_stores_created",
              tickets=0,
              queue=queue.pending_count if hasattr(queue, 'pending_count') else 0,

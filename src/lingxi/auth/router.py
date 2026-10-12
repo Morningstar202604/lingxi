@@ -23,7 +23,11 @@ from fastapi import APIRouter, Depends, HTTPException, status
 from pydantic import BaseModel
 
 from lingxi.auth.deps import get_current_user, require_permission
-from lingxi.auth.jwt import create_access_token
+from lingxi.auth.jwt import (
+    JwtSecretNotConfiguredError,
+    create_access_token,
+    resolve_signing_secret,
+)
 from lingxi.auth.models import (
     ROLE_PERMISSIONS,
     Permission,
@@ -103,11 +107,21 @@ async def login(body: LoginRequest) -> LoginResponse:
         )
 
     settings = get_settings()
+    try:
+        secret = resolve_signing_secret(settings.auth.jwt_secret)
+    except JwtSecretNotConfiguredError as e:
+        # 绝不退化用默认密钥签发：那种 token 任何读过源码的人都能伪造
+        log.error("login_jwt_secret_unconfigured", username=user.username)
+        raise HTTPException(
+            status_code=status.HTTP_503_SERVICE_UNAVAILABLE,
+            detail="JWT signing secret is not configured",
+        ) from e
+
     token = create_access_token(
         username=user.username,
         role=user.role,
         tenant_id=user.tenant_id,
-        secret=settings.auth.jwt_secret,
+        secret=secret,
         expires_minutes=settings.auth.jwt_expire_minutes,
     )
 

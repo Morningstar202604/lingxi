@@ -73,6 +73,19 @@ _GW_MSG_CARD = 49
 _GW_MSG_SYSTEM = 10002
 
 
+class GewechatCallbackAuthError(Exception):
+    """微信回调验签失败或未配置验签令牌。
+
+    为什么必须是独立异常而不是静默 return：
+    旧实现在验签不通过时只 log.warning 后 return，路由照样返回 {"ret": 0}，
+    调用方（以及我们自己的日志）无法区分「已处理」和「被拒绝」。
+    """
+
+    def __init__(self, reason: str) -> None:
+        super().__init__(reason)
+        self.reason = reason
+
+
 class GewechatAdapter(IMAdapter):
     """ Gewechat 适配器：HTTP REST + Callback 接收。
 
@@ -183,15 +196,29 @@ class GewechatAdapter(IMAdapter):
 
         Args:
             payload: Gewechat POST body（包含 data 字段）
-            callback_token: 从请求头 X-GEWE-TOKEN 传入的令牌，
-                用于验签。为 None 时跳过验证（仅开发模式）。
+            callback_token: 从请求头 X-GEWE-TOKEN 传入的令牌
+
+        Raises:
+            GewechatCallbackAuthError: 令牌缺失、不匹配，或服务端未配置令牌。
+
+        安全约束（fail-closed，见 docs/AUDIT-2026-10-10.md）：
+            此回调是**公网可达的入口**，它把任意 JSON 变成 IMEvent 并驱动
+            具备高权限工具调用能力的 Agent。旧实现的条件是
+            `if self._token and callback_token is not None and not compare_digest(...)`，
+            攻击者只要**省略 X-GEWE-TOKEN 头**就让 `callback_token is None`
+            短路掉整个校验，直接冒充任意 fromUser 与机器人对话。
+            现在：不带令牌 = 拒绝；服务端没配令牌 = 一律拒绝并要求先配置。
+            不存在"开发模式跳过验签"这条路。
         """
-        # Token 验签：生产环境必须校验，否则任何人可伪造消息注入
-        if self._token and callback_token is not None and not secrets.compare_digest(
-            callback_token, self._token,
-        ):
-            log.warning("gewechat_callback_token_mismatch")
-            return
+        if not self._token:
+            log.error("gewechat_callback_token_unconfigured", path=self._callback_path)
+            raise GewechatCallbackAuthError(
+                "Gewechat callback token is not configured (LINGXI_GEWECHAT__TOKEN). "
+                "Refusing to accept unauthenticated WeChat callbacks."
+            )
+        if callback_token is None or not secrets.compare_digest(callback_token, self._token):
+            log.warning("gewechat_callback_token_mismatch", header_present=callback_token is not None)
+            raise GewechatCallbackAuthError("Invalid or missing X-GEWE-TOKEN")
 
         # Gewechat 的 POST body 最外层是 data 字段
         data = payload.get("data") or payload
@@ -208,7 +235,8 @@ class GewechatAdapter(IMAdapter):
         Gewechat 是 HTTP 回调模式：微信服务器 POST 到我们的端口，
         不需要 WebSocket 长连接。路由注册到 Dashboard FastAPI 即可。
         """
-        from fastapi import Header
+        from fastapi import Header, HTTPException
+        from fastapi import status as http_status
 
         _self = self
 
@@ -216,7 +244,16 @@ class GewechatAdapter(IMAdapter):
             data: dict[str, Any],
             x_gewe_token: str | None = Header(None),  # noqa: N803
         ) -> dict[str, Any]:
-            await _self.handle_callback({"data": data}, callback_token=x_gewe_token)
+            try:
+                await _self.handle_callback({"data": data}, callback_token=x_gewe_token)
+            except GewechatCallbackAuthError as e:
+                # 503 = 服务端没配令牌（配置问题）；403 = 令牌不对/缺失（拒绝该请求）
+                code = (
+                    http_status.HTTP_503_SERVICE_UNAVAILABLE
+                    if "not configured" in e.reason
+                    else http_status.HTTP_403_FORBIDDEN
+                )
+                raise HTTPException(status_code=code, detail=e.reason) from e
             return {"ret": 0}
 
         return {

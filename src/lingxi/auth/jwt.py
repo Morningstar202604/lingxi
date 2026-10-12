@@ -37,6 +37,28 @@ if TYPE_CHECKING:
 log = get_logger(__name__)
 
 
+class JwtSecretNotConfiguredError(RuntimeError):
+    """jwt_secret 未配置。签发/校验 token 前必须拿到真实密钥。"""
+
+
+def resolve_signing_secret(secret: str | None) -> str:
+    """把 settings.auth.jwt_secret 收敛成可用的 str，缺失即拒绝。
+
+    为什么需要这个函数：`AuthConfig.jwt_secret` 现在允许为 None（不再有内置默认值），
+    而 create_access_token / decode_access_token 的入参是 str。如果没有这层收口，
+    调用方要么把 None 直接传进 PyJWT（行为未定义），要么各自写一遍判空。
+
+    密钥强度与"是否还是公开默认值"的策略不在这里重复 —— 那是
+    config.settings.AuthConfig 的 model_validator 负责的单一出处。
+    """
+    if secret is None or not secret.strip():
+        raise JwtSecretNotConfiguredError(
+            "auth.jwt_secret 未配置，拒绝签发/校验 token。"
+            "请设置 LINGXI_AUTH__JWT_SECRET。"
+        )
+    return secret
+
+
 def create_access_token(
     username: str,
     role: UserRole,

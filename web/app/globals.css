@@ -18,6 +18,32 @@ body {
   min-height: 100vh;
 }
 
+/* 暗色底上的可读性：中文正文浅灰纯白刺眼、调暗反而更舒服 */
+body {
+  -webkit-font-smoothing: antialiased;
+  text-rendering: optimizeLegibility;
+}
+
+/* 滚动淡入：内容换页时给一点方向感，避免硬切 */
+@keyframes fade-up {
+  from {
+    opacity: 0;
+    transform: translateY(6px);
+  }
+  to {
+    opacity: 1;
+    transform: translateY(0);
+  }
+}
+.page-enter {
+  animation: fade-up 0.35s ease-out both;
+}
+
+/* 数字用等宽字形：指标每 5 秒跳动时不会左右抖动 */
+.tabular {
+  font-variant-numeric: tabular-nums;
+}
+
 /* Thin scrollbar */
 ::-webkit-scrollbar {
   width: 6px;

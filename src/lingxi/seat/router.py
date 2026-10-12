@@ -26,7 +26,7 @@ from __future__ import annotations
 
 from typing import TYPE_CHECKING, Any
 
-from fastapi import APIRouter, HTTPException, status
+from fastapi import APIRouter, Depends, Header, HTTPException, status
 from pydantic import BaseModel, Field
 
 from lingxi.core import get_logger
@@ -36,6 +36,30 @@ if TYPE_CHECKING:
     from lingxi.seat.assignment import TicketAssigner
 
 log = get_logger(__name__)
+
+# 与 SecurityConfig.admin_token 的默认值一致，用于识别"未改配置"
+_DEFAULT_ADMIN_TOKEN = "change-me-in-production"
+
+
+def _require_admin(x_admin_token: str | None = Header(None)) -> None:
+    """坐席接口的管理凭据校验。
+
+    这些端点能注册坐席、分配与释放工单 —— 属于写管理面。此前该模块从未挂载，
+    所以没有鉴权也无人察觉；一旦 include_router 就会变成裸奔的写接口。
+    """
+    import secrets
+
+    from lingxi.config.settings import get_settings
+
+    settings = get_settings()
+    expected = settings.security.admin_token.get_secret_value()
+    if expected == _DEFAULT_ADMIN_TOKEN and not settings.debug:
+        raise HTTPException(
+            status_code=503,
+            detail="未配置管理凭据：请设置 LINGXI_SECURITY__ADMIN_TOKEN",
+        )
+    if not x_admin_token or not secrets.compare_digest(x_admin_token, expected):
+        raise HTTPException(status_code=401, detail="Unauthorized")
 
 
 # ── Request / Response 模型 ─────────────────────────────────────
@@ -93,7 +117,8 @@ def create_seat_router(
             prefix="/api",
         )
     """
-    router = APIRouter(tags=["seats"])
+    # 全路由统一挂管理凭据依赖：注册坐席 / 分配工单都是写操作
+    router = APIRouter(tags=["seats"], dependencies=[Depends(_require_admin)])
 
     @router.post("/seats", response_model=SeatResponse, status_code=201)
     async def register_seat(body: RegisterSeatRequest) -> SeatResponse:
@@ -114,6 +139,34 @@ def create_seat_router(
     async def list_seats() -> list[SeatResponse]:
         """列出所有坐席。"""
         return [_to_response(s) for s in seat_store.list_all()]
+
+    # ⚠️ 路由顺序敏感：FastAPI/Starlette 按注册顺序匹配，
+    # "/seats/metrics" 必须注册在 "/seats/{username}" 之前，
+    # 否则 metrics 会被当成 username="metrics" 去查坐席 → 404。
+    @router.get("/seats/metrics", response_model=MetricsResponse)
+    async def get_seat_metrics() -> MetricsResponse:
+        """获取坐席利用率报表。
+
+        如果 assigner 已配置则使用 assigner.get_metrics,
+        否则返回基础统计。
+        """
+        if assigner is not None:
+            return MetricsResponse(**assigner.get_metrics())
+
+        # Fallback: 直接从 SeatStore 计算
+        all_seats = seat_store.list_all()
+        online = sum(1 for s in all_seats if s.status in ("idle", "busy"))
+        busy = [s for s in all_seats if s.status == "busy"]
+        return MetricsResponse(
+            total_seats=len(all_seats),
+            online=online,
+            utilization_rate=round(len(busy) / online, 2) if online else 0.0,
+            avg_tickets_per_busy_seat=round(
+                sum(s.current_ticket_count for s in busy) / len(busy), 1,
+            )
+            if busy
+            else 0.0,
+        )
 
     @router.get("/seats/{username}", response_model=SeatResponse)
     async def get_seat(username: str) -> SeatResponse:
@@ -209,31 +262,6 @@ def create_seat_router(
         raise HTTPException(
             status_code=status.HTTP_409_CONFLICT,
             detail=f"Assignment failed: {result}",
-        )
-
-    @router.get("/seats/metrics", response_model=MetricsResponse)
-    async def get_seat_metrics() -> MetricsResponse:
-        """获取坐席利用率报表。
-
-        如果 assigner 已配置则使用 assigner.get_metrics,
-        否则返回基础统计。
-        """
-        if assigner is not None:
-            return MetricsResponse(**assigner.get_metrics())
-
-        # Fallback: 直接从 SeatStore 计算
-        all_seats = seat_store.list_all()
-        online = sum(1 for s in all_seats if s.status in ("idle", "busy"))
-        busy = [s for s in all_seats if s.status == "busy"]
-        return MetricsResponse(
-            total_seats=len(all_seats),
-            online=online,
-            utilization_rate=round(len(busy) / online, 2) if online else 0.0,
-            avg_tickets_per_busy_seat=round(
-                sum(s.current_ticket_count for s in busy) / len(busy), 1,
-            )
-            if busy
-            else 0.0,
         )
 
     return router

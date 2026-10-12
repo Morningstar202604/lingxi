@@ -460,3 +460,157 @@ export async function recordExperimentMetric(
   if (!res.ok) throw new Error(`API error: ${res.status}`);
   return res.json();
 }
+
+// ── SSE 事件流（fetch + ReadableStream）──
+// 不用 EventSource：它不支持自定义请求头，而 /api/events 要求 x-admin-token。
+// 把 token 塞进 query 会进浏览器历史、Nginx 访问日志与 Referer —— 那是降级
+// 安全。这里自己解 SSE 帧，代价是 ~40 行，换来凭据只走请求头。
+export interface SSEEvent {
+  event: string;
+  data: unknown;
+}
+
+export type SSEHandler = (ev: SSEEvent) => void;
+
+/**
+ * 订阅后端 SSE。返回 close() 用于取消订阅。
+ *
+ * 解析规则按 W3C EventSource：事件以空行分隔，data: 多行拼接，
+ * 注释行（以 : 开头）忽略。
+ */
+export async function subscribeSSE(
+  path: string,
+  onEvent: SSEHandler,
+  opts: { signal?: AbortSignal; method?: string; body?: unknown } = {},
+): Promise<() => void> {
+  const controller = new AbortController();
+  if (opts.signal) {
+    opts.signal.addEventListener("abort", () => controller.abort(), { once: true });
+  }
+
+  const res = await fetch(`${API_BASE}${path}`, {
+    method: opts.method ?? "GET",
+    headers: {
+      ...authHeaders(),
+      ...(opts.body ? { "Content-Type": "application/json" } : {}),
+    },
+    body: opts.body ? JSON.stringify(opts.body) : undefined,
+    signal: controller.signal,
+    cache: "no-store",
+  });
+
+  if (!res.ok || !res.body) {
+    throw new Error(`SSE 连接失败: ${res.status}`);
+  }
+
+  const reader = res.body.getReader();
+  const decoder = new TextDecoder();
+  let buffer = "";
+
+  void (async () => {
+    try {
+      for (;;) {
+        const { done, value } = await reader.read();
+        if (done) break;
+        buffer += decoder.decode(value, { stream: true });
+
+        // 按空行切帧（兼容 \n\n 与 \r\n\r\n）
+        for (;;) {
+          const sep = /\r?\n\r?\n/.exec(buffer);
+          if (!sep) break;
+          const frame = buffer.slice(0, sep.index);
+          buffer = buffer.slice(sep.index + sep[0].length);
+
+          let event = "message";
+          const dataLines: string[] = [];
+          for (const line of frame.split(/\r?\n/)) {
+            if (!line || line.startsWith(":")) continue;
+            if (line.startsWith("event:")) event = line.slice(6).trim();
+            else if (line.startsWith("data:")) dataLines.push(line.slice(5).trim());
+          }
+          if (!dataLines.length) continue;
+          const raw = dataLines.join("\n");
+          let parsed: unknown = raw;
+          try {
+            parsed = JSON.parse(raw);
+          } catch {
+            /* 非 JSON 原样透传 */
+          }
+          onEvent({ event, data: parsed });
+        }
+      }
+    } catch {
+      // 取消订阅或连接断开：静默结束，交由调用方处理重连
+    }
+  })();
+
+  return () => controller.abort();
+}
+
+/** 订阅升级/认领/关闭事件流 */
+export function subscribeQueueEvents(
+  onEvent: SSEHandler,
+  opts: { signal?: AbortSignal } = {},
+): Promise<() => void> {
+  return subscribeSSE("/api/events", onEvent, opts);
+}
+
+// ── 人格配置 (Persona 13 模块) ──
+
+export interface PersonaIdentity {
+  name: string;
+  role: string;
+  backstory: string;
+  avatar_url: string | null;
+  speaking_style: string;
+  signature: string;
+}
+
+export interface KeywordRule {
+  keywords: string[];
+  action: string;
+  payload: string;
+  priority: number;
+}
+
+export interface PersonaState {
+  identity: PersonaIdentity;
+  behavior: Record<string, unknown>;
+  modules: Record<string, boolean>;
+  active_modules: string[];
+  keyword_rules: KeywordRule[];
+  custom_prompt_keys: string[];
+}
+
+export interface PersonaPreview {
+  system_prompt: string;
+  chars: number;
+  guardrail: { verdict: string; pattern: string | null };
+}
+
+export async function fetchPersona(): Promise<PersonaState> {
+  const res = await fetch(`${API_BASE}/api/persona`, {
+    headers: authHeaders(),
+    cache: "no-store",
+  });
+  if (!res.ok) throw new Error(`API error: ${res.status}`);
+  return res.json();
+}
+
+export async function previewPersona(
+  message: string,
+  memoryBlock = "",
+  lorebookBlock = "",
+): Promise<PersonaPreview> {
+  const res = await fetch(`${API_BASE}/api/persona/preview`, {
+    method: "POST",
+    headers: { ...authHeaders(), "Content-Type": "application/json" },
+    body: JSON.stringify({
+      message,
+      memory_block: memoryBlock,
+      lorebook_block: lorebookBlock,
+    }),
+  });
+  if (!res.ok) throw new Error(`API error: ${res.status}`);
+  return res.json();
+}

@@ -22,7 +22,11 @@
 from __future__ import annotations
 
 import threading
-from datetime import datetime
+
+# datetime.utcnow() 自 Python 3.12 起弃用并已排期移除；
+# 且本项目把 DeprecationWarning 当 error（pyproject filterwarnings），
+# 所以统一走 timezone-aware 的 datetime.now(UTC)。
+from datetime import UTC, datetime
 from enum import StrEnum
 
 from pydantic import BaseModel, Field
@@ -61,7 +65,7 @@ class Seat(BaseModel):
     total_handled: int = 0         # 累计处理数
     avg_response_seconds: float = 0.0
     last_active_at: datetime | None = None
-    created_at: datetime = Field(default_factory=datetime.utcnow)
+    created_at: datetime = Field(default_factory=lambda: datetime.now(UTC))
 
     @property
     def has_capacity(self) -> bool:
@@ -132,7 +136,7 @@ class SeatStore:
                 )
                 return False
             seat.status = status
-            seat.last_active_at = datetime.utcnow()
+            seat.last_active_at = datetime.now(UTC)
             if (
                 status == SeatStatus.IDLE
                 and seat.current_ticket_count >= seat.max_concurrent
@@ -190,7 +194,7 @@ class SeatStore:
             # 达到上限 -> 状态自动转为 BUSY
             if seat.current_ticket_count >= seat.max_concurrent:
                 seat.status = SeatStatus.BUSY
-            seat.last_active_at = datetime.utcnow()
+            seat.last_active_at = datetime.now(UTC)
             log.info(
                 "seat_ticket_assigned",
                 username=username,

@@ -22,6 +22,7 @@
 """
 from __future__ import annotations
 
+import secrets
 from typing import Any
 
 from fastapi import APIRouter, Header, HTTPException
@@ -30,6 +31,30 @@ from lingxi.core import get_logger
 from lingxi.mcp.models import JSONRPCRequest, JSONRPCResponse, MCPErrorCode
 
 log = get_logger(__name__)
+
+# 与 SecurityConfig.admin_token 的默认值一致，用于识别"未改配置"
+_DEFAULT_ADMIN_TOKEN = "change-me-in-production"
+
+
+def _require_admin(x_admin_token: str | None) -> None:
+    """管理凭据校验（与 dashboard_api.py / workflow/router.py 同一套策略）。
+
+    🔗 安全
+        此前这些端点**只看 X-Miner-Permission 头就放行** —— 那是一个权限等级，
+        不是凭据，等于任何人都能声称自己是 L4 并直接调 shell。把接口挂上
+        FastAPI 之前必须先补这一层，否则挂载本身就是在开后门。
+    """
+    from lingxi.config.settings import get_settings
+
+    settings = get_settings()
+    expected = settings.security.admin_token.get_secret_value()
+    if expected == _DEFAULT_ADMIN_TOKEN and not settings.debug:
+        raise HTTPException(
+            status_code=503,
+            detail="未配置管理凭据：请设置 LINGXI_SECURITY__ADMIN_TOKEN",
+        )
+    if not x_admin_token or not secrets.compare_digest(x_admin_token, expected):
+        raise HTTPException(status_code=401, detail="Unauthorized")
 
 
 def create_mcp_router() -> APIRouter:
@@ -43,8 +68,10 @@ def create_mcp_router() -> APIRouter:
     @router.get("/tools/list")
     async def mcp_list_tools(
         x_permission: int = Header(default=0, alias="X-Miner-Permission"),
+        x_admin_token: str | None = Header(None),
     ) -> JSONRPCResponse:
         """返回可用工具列表 (MCP 风格)。"""
+        _require_admin(x_admin_token)
         from lingxi.mcp.server import get_mcp_server
 
         server = get_mcp_server()
@@ -70,8 +97,10 @@ def create_mcp_router() -> APIRouter:
     async def mcp_call_tool(
         body: JSONRPCRequest,
         x_permission: int = Header(default=0, alias="X-Miner-Permission"),
+        x_admin_token: str | None = Header(None),
     ) -> JSONRPCResponse:
         """MCP 风格调用一个工具: {...method:"tools/call", params:{name, arguments}}。"""
+        _require_admin(x_admin_token)
         from lingxi.mcp.server import get_mcp_server
 
         server = get_mcp_server()
@@ -94,8 +123,10 @@ def create_mcp_router() -> APIRouter:
     async def mcp_rpc(
         body: JSONRPCRequest,
         x_permission: int = Header(default=0, alias="X-Miner-Permission"),
+        x_admin_token: str | None = Header(None),
     ) -> JSONRPCResponse:
         """通用 JSON-RPC 端点: 根据 method 字段分发。"""
+        _require_admin(x_admin_token)
         from lingxi.mcp.server import get_mcp_server
 
         server = get_mcp_server()
@@ -127,12 +158,14 @@ def create_openai_tools_router() -> APIRouter:
     @router.get("/tools")
     async def openai_list_tools(
         x_permission: int = Header(default=0, alias="X-Miner-Permission"),
+        x_admin_token: str | None = Header(None),
     ) -> dict[str, Any]:
         """OpenAI 风格工具列表。
 
         把 MCP tools/list 的结果包装成 OpenAI function calling 格式:
         {"object": "list", "data": [{"type": "function", "function": {"name": ..., "description": ..., "parameters": {...}}}]}
         """
+        _require_admin(x_admin_token)
         from lingxi.mcp.server import get_mcp_server
 
         server = get_mcp_server()
@@ -160,6 +193,7 @@ def create_openai_tools_router() -> APIRouter:
     async def openai_call_tool(
         body: dict[str, Any],
         x_permission: int = Header(default=0, alias="X-Miner-Permission"),
+        x_admin_token: str | None = Header(None),
     ) -> dict[str, Any]:
         """OpenAI 风格工具调用。
 
@@ -175,6 +209,7 @@ def create_openai_tools_router() -> APIRouter:
             "isError": false
         }
         """
+        _require_admin(x_admin_token)
         from lingxi.mcp.server import get_mcp_server
 
         server = get_mcp_server()

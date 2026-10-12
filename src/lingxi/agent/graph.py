@@ -10,7 +10,10 @@
 from __future__ import annotations
 
 from functools import cache, partial
-from typing import Any
+from typing import TYPE_CHECKING, Any
+
+if TYPE_CHECKING:
+    from collections.abc import AsyncIterator
 
 from langgraph.checkpoint.memory import MemorySaver
 from langgraph.graph import END, START, StateGraph
@@ -68,13 +71,27 @@ class ZhiXiAgent:
         self._max_steps = max_steps
         self._checkpointer_factory = checkpointer_factory
         self._checkpointer_cm: Any = None  # async context manager（lazy init）
+        self._checkpointer_saver: Any = None
         # 默认使用 MemorySaver，保证多轮会话状态在同一进程内持久化
         effective_checkpointer = checkpointer if checkpointer is not None else MemorySaver()
         self._graph = self._build_graph(effective_checkpointer)
+        # 流式专用图：reason 走 token 级输出。惰性构建，跑不到流式就不付这个成本。
+        self._stream_graph: Any = None
 
-    def _build_graph(self, checkpointer: Any) -> Any:
+    def _build_graph(self, checkpointer: Any, stream: bool = False) -> Any:
+        """组装图。
+
+        `stream=True` 时 reason 走流式节点。两者是**同一张图、同一套状态机**，
+        只是 reason 内部的 LLM 调用方式不同 —— 不存在"流式另走一套逻辑"
+        导致两边行为漂移的风险。
+        """
         builder = StateGraph(AgentState)
-        builder.add_node("reason", reason_node)
+        # registry 必须绑进 reason 节点：没有它就不会向模型下发 tools=，
+        # 工具调用链路整条断开（见 docs/AUDIT-2026-10-10.md #1）
+        builder.add_node(
+            "reason",
+            partial(reason_node, registry=self._registry, stream=stream),
+        )
         # 用 partial 绑定当前实例的 registry + permission，避免模块级全局变量
         builder.add_node(
             "execute_tool",
@@ -101,14 +118,137 @@ class ZhiXiAgent:
         首次调用时，若 _checkpointer_factory 已设置，则 async with 初始化真实的 checkpointer
         并重建 graph（确保 LangGraph ainvoke 使用持久化的 state）。
         """
-        if self._checkpointer_factory is not None and self._checkpointer_cm is None:
-            self._checkpointer_cm = self._checkpointer_factory
-            saver = await self._checkpointer_cm.__aenter__()
-            self._graph = self._build_graph(saver)
-
+        await self._ensure_checkpointer()
         return await self._run_inner(**kwargs)
 
-    async def _run_inner(
+    async def resume(
+        self,
+        channel: str,
+        chat_id: str,
+        decision: dict[str, Any],
+    ) -> dict[str, Any]:
+        """从挂起点恢复图（L2/L3 人工审批用）。
+
+        `decision` 形如 ``{"approved": True, "approver": "alice"}``，
+        它会成为节点里 `interrupt()` 的返回值。
+
+        thread_id 必须与首次 `run()` 一致（`f"{channel}:{chat_id}"`），
+        否则恢复不到挂起点 —— 这也是审批记录里存 chat_id 的原因。
+        """
+        from langgraph.types import Command
+
+        await self._ensure_checkpointer()
+        thread_id = f"{channel}:{chat_id}"
+        config = {"configurable": {"thread_id": thread_id}}
+        try:
+            final_state = await self._graph.ainvoke(
+                Command(resume=decision), config=config,
+            )
+        except Exception as e:
+            log.exception("graph_resume_failed", chat_id=chat_id, error=str(e))
+            return {
+                "final_reply": "",
+                "escalate_reason": f"审批恢复失败: {type(e).__name__}",
+                "confidence": 0.0,
+                "step_count": 0,
+                "tool_results": [],
+                "token_usage": {},
+            }
+
+        return {
+            "final_reply": final_state.get("final_reply", ""),
+            "tool_results": final_state.get("tool_results", []),
+            "escalate_reason": final_state.get("escalate_reason", ""),
+            "step_count": final_state.get("step_count", 0),
+            "confidence": final_state.get("confidence", 0.0),
+            "token_usage": final_state.get("token_usage", {}),
+        }
+
+    async def aclose(self) -> None:
+        """释放 checkpointer 持有的资源（SQLite 连接等）。
+
+        lazy __aenter__ 必须配对 __aexit__，否则 sqlite 连接泄漏到进程结束
+        （见 docs/AUDIT-2026-10-10.md #18）。
+        """
+        cm, self._checkpointer_cm = self._checkpointer_cm, None
+        self._checkpointer_saver = None
+        if cm is not None:
+            await cm.__aexit__(None, None, None)
+
+    async def astream(
+        self,
+        raw_message: str,
+        chat_id: str,
+        user_id: str,
+        channel: str,
+        system_prompt: str = "",
+        messages: list[dict[str, Any]] | None = None,
+        permission_level: PermissionLevel | None = None,
+    ) -> AsyncIterator[dict[str, Any]]:
+        """逐 token 流式推理。
+
+        🔗 工程逻辑
+            走 `graph.astream(stream_mode="custom")`：这是节点内
+            `get_stream_writer()` 写入内容的**唯一出口**。
+            （`astream_events(v2)` 只给 on_chain_stream 的 state 增量，
+            在里面看不到 writer 写的事件 —— 实测过，那条路拿不到 token。）
+
+            与 `run()` 的区别仅在传输层：**同一张图、同一套状态机**，
+            只有 reason 内部的 LLM 调用方式不同，因此不存在"流式走另一套
+            逻辑"导致两边行为分叉的风险。
+
+        调用方**必须**在自己的协程里逐个消费并转发::
+
+            writer = get_stream_writer()
+            async for ev in agent.astream(...):
+                yield ev
+
+        产出的是领域事件（token / tool_call / tool_result / error），
+        调用方负责转成 SSE 或其他传输格式。
+        """
+        await self._ensure_checkpointer()
+        if self._stream_graph is None:
+            self._stream_graph = self._build_graph(
+                self._checkpointer_saver or MemorySaver(), stream=True,
+            )
+
+        initial = self._initial_state(
+            raw_message=raw_message,
+            chat_id=chat_id,
+            user_id=user_id,
+            channel=channel,
+            system_prompt=system_prompt,
+            messages=messages,
+            permission_level=permission_level,
+        )
+        config = {"configurable": {"thread_id": f"{channel}:{chat_id}"}}
+
+        try:
+            # stream_mode="custom" 才是节点内 get_stream_writer() 的出口。
+            # astream_events(v2) 只会给 on_chain_stream（state 增量），
+            # writer 写的内容在里面**看不到** —— 实测过，别再退回那条路。
+            async for chunk in self._stream_graph.astream(
+                initial, config=config, stream_mode="custom",
+            ):
+                if isinstance(chunk, dict):
+                    yield chunk
+        except Exception as e:  # noqa: BLE001 — 流式边界要把异常转成事件
+            log.exception("astream_failed", chat_id=chat_id, error=str(e))
+            yield {"type": "error", "error": f"{type(e).__name__}: {e}"}
+
+    async def _ensure_checkpointer(self) -> None:
+        """惰性初始化 checkpointer 并重建主图。
+
+        流式图复用同一个 saver（否则两套 checkpoint 会打架，同一会话状态分裂）。
+        """
+        if self._checkpointer_factory is None or self._checkpointer_cm is not None:
+            return
+        self._checkpointer_cm = self._checkpointer_factory
+        self._checkpointer_saver = await self._checkpointer_cm.__aenter__()
+        self._graph = self._build_graph(self._checkpointer_saver)
+        self._stream_graph = None  # 用新 saver 重建流式图
+
+    def _initial_state(
         self,
         raw_message: str,
         chat_id: str,
@@ -118,8 +258,10 @@ class ZhiXiAgent:
         memory_block: str = "",
         lorebook_block: str = "",
         messages: list[dict[str, Any]] | None = None,
-    ) -> dict[str, Any]:
-        initial: AgentState = {
+        permission_level: PermissionLevel | None = None,
+    ) -> AgentState:
+        """构造首轮 state（run 与 astream 共用，避免两边漂移）。"""
+        return {
             "user_id": user_id,
             "chat_id": chat_id,
             "channel": channel,
@@ -136,12 +278,48 @@ class ZhiXiAgent:
             "stage": "opening",
             "emotion": "calm",
             "pending_tool_call": None,
+            "pending_tool_calls": [],
             "tool_results": [],
+            "tool_call_signatures": [],
+            "token_usage": {},
             "next_step": "reason",
             "final_reply": "",
             "escalate_reason": "",
             "confidence": 0.0,
+            "current_permission": (
+                int(permission_level) if permission_level is not None
+                else int(self._permission_level)
+            ),
         }
+
+    async def _run_inner(
+        self,
+        raw_message: str,
+        chat_id: str,
+        user_id: str,
+        channel: str,
+        system_prompt: str = "",
+        memory_block: str = "",
+        lorebook_block: str = "",
+        messages: list[dict[str, Any]] | None = None,
+        permission_level: PermissionLevel | None = None,
+    ) -> dict[str, Any]:
+        """跑一轮推理。
+
+        permission_level 由调用方按 user/chat 解析后传入；为 None 时退回
+        引擎级默认值（SecurityConfig.default_permission_level）。
+        """
+        initial = self._initial_state(
+            raw_message=raw_message,
+            chat_id=chat_id,
+            user_id=user_id,
+            channel=channel,
+            system_prompt=system_prompt,
+            memory_block=memory_block,
+            lorebook_block=lorebook_block,
+            messages=messages,
+            permission_level=permission_level,
+        )
 
         # 始终使用确定性 thread_id（基于 channel + chat_id），
         # 保证同一会话多轮对话状态在 checkpointer 中连续累积
@@ -156,6 +334,9 @@ class ZhiXiAgent:
                 "final_reply": "服务暂时不可用，请稍后再试。",
                 "escalate_reason": str(e),
                 "confidence": 0.0,
+                "step_count": 0,
+                "tool_results": [],
+                "token_usage": {},
             }
 
         return {
@@ -164,6 +345,7 @@ class ZhiXiAgent:
             "escalate_reason": final_state.get("escalate_reason", ""),
             "step_count": final_state.get("step_count", 0),
             "confidence": final_state.get("confidence", 0.0),
+            "token_usage": final_state.get("token_usage", {}),
         }
 
 

@@ -38,6 +38,9 @@ from lingxi.config import get_settings
 from lingxi.core import get_logger
 from lingxi.core.logging import memory_handler
 from lingxi.flow.ticket import TicketStatus
+from lingxi.persona.guardrails import detect_injection
+from lingxi.persona.injector import PersonaInjector
+from lingxi.persona.schema import PersonaConfig
 
 log = get_logger(__name__)
 
@@ -56,6 +59,9 @@ def create_dashboard_app(
     agent: Any = None,  # ZhiXiAgent | None — 用于 SSE 流式推理端点
     auth_enabled: bool = False,  # 是否启用 JWT RBAC 鉴权
     experiment_engine: Any = None,  # ExperimentEngine | None
+    seat_store: Any = None,  # SeatStore | None — 坐席管理端点
+    assigner: Any = None,  # TicketAssigner | None
+    persona_config: Any = None,  # PersonaConfig | None — /api/persona 用
 ) -> FastAPI:
     """创建 Dashboard FastAPI 应用。"""
     app = FastAPI(title="智犀 (ZhiXi) Dashboard v0.2.0", version="0.2.0")
@@ -72,8 +78,21 @@ def create_dashboard_app(
         metrics_path = settings.metrics.path
 
         @app.get(metrics_path)
-        async def prometheus_metrics() -> Response:
-            """Prometheus 指标抓取端点。"""
+        async def prometheus_metrics(x_admin_token: str | None = Header(None)) -> Response:
+            """Prometheus 指标抓取端点。
+
+            需凭据：metrics.scrape_token 优先，未配置则回退 security.admin_token。
+            匿名可读会把内部端点名与状态码分布（含 404 探测痕迹）直接送出去
+            （见 docs/AUDIT-2026-10-10.md #7）。抓取侧示例::
+
+                scrape_configs:
+                  - job_name: zhixi
+                    metrics_path: /metrics
+                    authorization:
+                      type: Token
+                      credentials: <scrape_token>
+            """
+            _check_scrape(x_admin_token)
             collector = get_metrics_collector()
             data = collector.generate()
             return Response(content=data, media_type="text/plain; version=0.0.4; charset=utf-8")
@@ -88,6 +107,37 @@ def create_dashboard_app(
         from lingxi.auth import create_auth_router
         app.include_router(create_auth_router())
 
+    # ── 工作流 DAG 路由 (可视化 / 校验 / Mermaid 预览 / 执行) ──
+    # 此前 create_workflow_router 从未被任何地方 include，等于 700+ 行死代码
+    # components 传入引擎持有的真实组件，让 /api/workflow/execute 能真跑
+    # 一遍 DAG；缺失的组件在 executor 里被优雅降级为 skipped。
+    from lingxi.workflow.router import create_workflow_router
+
+    app.include_router(create_workflow_router({
+        "rule_engine": rule_engine,
+        "ticket_store": ticket_store,
+        "knowledge": knowledge_service,
+        "agent": agent,
+        "queue": queue,
+        "assigner": assigner,
+        "audit_log": audit_log,
+    }))
+
+    # ── 坐席管理路由 ──
+    if seat_store is not None:
+        from lingxi.seat.router import create_seat_router
+
+        app.include_router(
+            create_seat_router(seat_store, assigner=assigner, ticket_store=ticket_store),
+            prefix="/api",
+        )
+
+    # ── MCP / OpenAI 兼容工具路由（内部需 admin token）──
+    from lingxi.mcp.router import create_mcp_router, create_openai_tools_router
+
+    app.include_router(create_mcp_router())
+    app.include_router(create_openai_tools_router())
+
     def _check_admin(x_admin_token: str | None = Header(None)) -> None:
         """Dashboard 管理面认证。
 
@@ -95,7 +145,7 @@ def create_dashboard_app(
         - 常量时间比较，避免时序侧信道（secrets.compare_digest）
         - 未配置自定义 token 且非 debug 时 fail-closed：
           默认值 "change-me-in-production" 不再是可用凭据，
-          否则任何未改配置��部署都等于把工单/认领/关闭公开出去
+          否则任何未改配置的部署都等于把工单/认领/关闭公开出去
         """
         settings = get_settings()
         expected = settings.security.admin_token.get_secret_value()
@@ -109,6 +159,32 @@ def create_dashboard_app(
                 ),
             )
 
+        if not x_admin_token or not secrets.compare_digest(x_admin_token, expected):
+            raise HTTPException(status_code=401, detail="Unauthorized")
+
+    def _check_scrape(x_admin_token: str | None) -> None:
+        """/metrics 抓取鉴权：scrape_token 优先，未配置则回退 admin_token。
+
+        两者都没配置（非 debug）时同样 fail-closed —— 指标端点不是公开信息。
+        """
+        settings = get_settings()
+        scrape = settings.metrics.scrape_token
+        expected = (
+            scrape.get_secret_value() if scrape is not None
+            else settings.security.admin_token.get_secret_value()
+        )
+        if (
+            expected == _DEFAULT_ADMIN_TOKEN
+            and settings.metrics.scrape_token is None
+            and not settings.debug
+        ):
+            raise HTTPException(
+                status_code=503,
+                detail=(
+                    "/metrics 未配置抓取凭据：请设置 "
+                    "LINGXI_METRICS__SCRAPE_TOKEN 环境变量"
+                ),
+            )
         if not x_admin_token or not secrets.compare_digest(x_admin_token, expected):
             raise HTTPException(status_code=401, detail="Unauthorized")
 
@@ -295,6 +371,66 @@ def create_dashboard_app(
             await knowledge_service.reset()
             return {"status": "ok"}
 
+    # ── 人工审批（L2/L3 高风险操作）──
+    # Agent 在 L2/L3 调用点 interrupt 挂起 → 坐席在这里决策 →
+    # approve/reject 端点调用 agent.resume() 让图从挂起点继续。
+    @app.get("/api/approvals")
+    async def list_approvals(
+        status: str = "pending",
+        x_admin_token: str | None = Header(None),
+    ) -> list[dict[str, Any]]:
+        """待审批 / 历史审批清单。"""
+        _check_admin(x_admin_token)
+        from lingxi.agent.approval import get_approval_store
+
+        store = get_approval_store()
+        items = store.list_pending() if status == "pending" else store.list_all()
+        return [i.to_dict() for i in items]
+
+    @app.post("/api/approvals/{approval_id}/{action}")
+    async def decide_approval(
+        approval_id: str,
+        action: str,
+        body: dict[str, Any],
+        x_admin_token: str | None = Header(None),
+    ) -> dict[str, Any]:
+        """审批决策：action ∈ {approve, reject}。
+
+        决策后会立刻 resume 挂起的图 —— 不恢复的话用户那边会一直等。
+        """
+        _check_admin(x_admin_token)
+        if action not in ("approve", "reject"):
+            raise HTTPException(status_code=400, detail="action 必须是 approve 或 reject")
+
+        from lingxi.agent.approval import get_approval_store
+
+        store = get_approval_store()
+        item = store.decide(
+            approval_id,
+            approved=action == "approve",
+            approver=str(body.get("approver", "")),
+            note=str(body.get("note", "")),
+        )
+        if item is None:
+            raise HTTPException(status_code=404, detail="审批项不存在或已决策")
+
+        resumed: dict[str, Any] = {}
+        if agent is not None and hasattr(agent, "resume"):
+            resumed = await agent.resume(
+                channel=item.channel,
+                chat_id=item.chat_id,
+                decision={"approved": action == "approve", "approver": item.approver},
+            )
+        store.purge()
+        return {
+            "approval_id": approval_id,
+            "status": item.status,
+            "approver": item.approver,
+            "resumed": bool(resumed),
+            "final_reply": resumed.get("final_reply", ""),
+            "escalate_reason": resumed.get("escalate_reason", ""),
+        }
+
     @app.get("/api/logs")
     async def list_logs(
         limit: int = 200,
@@ -303,6 +439,50 @@ def create_dashboard_app(
         """最近结构化日志（内存环，最近 N 条）。"""
         _check_admin(x_admin_token)
         return memory_handler.recent(min(limit, 1000))
+
+    # ── 人格配置 (13 模块) ──
+    # 此前 /persona 页只能在前端硬编码一份假数据（后端无端点），
+    # 运维改 PersonaConfig 后控制台看不到，等于没有可观测性。
+    @app.get("/api/persona")
+    async def get_persona(
+        x_admin_token: str | None = Header(None),
+    ) -> dict[str, Any]:
+        """返回运行时生效的人格配置（身份 / 行为 / 13 模块开关 / 关键词规则）。"""
+        _check_admin(x_admin_token)
+        cfg = persona_config or PersonaConfig()
+        modules = cfg.modules.model_dump()
+        return {
+            "identity": cfg.identity.model_dump(),
+            "behavior": cfg.behavior.model_dump(),
+            "modules": modules,
+            "active_modules": [k for k, v in modules.items() if v and k != "debug"],
+            "keyword_rules": [r.model_dump() for r in cfg.keyword_rules],
+            "custom_prompt_keys": sorted(cfg.custom_prompts),
+        }
+
+    @app.post("/api/persona/preview")
+    async def preview_persona(
+        body: dict[str, Any],
+        x_admin_token: str | None = Header(None),
+    ) -> dict[str, Any]:
+        """注入预览：用给定消息实时拼出真正会送给 LLM 的 system prompt。
+
+        body: {"message": "...", "memory_block": "...", "lorebook_block": "..."}
+        """
+        _check_admin(x_admin_token)
+        message = str(body.get("message", "") or "")
+        injector = PersonaInjector(persona_config or PersonaConfig())
+        prompt = injector.build_system_prompt(
+            memory_block=str(body.get("memory_block", "") or ""),
+            lorebook_block=str(body.get("lorebook_block", "") or ""),
+            user_message=message,
+        )
+        verdict, pattern = detect_injection(message)
+        return {
+            "system_prompt": prompt,
+            "chars": len(prompt),
+            "guardrail": {"verdict": verdict.value, "pattern": pattern},
+        }
 
     @app.get("/api/events")
     async def event_stream(
@@ -467,9 +647,9 @@ def create_dashboard_app(
             summary = await summarizer.summarize(messages)
             return {"summary": summary}
 
-    # ── Agent SSE 流式推理 (Phase: streaming support) ──
+    # ── Agent SSE 流式推理 ──
 
-    if agent is not None:
+    if agent is not None and hasattr(agent, "astream"):
         from lingxi.streaming import stream_agent_events
 
         @app.post("/api/stream/chat", response_class=EventSourceResponse)

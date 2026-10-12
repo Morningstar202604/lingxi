@@ -62,7 +62,10 @@ def build_default_pipeline_dag() -> WorkflowDAG:
             id="keyword_escalate",
             type=NodeType.RULE_ENGINE,
             label="关键词升级",
-            params={"description": "强制关键字匹配 → 跳过 Agent 直接升级"},
+            # mode=keywords：读 ctx.keyword_matched。
+            # 缺省 mode="rules" 会去跑 RuleEngine，把关键词信号覆盖成规则信号，
+            # 导致 keyword.matched 这条条件边永远取不到 True。
+            params={"mode": "keywords", "description": "强制关键字匹配 → 跳过 Agent 直接升级"},
         ),
         DAGNode(
             id="ticket_intake",
@@ -94,7 +97,10 @@ def build_default_pipeline_dag() -> WorkflowDAG:
             id="confidence_check",
             type=NodeType.RULE_ENGINE,
             label="置信度判断",
-            params={"threshold": 0.6},
+            # mode=threshold：这个节点不是跑规则，而是给下游 confidence
+            # 条件边提供判定依据。缺省 mode="rules" 会重跑一遍 RuleEngine，
+            # 把「规则未命中」覆盖成「置信度不足」的结果。
+            params={"mode": "threshold", "threshold": 0.6},
         ),
         DAGNode(
             id="seat_assign",

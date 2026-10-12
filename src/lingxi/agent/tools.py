@@ -23,6 +23,7 @@ from typing import TYPE_CHECKING, Any
 
 from lingxi.core import get_logger
 from lingxi.persona.guardrails import (
+    PERM_FORBIDDEN,
     check_permission,
     classify_shell_command,
 )
@@ -77,6 +78,21 @@ class ToolDefinition:
             "inputSchema": self.input_schema,
         }
 
+    def to_openai_tool(self) -> dict[str, Any]:
+        """OpenAI function-calling 规范的工具声明。
+
+        input_schema 本身就是 JSON Schema，与 OpenAI 的 parameters 字段同构，
+        直接复用即可（不重复维护第二份 schema）。
+        """
+        return {
+            "type": "function",
+            "function": {
+                "name": self.name,
+                "description": self.description,
+                "parameters": self.input_schema,
+            },
+        }
+
 
 class ToolRegistry:
     """中央工具注册表。"""
@@ -84,6 +100,11 @@ class ToolRegistry:
     def __init__(self, blocked_commands: list[str] | None = None) -> None:
         self._tools: dict[str, ToolDefinition] = {}
         self._blocked_commands: list[str] = blocked_commands or []
+
+    @property
+    def blocked_commands(self) -> list[str]:
+        """黑名单命令（只读；原先只能摸 `_blocked_commands` 私有属性）。"""
+        return list(self._blocked_commands)
 
     def register(self, tool: ToolDefinition) -> None:
         self._tools[tool.name] = tool
@@ -98,6 +119,71 @@ class ToolRegistry:
     def mcp_tools_list(self) -> list[dict[str, Any]]:
         return [t.to_mcp_dict() for t in self.available]
 
+    def openai_tools(self) -> list[dict[str, Any]]:
+        """OpenAI function-calling 工具清单 — 传给 litellm 的 ``tools=`` 参数。
+
+        这是工具调用链路接通的关键：模型只有在收到该清单时才可能返回
+        tool_calls，否则只能输出散文（见 docs/AUDIT-2026-10-10.md #1）。
+        """
+        return [t.to_openai_tool() for t in self.available]
+
+
+def resolve_required_level(
+    registry: ToolRegistry,
+    tool_name: str,
+    arguments: dict[str, Any],
+) -> int:
+    """本次调用真正需要的权限等级。
+
+    🔗 工程逻辑
+        shell 的风险等级取决于**具体命令**（`ls` 是 L0，`rm -rf` 是 L3），
+        不能只看工具声明上的 required_permission=1。原先这段判定只存在于
+        `execute_tool` 内部，审批流拿不到 —— 抽出后调用方（execute_tool_node）
+        与执行器共用同一份判定，避免"审批时算一个级别、执行时算另一个"。
+
+        工具不存在时返回 PERM_FORBIDDEN：宁可判到红线，也不给未知工具开绿灯。
+    """
+    tool = registry.get(tool_name)
+    if tool is None:
+        return PERM_FORBIDDEN
+    if tool_name == "shell":
+        command = arguments.get("command", "")
+        if isinstance(command, str) and command.strip():
+            return classify_shell_command(command, registry.blocked_commands)
+    return tool.required_permission
+
+
+def needs_approval(required: int, current: int) -> bool:
+    """该调用是否需要人工审批（BLUEPRINT 权限分级模型）。
+
+    L2 需用户确认 / L3 需管理员审批 / L4 始终拒绝。
+    L4 不进审批流 —— 红线操作不是"批一下就能做"。
+    """
+    return current < required < PERM_FORBIDDEN
+
+
+def truncate_observation(text: str, max_chars: int) -> str:
+    """截断过长的工具结果。
+
+    🔗 工程逻辑
+        实测：shell 返回 30 万字符时，observation 会**全量**进入 messages，
+        下一轮请求的上下文被单个工具结果撑爆 —— 既超出模型上下文窗口，
+        也放大了注入风险（工具输出里的文本会被当成上下文读）。
+
+        头尾各留一段：头部保留"是什么命令/什么结果"，尾部保留实际结论
+        （报错信息、退出码往往在末尾）。
+    """
+    if len(text) <= max_chars:
+        return text
+    head = max_chars // 3
+    tail = max_chars - head - 40
+    dropped = len(text) - head - tail
+    return (
+        f"{text[:head]}\n"
+        f"…（中间 {dropped} 字符已省略，共 {len(text)} 字符）…\n"
+        f"{text[-tail:]}"
+    )
+
 
 async def execute_tool(
     registry: ToolRegistry,
@@ -105,29 +191,32 @@ async def execute_tool(
     arguments: dict[str, Any],
     current_permission: int,
     timeout: float = 30.0,
+    max_observation_chars: int | None = None,
 ) -> dict[str, Any]:
-    """执行一次工具调用（带权限检查 + 超时）。"""
+    """执行一次工具调用（带权限检查 + 超时）。
+
+    权限判定统一走 `resolve_required_level`，与审批流共用同一套等级口径 —
+    避免"审批时算一个级别、执行时算另一个"。
+    """
     tool = registry.get(tool_name)
     if tool is None:
         return {"success": False, "observation": f"工具 '{tool_name}' 不存在"}
 
-    # ── 权限检查 ──
+    required = resolve_required_level(registry, tool_name, arguments)
+    # L4 红线：无论谁调用一律拒绝（BLUEPRINT「始终拒绝，仅代码层操作」）
+    if required >= PERM_FORBIDDEN:
+        detail = (
+            "命令被黑名单拦截，已拒绝执行。"
+            if tool_name == "shell"
+            else f"工具 '{tool_name}' 属红线操作，已拒绝执行。"
+        )
+        return {"success": False, "observation": detail}
+
     try:
-        check_permission(tool_name, current_permission, tool.required_permission)
+        check_permission(tool_name, current_permission, required)
     except Exception as e:
         log.warning("permission_denied", tool=tool_name, error=str(e))
         return {"success": False, "observation": f"权限不足：{e}"}
-
-    # ── Shell 命令特殊处理 ──
-    if tool_name == "shell" and "command" in arguments:
-        cmd_level = classify_shell_command(arguments["command"], registry._blocked_commands)
-        # PERM_FORBIDDEN(4) 的命令无论用户权限如何一律拦截
-        if cmd_level >= 4:
-            return {"success": False, "observation": "命令被黑名单拦截，已拒绝执行。"}
-        try:
-            check_permission("shell", current_permission, cmd_level)
-        except Exception:
-            return {"success": False, "observation": f"Shell 命令权限被拒绝（级别 {cmd_level}）"}
 
     # ── 执行 handler ──
     try:
@@ -143,6 +232,16 @@ async def execute_tool(
             result = await asyncio.wait_for(asyncio.shield(result), timeout=timeout)
 
         observation = str(result) if not isinstance(result, str) else result
+        # 超长结果截断：不截的话下一个 LLM 请求的上下文会被单个工具撑爆
+        limit = max_observation_chars
+        if limit is None:
+            from lingxi.config import get_settings
+
+            limit = get_settings().agent.tool_result_max_chars
+        raw_len = len(observation)
+        observation = truncate_observation(observation, limit)
+        if raw_len > limit:
+            log.info("tool_result_truncated", tool=tool_name, raw=raw_len, kept=limit)
         return {"success": True, "observation": observation}
 
     except TimeoutError:
@@ -270,6 +369,9 @@ __all__ = [
     "ToolDefinition",
     "ToolRegistry",
     "execute_tool",
+    "needs_approval",
     "register_tool_bridge",
+    "resolve_required_level",
     "TOOL_BRIDGE",
+    "truncate_observation",
 ]

@@ -14,9 +14,9 @@
 """
 from functools import cache
 from pathlib import Path
-from typing import Literal
+from typing import ClassVar, Literal
 
-from pydantic import BaseModel, Field, SecretStr, field_validator
+from pydantic import BaseModel, Field, SecretStr, field_validator, model_validator
 from pydantic_settings import BaseSettings, SettingsConfigDict
 
 
@@ -96,31 +96,22 @@ class KnowledgeConfig(BaseModel):
 class MemoryConfig(BaseModel):
     """记忆系统配置。
 
-    支持三种后端（可组合）：
-    - local    → SQLite + 内置管线（默认，零依赖跑通）
-    - mem0     → Mem0 语义召回（需 mem0ai + embedding provider）
-    - neo4j    → Neo4j 实体图谱（需 neo4j 驱动）
+    后端为内置 SQLite 管线（local）。Mem0 / Neo4j 后端在本版本**没有实现**，
+    相关的配置项已删除 —— 与其留一堆配了也静默失效的死配置，不如让配置面
+    与真实能力一致（见 docs/AUDIT-2026-10-10.md 第四章 4.4）。
     """
-
-    # ── 后端选择 ──
-    backend: Literal["local", "mem0", "neo4j"] = "local"
-    mem0_api_key: str | None = None             # 非空时启用 Mem0 语义召回
-    embed_model: str = "text-embedding-3-small"
-    recall_top_k: int = 5
 
     # ── SQLite 持久化（tickets / queue / memory 共享一张 DB 文件）──
     # 相对于 settings.data_dir 解析（见 __main__.py 的 data_dir / db_path）。
     # 此处不要再带 "data/" 前缀，否则会拼成 data/data/xxx.db。
     db_path: str = "zhixi_memory.db"
     persistent: bool = True  # 启用写通式持久化 (False 则纯内存, 用于测试)
+    # 实体图谱库（相对 data_dir）。默认与业务数据分文件，
+    # 避免图谱重建时锁住正在写工单的那张表。
+    graph_db_path: str = "zhixi_graph.db"
 
     # ── Lorebook YAML 加载路径 ──
     lorebook_paths: list[str] = Field(default_factory=list)
-
-    # ── Neo4j 图谱（生产环境大规模实体关系）──
-    neo4j_uri: str | None = None
-    neo4j_user: str | None = None
-    neo4j_password: SecretStr | None = None
 
 
 class AgentConfig(BaseModel):
@@ -130,10 +121,36 @@ class AgentConfig(BaseModel):
     confidence_threshold: float = 0.6
     context_char_budget: int = 4000
     max_concurrent_sessions: int = 200
+    # 工具调用（function calling）总开关。关掉则不向模型下发 tools=，
+    # 模型只能返回文本 —— 用于不支持 function calling 的私有模型端点。
+    tool_calling: bool = True
+
+    # ── 可靠性 ──
+    # LLM 调用失败重试。0 = 不重试（旧的脆弱行为：一次抖动就转人工）。
+    llm_max_retries: int = Field(default=2, ge=0, le=5)
+    llm_retry_base_delay: float = 0.5  # 秒，指数退避基数
+
+    # ── 上下文控制 ──
+    # 单次工具结果注入 prompt 的上限。超了会挤爆上下文且放大注入风险。
+    tool_result_max_chars: int = Field(default=2000, ge=200)
+    # 连续相同工具调用超过该次数即短路（模型陷入循环时的护栏）
+    max_identical_tool_calls: int = Field(default=2, ge=1)
 
 
 class SecurityConfig(BaseModel):
-    """分级权限与护栏配置。"""
+    """分级权限与护栏配置。
+
+    🔗 工程逻辑
+        default_permission_level 是所有会话的基线等级；
+        permission_rules 允许**按用户/会话**单独提权或降权，
+        key 可以是 user_id、chat_id 或 "@all"。取值优先 user_id > chat_id > @all。
+        例::
+
+            LINGXI_SECURITY__PERMISSION_RULES='{"u_vip_001": 2, "wxid_abc": 0}'
+
+        命中规则即视为该会话的权限等级（覆盖基线），由
+        ``lingxi.persona.guardrails.resolve_permission_level`` 解析。
+    """
 
     admin_token: SecretStr = SecretStr("change-me-in-production")
     permission_model: Literal["open", "standard", "strict"] = "standard"
@@ -141,14 +158,77 @@ class SecurityConfig(BaseModel):
         "rm -rf /", "mkfs", "dd if=/dev/zero", ":(){ :|:& };:",
     ])
 
+    # ── 分级权限：按会话给到（不再是进程级全局常量）──
+    default_permission_level: int = Field(default=1, ge=0, le=4)
+    permission_rules: dict[str, int] = Field(default_factory=dict)
+
 
 class AuthConfig(BaseModel):
-    """JWT RBAC 鉴权配置。"""
+    """JWT RBAC 鉴权配置。
 
-    jwt_secret: str = "change-me-in-production-please-use-strong-secret"
+    🔗 工程逻辑
+        启用鉴权时密钥**必须由部署方提供**，且不允许是历史默认值。
+        旧默认值 `change-me-in-production-please-use-strong-secret` 是源码里公开
+        的常量，而签发端（auth/router.py）当时不做任何校验 —— 任何读过源码的
+        人都能伪造 admin JWT 直通所有管理端点。现在改为 fail-closed：
+        enabled=True 却配不出合格密钥，启动即报错，而不是悄悄用弱密钥签发。
+
+    🤖 AI 避坑
+        - 不要把"默认值 + 运行时才检查"当成防护：检查必须落在配置模型上，
+          否则任何绕过装配直接读 settings 的路径（测试、脚本）都会继承弱默认。
+        - jwt_secret 保留 None 而不是给个占位串：占位串本身就是凭据。
+    """
+
+    # HS256 密钥；enabled=True 时必填且需满足 _MIN_SECRET_BYTES
+    jwt_secret: str | None = None
     jwt_algorithm: str = "HS256"
     jwt_expire_minutes: int = 60
     enabled: bool = False  # 默认不启用，按需开启
+
+    # 引导管理员口令。为空则不播种任何用户 —— 不存在内置 admin/admin123。
+    # 用户名固定为 admin；要建其他账号请用 /auth/users（需 USER_MANAGE）。
+    admin_username: str = "admin"
+    admin_password: SecretStr | None = None
+
+    # API Key 认证：{username: sha256(key) 的十六进制}。
+    # 空 dict = API Key 这条认证路径整体关闭（不再接受任何 X-API-Key）。
+    # 刻意不在源码里放明文 key —— 旧的 zxk_admin_xxx 等同后门口令。
+    api_key_hashes: dict[str, str] = Field(default_factory=dict)
+
+    # 历史上出现在源码/文档里的弱默认值，一律视为未配置
+    _BANNED_SECRETS: ClassVar[frozenset[str]] = frozenset({
+        "change-me-in-production-please-use-strong-secret",
+        "change-me-in-production",
+        "secret",
+        "changeme",
+    })
+    _MIN_SECRET_BYTES: ClassVar[int] = 32
+
+    @model_validator(mode="after")
+    def _enforce_secret_when_enabled(self) -> "AuthConfig":
+        if not self.enabled:
+            return self
+        secret = self.jwt_secret
+        if secret is None or secret.strip() == "":
+            raise ValueError(
+                "auth.enabled=True 但 jwt_secret 未配置。请设置 "
+                "LINGXI_AUTH__JWT_SECRET（≥32 字节随机串）。"
+            )
+        if secret in self._BANNED_SECRETS:
+            raise ValueError(
+                "auth.jwt_secret 是已知的公开默认值，拒绝用它签发 token。"
+            )
+        if len(secret.encode("utf-8")) < self._MIN_SECRET_BYTES:
+            raise ValueError(
+                f"auth.jwt_secret 只有 {len(secret.encode('utf-8'))} 字节，"
+                f"HS256 至少需要 {self._MIN_SECRET_BYTES} 字节。"
+            )
+        if self.admin_password is None or not self.admin_password.get_secret_value():
+            raise ValueError(
+                "auth.enabled=True 但 admin_password 未配置，"
+                "系统将没有任何可登录账号。请设置 LINGXI_AUTH__ADMIN_PASSWORD。"
+            )
+        return self
 
 
 class MetricsConfig(BaseModel):
@@ -156,6 +236,10 @@ class MetricsConfig(BaseModel):
 
     enabled: bool = True
     path: str = "/metrics"
+    # Prometheus 抓取专用凭据。为空则回退用 security.admin_token。
+    # /metrics 会暴露内部端点名与状态码分布，绝不能匿名可读
+    # （见 docs/AUDIT-2026-10-10.md #7）。
+    scrape_token: SecretStr | None = None
 
 
 class WebhookConfig(BaseModel):
@@ -184,7 +268,6 @@ class Settings(BaseSettings):
     debug: bool = False
     log_level: Literal["DEBUG", "INFO", "WARNING", "ERROR"] = "INFO"
     data_dir: Path = Path("./data")
-    yaml_config_path: Path | None = None
 
     onebot: OneBotConfig = Field(default_factory=OneBotConfig)
     gewechat: GewechatConfig = Field(default_factory=GewechatConfig)

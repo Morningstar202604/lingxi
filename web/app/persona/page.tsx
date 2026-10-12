@@ -1,56 +1,56 @@
 "use client";
 
+// ── 人格控制台 ──
+// 数据源改为真实的 /api/persona 与 /api/persona/preview。
+// 此前这一页的 identity / activeModules 全是前端写死的常量，keywordRulesCount
+// 恒为 0，编辑按钮则弹一句"后端 PUT 待实现"——运维在控制台看到的不是引擎
+// 真正在跑的人格配置。
+
 import { useCallback, useEffect, useState } from "react";
-import { fetchSessions } from "@/lib/api";
 
-interface Identity {
-  name: string;
-  role: string;
-  speaking_style: string;
-}
+import { fetchPersona, previewPersona, type PersonaState } from "@/lib/api";
 
-interface PersonaState {
-  identity: Identity;
-  activeModules: string[];
-  keywordRulesCount: number;
-  totalSessions: number;
-}
+const MODULE_LABELS: Record<string, string> = {
+  time_awareness: "时间感知",
+  turn_stage_awareness: "对话阶段感知",
+  keyword_triggers: "关键词触发",
+  emotion_vector: "情绪向量",
+  memory_injection: "记忆注入",
+  lorebook_injection: "世界观注入",
+  variance: "表达变体",
+  fixed_signals: "固定信号",
+  static_rules: "静态规则",
+  translate: "语言适配",
+};
+
+const ACTION_LABELS: Record<string, string> = {
+  inject_prompt: "注入提示",
+  switch_emotion: "切换情绪",
+  escalate: "强制升级",
+};
+
+const VERDICT_STYLE: Record<string, string> = {
+  clean: "border-lingxi-green/30 text-lingxi-green bg-lingxi-green/10",
+  suspect: "border-lingxi-orange/30 text-lingxi-orange bg-lingxi-orange/10",
+  block: "border-lingxi-red/30 text-lingxi-red bg-lingxi-red/10",
+};
 
 export default function PersonaPage() {
   const [state, setState] = useState<PersonaState | null>(null);
-  const [mode, setMode] = useState<"view" | "edit">("view");
-  const [editJson, setEditJson] = useState("");
-  const [saving, setSaving] = useState(false);
-  const [msg, setMsg] = useState<string | null>(null);
+  const [error, setError] = useState<string | null>(null);
+
+  const [probe, setProbe] = useState("我要退货");
+  const [prompt, setPrompt] = useState<string | null>(null);
+  const [verdict, setVerdict] = useState<string | null>(null);
+  const [chars, setChars] = useState(0);
+  const [previewing, setPreviewing] = useState(false);
 
   const load = useCallback(async () => {
     try {
-      const sessions = await fetchSessions();
-      const identity: Identity = {
-        name: "智犀",
-        role: "全栈数字助理",
-        speaking_style: "简洁、专业、带一点温暖",
-      };
-      const activeModules = [
-        "time_awareness",
-        "turn_stage_awareness",
-        "keyword_triggers",
-        "emotion_vector",
-        "memory_injection",
-        "lorebook_injection",
-        "variance",
-        "fixed_signals",
-        "static_rules",
-      ];
-      setState({
-        identity,
-        activeModules,
-        keywordRulesCount: 0,
-        totalSessions: sessions.length,
-      });
-      setMsg(null);
+      setState(await fetchPersona());
+      setError(null);
     } catch (e) {
-      setMsg((e as Error).message);
+      setError((e as Error).message);
     }
   }, []);
 
@@ -58,115 +58,179 @@ export default function PersonaPage() {
     load();
   }, [load]);
 
-  const toggleMode = () => {
-    if (mode === "view" && state) {
-      setEditJson(JSON.stringify(state, null, 2));
+  const runPreview = useCallback(async () => {
+    setPreviewing(true);
+    try {
+      const r = await previewPersona(probe);
+      setPrompt(r.system_prompt);
+      setVerdict(r.guardrail.verdict);
+      setChars(r.chars);
+    } catch (e) {
+      setError((e as Error).message);
+    } finally {
+      setPreviewing(false);
     }
-    setMode(mode === "view" ? "edit" : "view");
-  };
+  }, [probe]);
 
-  const handleSave = () => {
-    setSaving(true);
-    setTimeout(() => {
-      setSaving(false);
-      setMsg(
-        "Persona 配置保存需后端 /api/persona PUT（待实现）。请在 YAML 中修改后重启。",
-      );
-      setMode("view");
-    }, 500);
-  };
-
-  return (
-    <div className="space-y-4">
-      <div className="flex items-center justify-between">
-        <div className="text-xs text-lingxi-muted">
-          {state ? `会话总数: ${state.totalSessions}` : "加载中..."}
-        </div>
+  if (error) {
+    return (
+      <div className="card border-lingxi-red/30">
+        <p className="text-lingxi-red text-sm font-medium">人格配置加载失败</p>
+        <p className="text-xs text-lingxi-muted mt-2">{error}</p>
         <button
-          onClick={toggleMode}
-          className="px-3 py-1.5 rounded-lg text-xs border border-white/10 bg-white/5 text-white/70 hover:bg-white/10 transition-colors"
+          onClick={load}
+          className="mt-3 px-3 py-1.5 rounded-lg text-xs border border-lingxi-orange/30 bg-lingxi-orange/10 text-lingxi-orange"
         >
-          {mode === "view" ? "编辑" : "取消"}
+          重试
         </button>
       </div>
+    );
+  }
 
-      {msg && (
-        <div className="card border-yellow-500/30 text-yellow-400 text-sm py-3 px-4">
-          {msg}
-        </div>
-      )}
+  if (!state) {
+    return <div className="card animate-pulse h-40" />;
+  }
 
-      {mode === "view" && state ? (
-        <div className="space-y-4">
-          <div className="card">
-            <h3 className="text-sm font-medium text-white mb-3">身份定义</h3>
-            <dl className="grid grid-cols-3 gap-4 text-xs">
-              <div>
-                <dt className="text-lingxi-muted mb-1">名称</dt>
-                <dd className="text-white">{state.identity.name}</dd>
-              </div>
-              <div>
-                <dt className="text-lingxi-muted mb-1">角色</dt>
-                <dd className="text-white">{state.identity.role}</dd>
-              </div>
-              <div>
-                <dt className="text-lingxi-muted mb-1">说话风格</dt>
-                <dd className="text-white">{state.identity.speaking_style}</dd>
-              </div>
-            </dl>
+  return (
+    <div className="space-y-4 page-enter">
+      <div className="card">
+        <h3 className="text-sm font-medium text-white mb-3">身份定义</h3>
+        <dl className="grid grid-cols-1 md:grid-cols-4 gap-4 text-xs">
+          <div>
+            <dt className="text-lingxi-muted mb-1">名称</dt>
+            <dd className="text-white text-sm">{state.identity.name}</dd>
           </div>
-
-          <div className="card">
-            <h3 className="text-sm font-medium text-white mb-3">模块开关</h3>
-            <div className="flex flex-wrap gap-2">
-              {state.activeModules.map((m) => (
-                <span
-                  key={m}
-                  className="px-2 py-1 rounded text-xs bg-lingxi-green/10 text-lingxi-green border border-lingxi-green/25"
-                >
-                  {m}
-                </span>
-              ))}
-            </div>
+          <div>
+            <dt className="text-lingxi-muted mb-1">角色</dt>
+            <dd className="text-white text-sm">{state.identity.role}</dd>
           </div>
-
-          <div className="card">
-            <h3 className="text-sm font-medium text-white mb-3">关键词规则</h3>
-            <p className="text-xs text-lingxi-muted">
-              已加载 {state.keywordRulesCount} 条 KeywordRule（通过 YAML 配置）
-            </p>
+          <div className="md:col-span-2">
+            <dt className="text-lingxi-muted mb-1">说话风格</dt>
+            <dd className="text-white text-sm">{state.identity.speaking_style}</dd>
           </div>
-
-          <div className="card">
-            <h3 className="text-sm font-medium text-white mb-3">
-              集成 SSE 事件
-            </h3>
-            <p className="text-xs text-lingxi-muted">
-              升级/认领/关闭事件通过 Server-Sent Events 实时推送（/api/events,
-              sse-starlette）
-            </p>
-          </div>
-        </div>
-      ) : (
-        <div className="space-y-3">
-          <p className="text-xs text-lingxi-muted">
-            Persona JSON 编辑 — 修改后需 PUT /api/persona（待实现）
+        </dl>
+        {state.identity.backstory && (
+          <p className="text-xs text-lingxi-muted mt-3 leading-relaxed border-t border-white/5 pt-3">
+            {state.identity.backstory}
           </p>
-          <textarea
-            value={editJson}
-            onChange={(e) => setEditJson(e.target.value)}
-            className="w-full h-96 bg-[#0a0f1e] border border-white/10 rounded-lg p-3 text-xs font-mono text-white/80 resize-none"
-            spellCheck={false}
-          />
-          <button
-            onClick={handleSave}
-            disabled={saving}
-            className="px-4 py-2 rounded-lg text-xs border border-lingxi-green/30 bg-lingxi-green/10 text-lingxi-green hover:bg-lingxi-green/20 disabled:opacity-40"
-          >
-            {saving ? "保存中..." : "保存 (需后端 API)"}
-          </button>
+        )}
+      </div>
+
+      <div className="card">
+        <h3 className="text-sm font-medium text-white mb-1">上下文模块</h3>
+        <p className="text-xs text-lingxi-muted mb-3">
+          运行时生效 {state.active_modules.length} /{" "}
+          {Object.keys(state.modules).filter((k) => k !== "debug").length} 个
+        </p>
+        <div className="grid grid-cols-2 md:grid-cols-5 gap-2">
+          {Object.entries(state.modules)
+            .filter(([k]) => k !== "debug")
+            .map(([key, on]) => (
+              <div
+                key={key}
+                className={`px-2.5 py-2 rounded-lg border text-xs transition-colors ${
+                  on
+                    ? "border-lingxi-green/25 bg-lingxi-green/10 text-lingxi-green"
+                    : "border-white/5 bg-white/[0.02] text-lingxi-muted"
+                }`}
+              >
+                <div className="flex items-center gap-1.5">
+                  <span
+                    className={`w-1.5 h-1.5 rounded-full ${
+                      on ? "bg-lingxi-green" : "bg-lingxi-muted/50"
+                    }`}
+                  />
+                  {MODULE_LABELS[key] ?? key}
+                </div>
+                <p className="text-[10px] opacity-60 mt-0.5">{key}</p>
+              </div>
+            ))}
         </div>
-      )}
+      </div>
+
+      <div className="grid grid-cols-1 lg:grid-cols-2 gap-4">
+        <div className="card">
+          <h3 className="text-sm font-medium text-white mb-1">关键词规则</h3>
+          <p className="text-xs text-lingxi-muted mb-3">
+            已加载 {state.keyword_rules.length} 条 KeywordRule
+          </p>
+          {state.keyword_rules.length === 0 ? (
+            <p className="text-xs text-lingxi-muted">未配置关键词规则</p>
+          ) : (
+            <ul className="space-y-2">
+              {state.keyword_rules.map((r, i) => (
+                <li
+                  key={i}
+                  className="text-xs border-l border-lingxi-orange/30 pl-3 py-1 animate-slide-in"
+                >
+                  <span className="text-lingxi-orange">
+                    {ACTION_LABELS[r.action] ?? r.action}
+                  </span>
+                  <span className="text-lingxi-muted"> · </span>
+                  {r.keywords.map((k) => (
+                    <span
+                      key={k}
+                      className="inline-block px-1.5 py-0.5 mr-1 rounded bg-white/5 text-white/70"
+                    >
+                      {k}
+                    </span>
+                  ))}
+                  {r.payload && (
+                    <p className="text-lingxi-muted mt-1">{r.payload}</p>
+                  )}
+                </li>
+              ))}
+            </ul>
+          )}
+          {state.custom_prompt_keys.length > 0 && (
+            <p className="text-xs text-lingxi-muted mt-3 pt-3 border-t border-white/5">
+              自定义提示词区块：{state.custom_prompt_keys.join("、")}
+            </p>
+          )}
+        </div>
+
+        <div className="card">
+          <h3 className="text-sm font-medium text-white mb-1">注入预览</h3>
+          <p className="text-xs text-lingxi-muted mb-3">
+            输入一条用户消息，实时查看真正会送给 LLM 的 system prompt 与护栏判定
+          </p>
+          <div className="flex gap-2">
+            <input
+              value={probe}
+              onChange={(e) => setProbe(e.target.value)}
+              onKeyDown={(e) => e.key === "Enter" && runPreview()}
+              placeholder="例如：我要退货"
+              className="flex-1 bg-[#0a0f1e] border border-white/10 rounded-lg px-3 py-2 text-xs text-white/90 outline-none focus:border-lingxi-orange/40"
+            />
+            <button
+              onClick={runPreview}
+              disabled={previewing || !probe.trim()}
+              className="px-3 py-2 rounded-lg text-xs border border-lingxi-orange/30 bg-lingxi-orange/10 text-lingxi-orange hover:bg-lingxi-orange/20 disabled:opacity-40 transition-colors"
+            >
+              {previewing ? "生成中…" : "预览"}
+            </button>
+          </div>
+
+          {verdict && (
+            <div className="flex items-center gap-2 mt-3">
+              <span
+                className={`px-2 py-0.5 rounded text-xs border ${
+                  VERDICT_STYLE[verdict] ?? ""
+                }`}
+              >
+                护栏：{verdict}
+              </span>
+              <span className="text-xs text-lingxi-muted tabular">{chars} 字符</span>
+            </div>
+          )}
+
+          {prompt !== null && (
+            <pre className="mt-3 max-h-64 overflow-auto bg-[#0a0f1e] border border-white/5 rounded-lg p-3 text-[11px] leading-relaxed text-white/70 whitespace-pre-wrap break-words font-mono animate-fade-up">
+              {prompt}
+            </pre>
+          )}
+        </div>
+      </div>
     </div>
   );
 }

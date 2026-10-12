@@ -1,6 +1,15 @@
 "use client";
 
-import { useCallback, useEffect, useState } from "react";
+import { useCallback, useEffect, useRef, useState } from "react";
+
+import {
+  StatusDonut,
+  TrendChart,
+  WaitGauge,
+  type StatusSlice,
+  type TrendPoint,
+} from "@/components/DashboardCharts";
+import EventStreamPanel from "@/components/EventStreamPanel";
 import MetricsGrid from "@/components/MetricsGrid";
 import QueuePanel from "@/components/QueuePanel";
 import TicketsTable from "@/components/TicketsTable";
@@ -13,11 +22,17 @@ import {
   type TicketSummary,
 } from "@/lib/api";
 
+/** 趋势线保留的采样点数：5s/次 × 60 ≈ 5 分钟 */
+const TREND_WINDOW = 60;
+
 export default function DashboardPage() {
   const [summary, setSummary] = useState<DashboardSummary | null>(null);
   const [queue, setQueue] = useState<QueueSnapshot | null>(null);
   const [recent, setRecent] = useState<TicketSummary[]>([]);
+  const [trend, setTrend] = useState<TrendPoint[]>([]);
   const [error, setError] = useState<string | null>(null);
+  const [lastSync, setLastSync] = useState<number | null>(null);
+  const trendRef = useRef<TrendPoint[]>([]);
 
   const load = useCallback(async () => {
     try {
@@ -28,7 +43,23 @@ export default function DashboardPage() {
       ]);
       setSummary(s);
       setQueue(q);
-      setRecent(t.slice(0, 10));
+      // 后端按 dict 插入序返回，slice(0,10) 取到的是**最早** 10 条；
+      // 页面标题写"最近活跃"，所以必须自己按更新时间倒序（见 AUDIT-2026-10-10.md #27）
+      setRecent(
+        [...t].sort((a, b) => b.updated_at - a.updated_at).slice(0, 10),
+      );
+      const next: TrendPoint[] = [
+        ...trendRef.current,
+        {
+          t: Date.now(),
+          active: s.active_tickets,
+          escalated: s.escalated,
+          queuePending: s.queue.pending_count,
+        },
+      ].slice(-TREND_WINDOW);
+      trendRef.current = next;
+      setTrend(next);
+      setLastSync(Date.now());
       setError(null);
     } catch (e) {
       setError((e as Error).message);
@@ -40,6 +71,25 @@ export default function DashboardPage() {
     const id = setInterval(load, 5_000);
     return () => clearInterval(id);
   }, [load]);
+
+  const slices: StatusSlice[] = summary
+    ? [
+        { name: "处理中", value: summary.processing, color: "#E8963E" },
+        { name: "已升级", value: summary.escalated, color: "#E74C3C" },
+        { name: "等用户", value: summary.waiting_user, color: "#5B8DEF" },
+        {
+          name: "接入中",
+          value: Math.max(
+            0,
+            summary.active_tickets -
+              summary.processing -
+              summary.escalated -
+              summary.waiting_user,
+          ),
+          color: "#95A5A6",
+        },
+      ]
+    : [];
 
   if (error) {
     return (
@@ -65,9 +115,17 @@ export default function DashboardPage() {
     <div className="space-y-6">
       {/* 实时指标 */}
       <section>
-        <h3 className="text-xs font-medium text-lingxi-muted uppercase tracking-wider mb-3">
-          实时指标
-        </h3>
+        <div className="flex items-center justify-between mb-3">
+          <h3 className="text-xs font-medium text-lingxi-muted uppercase tracking-wider">
+            实时指标
+          </h3>
+          <span className="flex items-center gap-1.5 text-[10px] text-lingxi-muted">
+            <span className="w-1.5 h-1.5 rounded-full bg-lingxi-green pulse-dot" />
+            {lastSync
+              ? `同步于 ${new Date(lastSync).toLocaleTimeString("zh-CN")}`
+              : "连接中…"}
+          </span>
+        </div>
         {summary ? (
           <MetricsGrid
             active={summary.active_tickets}
@@ -84,6 +142,35 @@ export default function DashboardPage() {
             ))}
           </div>
         )}
+      </section>
+
+      {/* 动态可视化：趋势 / 状态构成 / 等待时长 / 实时事件 */}
+      <section>
+        <h3 className="text-xs font-medium text-lingxi-muted uppercase tracking-wider mb-3">
+          可视化分析
+        </h3>
+        <div className="grid grid-cols-1 lg:grid-cols-3 gap-4">
+          <div className="lg:col-span-1">
+            <StatusDonut slices={slices} />
+          </div>
+          <div className="lg:col-span-1">
+            <WaitGauge
+              seconds={summary?.queue.longest_wait ?? 0}
+              threshold={120}
+            />
+          </div>
+          <div className="lg:col-span-1">
+            <TrendChart points={trend} />
+          </div>
+        </div>
+      </section>
+
+      {/* 实时事件流（SSE） */}
+      <section>
+        <h3 className="text-xs font-medium text-lingxi-muted uppercase tracking-wider mb-3">
+          实时事件
+        </h3>
+        <EventStreamPanel />
       </section>
 
       {/* 升级队列 + 最近工单 */}
@@ -113,7 +200,6 @@ export default function DashboardPage() {
           </div>
         </div>
       </section>
-
     </div>
   );
 }

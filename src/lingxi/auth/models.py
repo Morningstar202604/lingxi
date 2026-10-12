@@ -155,25 +155,44 @@ class UserStore:
         return secrets.token_hex(16)
 
     def _seed_defaults(self) -> None:
-        """写入内置默认用户。"""
-        defaults = [
-            ("admin", "admin123", UserRole.ADMIN, "default"),
-            ("viewer", "view123", UserRole.VIEWER, "default"),
-        ]
-        for username, password, role, tenant in defaults:
-            salt = self._generate_salt()
-            pw_hash = self._hash_password(password, salt)
-            user = User(
-                username=username,
-                role=role,
-                tenant_id=tenant,
-                disabled=False,
-                password_hash=pw_hash,
-                password_salt=salt,
+        """按配置播种一个引导管理员账号。
+
+        🔗 工程逻辑
+            旧实现无条件写入 admin/admin123 与 viewer/view123 —— 两个公开在源码里
+            的后门口令，任何部署都自带一对可直接登录的凭据（且 viewer 账号本身
+            没有存在必要）。现在只有显式配置了 auth.admin_password 才建账号；
+            没配就是**零账号**，配合 AuthConfig 的 enabled 校验，
+            宁可起不来也不带着默认口令上线。
+
+        引导出的账号仅 admin 一个；其余账号请用 POST /auth/users（需 USER_MANAGE）。
+        """
+        from lingxi.config.settings import get_settings
+
+        auth = get_settings().auth
+        bootstrap_pw = (
+            auth.admin_password.get_secret_value() if auth.admin_password else ""
+        )
+        if not bootstrap_pw:
+            log.warning(
+                "UserStore seeded",
+                count=0,
+                reason="auth.admin_password 未配置，不创建任何账号",
             )
-            self._users[username] = user
-            self._salts[username] = salt
-        log.info("UserStore seeded", count=len(defaults))
+            return
+
+        username = auth.admin_username or "admin"
+        salt = self._generate_salt()
+        user = User(
+            username=username,
+            role=UserRole.ADMIN,
+            tenant_id="default",
+            disabled=False,
+            password_hash=self._hash_password(bootstrap_pw, salt),
+            password_salt=salt,
+        )
+        self._users[username] = user
+        self._salts[username] = salt
+        log.info("UserStore seeded", count=1, username=username)
 
     def create(
         self,

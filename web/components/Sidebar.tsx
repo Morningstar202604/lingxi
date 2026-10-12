@@ -55,7 +55,7 @@ export default function Sidebar() {
           引擎在线
         </div>
         <div className="px-3 text-[10px] text-lingxi-muted/50">
-          ZhiXi v0.2.0 · 395 tests
+          ZhiXi v0.2.0 · 507 tests
         </div>
       </div>
     </aside>

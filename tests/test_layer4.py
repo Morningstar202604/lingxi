@@ -107,7 +107,11 @@ class TestExecuteTool:
         ))
         result = await execute_tool(reg, "danger", {}, PERM_AUTO)
         assert result["success"] is False
-        assert "权限" in result["observation"]
+        # L4 红线：无论调用方是谁都拒绝，且不进审批流
+        assert "红线" in result["observation"]
+        assert "权限不足" not in result["observation"], (
+            "红线操作应报'红线拒绝'而非'权限不足' —— 后者会被误读为可提权"
+        )
 
     @pytest.mark.asyncio
     async def test_sync_handler_runs(self) -> None:

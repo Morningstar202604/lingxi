@@ -1,10 +1,8 @@
 """SSE 流式输出：Agent 推理链事件 → Server-Sent Events。
 
 🔗 工程逻辑
-    LangGraph 1.2+ 的 astream_events() 可以逐步产出每个 tool 调用、
-    LLM token、chain 开始/结束等事件。
-    我们把这些内部事件翻译为用户友好的 event type，
-    通过 sse_starlette 推送到前端。
+    把 Agent 的推理链事件（token / tool_call / tool_result / error）
+    翻译成用户友好的 event type，通过 sse_starlette 推给前端。
 
     SSE 事件格式 (前端消费):
     ---
@@ -30,19 +28,18 @@
     data: {"status": "completed"}
     ---
 
-    三种运行模式（按优先级）:
-    1. LangGraph astream_events (v2 API) — 全流式，逐 token + tool 事件
-    2. 自定义 Agent.astream() — Agent 自行实现了流式接口
-    3. 降级: 阻塞 run() + 模拟流式 (compatibility mode)
+    两种运行模式（按优先级）:
+    1. Agent.astream() — 真流式，逐 token + tool 事件（复用非流式同一套图）
+    2. 降级: 阻塞 run() 后回放（Agent 未实现 astream 时）
 
 🤖 AI 避坑
-    - astream_events 在 LangGraph 不同版本 API 不同，这里用 v1.x 兼容写法
+    - **不要**用 `agent._graph.astream_events()` 取 token：那条路依赖 LangGraph
+      的 on_chat_model_stream 事件，而本项目 reason 节点直连 litellm.acompletion
+      （不经过 LangChain Runnable），该事件永不触发 —— 实测只产出 3 个事件。
     - 最终 message 事件可能有多个 delta，前端要拼接显示
-    - 流式过程中发生异常要推 agent_error event 后关闭连接
+    - 流式过程中发生异常要推 agent_end(status=error) 后关闭连接
     - 注意 backpressure — 如果消费方太慢会堆积事件
-    - 不要在有 async generator 里用 threading.Lock
-    - ZhiXiAgent._graph 是 LangGraph StateGraph 编译后的实例 (带下划线 = 内部)
-      但流式场景必须用它调用 astream_events
+    - 不要在 async generator 里用 threading.Lock
     - orjson.dumps 不能处理 BaseModel/SecretStr → 用 default=str 兜底
 """
 from __future__ import annotations
@@ -56,19 +53,9 @@ from sse_starlette.sse import EventSourceResponse
 if TYPE_CHECKING:
     from collections.abc import AsyncIterator
 
-    from lingxi.agent.state import AgentState
-
 from lingxi.core import get_logger
 
 log = get_logger(__name__)
-
-# LangGraph astream_events 事件类型前缀 (v2 wire format)
-_LG_CHAT_STREAM = "on_chat_model_stream"
-_LG_CHAT_START = "on_chat_model_start"
-_LG_TOOL_START = "on_tool_start"
-_LG_TOOL_END = "on_tool_end"
-_LG_CHAIN_START = "on_chain_start"
-_LG_CHAIN_END = "on_chain_end"
 
 
 def _sse_event(event_type: str, data: Any) -> dict[str, Any]:
@@ -77,19 +64,6 @@ def _sse_event(event_type: str, data: Any) -> dict[str, Any]:
         "event": event_type,
         "data": orjson.dumps(data, default=str).decode("utf-8"),
     }
-
-
-def _extract_event_responses(event: dict[str, Any]) -> dict[str, Any]:
-    """从 LangGraph on_chain_end 输出中提取 final_reply / escalate 等。
-
-    LangGraph 链结束时的 output 字段格式不固定 —
-    对于 StateGraph，它是 TypedDict 的 merge 视图 (AgentState 子集)。
-    这里做容错解析。
-    """
-    output = event.get("data", {}).get("output", {})
-    if not isinstance(output, dict):
-        return {}
-    return output
 
 
 def stream_agent_events(
@@ -140,49 +114,21 @@ def stream_agent_events(
             yield _sse_event("knowledge_recall", {"hits": knowledge_events})
 
         try:
-            has_graph = hasattr(agent, "_graph") or hasattr(agent, "graph")
-
-            if has_graph and hasattr(agent, "_run_inner"):
-                # ── 模式 1: 直接拿到 LangGraph graph，构造 AgentState 并 astream_events ──
-                graph = getattr(agent, "_graph", None) or getattr(agent, "graph", None)
-                if graph is not None and hasattr(graph, "astream_events"):
-                    async for sse_ev in _stream_via_graph(
-                        agent, graph, raw_message, chat_id, user_id, channel,
-                        system_prompt, memory_block, lorebook_block, messages,
-                    ):
-                        yield sse_ev
-                else:
-                    # graph 没有 astream_events（LangGraph 太旧）→ 降级模式 3
-                    async for sse_ev in _stream_fallback(
-                        agent, raw_message, chat_id, user_id, channel,
-                        system_prompt, memory_block, lorebook_block, messages,
-                    ):
-                        yield sse_ev
-
-            elif hasattr(agent, "astream"):
-                # ── 模式 2: Agent 实现了 astream 方法 ──
-                async for chunk in agent.astream(
-                    raw_message=raw_message,
-                    chat_id=chat_id,
-                    user_id=user_id,
-                    channel=channel,
-                    system_prompt=system_prompt,
-                    memory_block=memory_block,
-                    lorebook_block=lorebook_block,
-                    messages=messages or [],
+            # 优先走 Agent.astream()：它复用与非流式同一套图与状态机，
+            # 且在 reason 节点里用 stream=True 逐 token 产出。
+            #
+            # 曾优先走 _stream_via_graph（直接读 agent._graph），那条路依赖
+            # LangGraph 的 on_chat_model_stream 事件 —— 而本项目的 reason 节点
+            # 是直接调 litellm.acompletion（不经过 LangChain Runnable），
+            # 该事件永不触发，实测只产出 agent_start/message/agent_end 三个事件，
+            # 所谓"逐 token 流式"是假的。
+            if hasattr(agent, "astream"):
+                async for sse_ev in _stream_native(
+                    agent, raw_message, chat_id, user_id, channel,
+                    system_prompt, messages,
                 ):
-                    chunk_type = chunk.get("type", "")
-                    if chunk_type == "thinking":
-                        yield _sse_event("thinking", {"delta": chunk.get("content", "")})
-                    elif chunk_type == "tool_call":
-                        yield _sse_event("tool_call", chunk)
-                    elif chunk_type == "tool_result":
-                        yield _sse_event("tool_result", chunk)
-                    elif chunk_type == "message":
-                        yield _sse_event("message", chunk)
-
+                    yield sse_ev
             else:
-                # ── 模式 3: 降级 run() ──
                 async for sse_ev in _stream_fallback(
                     agent, raw_message, chat_id, user_id, channel,
                     system_prompt, memory_block, lorebook_block, messages,
@@ -198,104 +144,53 @@ def stream_agent_events(
     return EventSourceResponse(event_generator())
 
 
-async def _stream_via_graph(
+
+
+async def _stream_native(
     agent: Any,
-    graph: Any,
     raw_message: str,
     chat_id: str,
     user_id: str,
     channel: str,
     system_prompt: str,
-    memory_block: str,
-    lorebook_block: str,
     messages: list[dict[str, Any]] | None,
 ) -> AsyncIterator[dict[str, Any]]:
-    """通过 LangGraph astream_events 实现全流式输出。"""
+    """主路径：消费 Agent.astream() 的 token 级事件。
 
-    # 复用 Agent._run_inner 中的 state 构造逻辑（避免 DRY）
-    initial: AgentState = {
-        "user_id": user_id,
-        "chat_id": chat_id,
-        "channel": channel,
-        "raw_message": raw_message,
-        "system_prompt": system_prompt,
-        "memory_block": memory_block,
-        "lorebook_block": lorebook_block,
-        "messages": messages or [
-            {"role": "system", "content": system_prompt},
-            {"role": "user", "content": raw_message},
-        ],
-        "step_count": 0,
-        "max_steps": getattr(agent, "_max_steps", 3),
-        "stage": "opening",
-        "emotion": "calm",
-        "pending_tool_call": None,
-        "tool_results": [],
-        "next_step": "reason",
-        "final_reply": "",
-        "escalate_reason": "",
-        "confidence": 0.0,
-    }
+    Agent 侧已把图、状态机、护栏、权限全部复用了非流式实现，
+    这里只做「领域事件 → SSE」的一层映射。
+    """
+    collected: list[str] = []
+    async for ev in agent.astream(
+        raw_message=raw_message,
+        chat_id=chat_id,
+        user_id=user_id,
+        channel=channel,
+        system_prompt=system_prompt,
+        messages=messages,
+    ):
+        kind = ev.get("type")
+        if kind == "token":
+            content = ev.get("content", "")
+            if content:
+                collected.append(content)
+                yield _sse_event("message", {"delta": content, "final": False})
+        elif kind == "tool_call":
+            yield _sse_event("tool_call", {
+                "tool": ev.get("tool_name", ""),
+                "arguments": ev.get("arguments", {}),
+            })
+        elif kind == "tool_result":
+            yield _sse_event("tool_result", {
+                "tool": ev.get("tool_name", ""),
+                "result": ev.get("observation", ""),
+                "success": ev.get("success", False),
+            })
+        elif kind == "error":
+            yield _sse_event("error", {"error": ev.get("error", "")})
 
-    thread_id = f"{channel}:{chat_id}"
-    config = {"configurable": {"thread_id": thread_id}}
-
-    # 追踪已经发出的 message 事件（避免重复）
-    emitted_final = False
-
-    try:
-        async for event in graph.astream_events(initial, config=config, version="v2"):
-            kind = event.get("event", "")
-            name = event.get("name", "")
-            data = event.get("data", {})
-
-            if kind == _LG_CHAT_STREAM:
-                # LLM 逐 token 输出
-                chunk_info = data.get("chunk", "")
-                # chunk 可能是 AIMessageChunk 对象或 str
-                token = _extract_token(chunk_info)
-                if token:
-                    yield _sse_event("thinking", {"delta": token})
-
-            elif kind == _LG_CHAT_START:
-                yield _sse_event("thinking", {"delta": ""})
-
-            elif kind == _LG_TOOL_START:
-                tool_input = data.get("input", {})
-                yield _sse_event("tool_call", {
-                    "tool": name,
-                    "args": tool_input,
-                })
-
-            elif kind == _LG_TOOL_END:
-                output = data.get("output", "")
-                # output 可能是 ToolMessage 或其它对象
-                result_text = _extract_tool_output(output)
-                yield _sse_event("tool_result", {
-                    "tool": name,
-                    "result": result_text,
-                })
-
-            elif kind == _LG_CHAIN_END:
-                output = _extract_event_responses(event)
-                final_reply = output.get("final_reply", "")
-                if final_reply and not emitted_final:
-                    emitted_final = True
-                    yield _sse_event("message", {
-                        "delta": final_reply,
-                        "final": True,
-                    })
-
-            elif kind == _LG_CHAIN_START:
-                pass  # 不需要向前端传递 chain 内部事件
-
-            else:
-                # 未知事件类型不向前传递（避免污染前端）
-                log.debug("unknown_stream_event", kind=kind, name=name)
-
-    except Exception as e:
-        log.exception("astream_events_error", chat_id=chat_id, error=str(e))
-        raise
+    if collected:
+        yield _sse_event("message", {"delta": "", "final": True})
 
 
 async def _stream_fallback(
@@ -309,8 +204,12 @@ async def _stream_fallback(
     lorebook_block: str,
     messages: list[dict[str, Any]] | None,
 ) -> AsyncIterator[dict[str, Any]]:
-    """降级模式: 阻塞 run() 后模拟流式输出。"""
-    yield _sse_event("thinking", {"delta": "(非流式模式) 正在分析您的问题..."})
+    """降级路径：Agent 没有 astream 时阻塞 run() 再回放。
+
+    明确告知"非流式模式" —— 不假装逐 token，否则前端会把一次性输出
+    当成流式渲染，用户观感与实际行为不符。
+    """
+    yield _sse_event("thinking", {"delta": "正在分析您的问题..."})
 
     result: dict[str, Any] = await agent.run(
         raw_message=raw_message,
@@ -323,8 +222,7 @@ async def _stream_fallback(
         messages=messages,
     )
 
-    tool_results = result.get("tool_results", [])
-    for tr in tool_results:
+    for tr in result.get("tool_results", []):
         if isinstance(tr, dict):
             yield _sse_event("tool_result", {
                 "tool": tr.get("tool_name", "unknown"),
@@ -333,40 +231,12 @@ async def _stream_fallback(
 
     final_reply = result.get("final_reply", "")
     if final_reply:
-        yield _sse_event("message", {
-            "delta": final_reply,
-            "final": True,
-        })
-
-
-def _extract_token(chunk_info: Any) -> str:
-    """从 LangGraph chunk 对象中提取 token 字符串。"""
-    if isinstance(chunk_info, str):
-        return chunk_info
-    # LangGraph v2 中 chunk 通常是 AIMessageChunk
-    if hasattr(chunk_info, "content"):
-        content = chunk_info.content
-        if isinstance(content, str):
-            return content
-        if isinstance(content, list):
-            # content blocks format
-            text_parts = [c.get("text", "") for c in content if isinstance(c, dict)]
-            return "".join(text_parts)
-    return ""
-
-
-def _extract_tool_output(output: Any) -> str:
-    """从 LangGraph tool 输出中提取文本结果。"""
-    if isinstance(output, str):
-        return output
-    if hasattr(output, "content"):
-        return str(output.content)
-    return str(output)
+        yield _sse_event("message", {"delta": final_reply, "final": True})
 
 
 __all__ = [
     "stream_agent_events",
     "_sse_event",
-    "_stream_via_graph",
+    "_stream_native",
     "_stream_fallback",
 ]

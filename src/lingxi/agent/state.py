@@ -19,14 +19,20 @@
 """
 from __future__ import annotations
 
-from typing import Any, Literal, TypedDict
+from typing import Any, Literal, NotRequired, TypedDict
 
 
 class ToolCall(TypedDict):
-    """一次工具调用请求。"""
+    """一次工具调用请求。
+
+    id: 模型侧返回的 tool_call_id。走 OpenAI function-calling 协议时必须原样回填，
+    否则下一次请求里的 assistant.tool_calls 找不到配对的 tool 消息，
+    服务端会直接报 400（OpenAI / DeepSeek / Qwen 等都会校验配对）。
+    """
 
     tool_name: str
     arguments: dict[str, Any]
+    id: NotRequired[str]
 
 
 class ToolResult(TypedDict):
@@ -66,7 +72,21 @@ class AgentState(TypedDict):
 
     # ── 工具调用 ──
     pending_tool_call: ToolCall | None
+    # 模型一轮可能返回多个 tool_calls，全部执行并逐个回填 tool 消息
+    pending_tool_calls: list[ToolCall]
     tool_results: list[ToolResult]
+    # "工具名 + 参数" 的指纹序列，用于检测模型陷入重复调用死循环
+    tool_call_signatures: list[str]
+
+    # ── 成本 ──
+    # 跨轮累加的 token 用量（prompt/completion/total/calls）。
+    # 没有它就无法回答"这轮对话花了多少钱"，成本不可观测等于不可控。
+    token_usage: dict[str, int]
+
+    # ── 分级权限 ──
+    # 由 pipeline 按 user/chat 解析后写入（见 SecurityConfig.permission_rules），
+    # execute_tool 节点读它做鉴权 —— 不再是进程级全局常量。
+    current_permission: int
 
     # ── 控制流 ──
     next_step: Literal["reason", "tool", "escalate", "respond", "done"]
