@@ -1,6 +1,7 @@
 #![cfg_attr(not(debug_assertions), windows_subsystem = "windows")]
 
-use tauri::{Manager, Runtime};
+use std::sync::{Arc, Mutex};
+use tauri::{Listener, Manager};
 
 mod python_sidecar;
 use python_sidecar::PythonSidecar;
@@ -15,22 +16,28 @@ pub fn run() {
         .plugin(tauri_plugin_http::init())
         .plugin(tauri_plugin_opener::init())
         .setup(|app| {
-            // 启动 Python sidecar
-            let mut sidecar = PythonSidecar::new(app.handle())?;
+            let sidecar = Arc::new(Mutex::new(PythonSidecar::new(app.handle())?));
+            let sidecar_start = sidecar.clone();
             let handle = app.handle().clone();
 
             tauri::async_runtime::spawn(async move {
-                if let Err(e) = sidecar.start(handle).await {
+                // Lock, extract what we need, then release lock before await
+                let (executable, admin_token, port) = {
+                    let guard = sidecar_start.lock().unwrap();
+                    (guard.executable.clone(), guard.admin_token.clone(), guard.port)
+                };
+                
+                // Start sidecar without holding the lock
+                if let Err(e) = PythonSidecar::start_standalone(executable, admin_token, port, handle).await {
                     eprintln!("Failed to start sidecar: {}", e);
-                    // 即使 sidecar 启动失败也继续运行，前端会显示错误状态
                 }
             });
 
-            // 退出时关闭 sidecar
-            let handle = app.handle().clone();
+            let sidecar_stop = sidecar.clone();
             app.once("close_requested", move |_| {
+                let mut guard = sidecar_stop.lock().unwrap();
                 tauri::async_runtime::block_on(async move {
-                    if let Err(e) = sidecar.stop().await {
+                    if let Err(e) = guard.stop().await {
                         eprintln!("Failed to stop sidecar: {}", e);
                     }
                 });

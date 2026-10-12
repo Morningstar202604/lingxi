@@ -1,0 +1,1 @@
+{"lingxi-capability":{"identifier":"lingxi-capability","description":"Permissions for lingxi desktop app","local":true,"windows":["main"],"permissions":["core:default","shell:default","process:default","fs:default","dialog:default","http:default","opener:default"]}}

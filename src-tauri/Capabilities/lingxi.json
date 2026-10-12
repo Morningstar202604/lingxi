@@ -4,20 +4,11 @@
   "windows": ["main"],
   "permissions": [
     "core:default",
-    "shell:allow-execute",
-    "shell:allow-sidecar",
-    "process:allow-execute",
-    "process:allow-sidecar",
-    "fs:allow-read-text-file",
-    "fs:allow-write-text-file",
-    "fs:allow-create-dir",
-    "fs:allow-read-dir",
-    "fs:allow-copy-file",
-    "fs:allow-remove-file",
-    "fs:allow-rename-file",
-    "dialog:allow-open",
-    "dialog:allow-save",
-    "http:allow-request",
-    "opener:allow-open"
+    "shell:default",
+    "process:default",
+    "fs:default",
+    "dialog:default",
+    "http:default",
+    "opener:default"
   ]
 }

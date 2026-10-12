@@ -140,7 +140,9 @@ async def call_llm(
     tools: list[dict[str, Any]] | None = None,
     usage: TokenUsage | None = None,
 ) -> Any:
-    """带重试的 LLM 调用。失败抛 LLMCallError。
+    """带重试 + 多模型降级的 LLM 调用。失败抛 LLMCallError。
+
+    降级链：配置模型 → fallback_models → 最后兜底报错（含友好提示）
 
     Args:
         messages: 完整消息历史
@@ -157,52 +159,77 @@ async def call_llm(
     retries = settings.agent.llm_max_retries
     base_delay = settings.agent.llm_retry_base_delay
 
-    kwargs: dict[str, Any] = {
-        "model": llm_cfg.model,
-        "messages": messages,
-        "temperature": llm_cfg.temperature,
-        "max_tokens": llm_cfg.max_tokens,
-        "api_key": llm_cfg.api_key.get_secret_value() if llm_cfg.api_key else None,
-        "base_url": llm_cfg.base_url,
-        "timeout": 30,
-    }
-    if tools:
-        kwargs["tools"] = tools
-        kwargs["tool_choice"] = "auto"
+    # 构建尝试链：主模型 + 备用模型
+    models_to_try = [llm_cfg.model] + [m for m in llm_cfg.fallback_models if m != llm_cfg.model]
 
-    last_error: BaseException | None = None
-    for attempt in range(retries + 1):
-        try:
-            response = await acompletion(**kwargs)
-            if usage is not None:
-                usage.add(response)
-            extract_content(response)  # 提前验空，把边界情况变成明确异常
-            return response
-        except EmptyLLMResponseError:
-            # 空响应是可重试的（网关抖动），交给下一轮
-            last_error = LLMCallError("模型返回空响应（choices 为空）", retryable=True)
-        except Exception as e:  # noqa: BLE001 — 这里就是要兜住所有网关异常
-            last_error = e
-            if not is_retryable(e):
-                log.warning("llm_call_fatal", error=f"{type(e).__name__}: {e}")
-                raise LLMCallError(f"{type(e).__name__}: {e}", retryable=False) from e
+    for model_idx, model in enumerate(models_to_try):
+        kwargs: dict[str, Any] = {
+            "model": model,
+            "messages": messages,
+            "temperature": llm_cfg.temperature,
+            "max_tokens": llm_cfg.max_tokens,
+            "api_key": llm_cfg.api_key.get_secret_value() if llm_cfg.api_key else None,
+            "base_url": llm_cfg.base_url,
+            "timeout": 30,
+        }
+        if tools:
+            kwargs["tools"] = tools
+            kwargs["tool_choice"] = "auto"
 
-        if attempt < retries:
-            # 指数退避 + jitter：避免并发请求同时重试形成尖峰
-            delay = base_delay * (2 ** attempt) * (0.5 + random.random())
-            log.warning(
-                "llm_call_retry",
-                attempt=attempt + 1,
-                max_retries=retries,
-                delay=round(delay, 3),
-                error=f"{type(last_error).__name__}: {last_error}",
-            )
-            await asyncio.sleep(delay)
+        last_error: BaseException | None = None
+        for attempt in range(retries + 1):
+            try:
+                response = await acompletion(**kwargs)
+                if usage is not None:
+                    usage.add(response)
+                extract_content(response)
+                if model_idx > 0:
+                    log.info("llm_fallback_succeeded", model=model, fallback_idx=model_idx)
+                return response
+            except EmptyLLMResponseError:
+                last_error = LLMCallError("模型返回空响应（choices 为空）", retryable=True)
+            except Exception as e:  # noqa: BLE001
+                last_error = e
+                if not is_retryable(e):
+                    log.warning("llm_call_fatal", model=model, error=f"{type(e).__name__}: {e}")
+                    # 不可重试错误，直接尝试下一个 fallback 模型
+                    break
 
-    raise LLMCallError(
-        f"LLM 调用失败（重试 {retries} 次后）: {type(last_error).__name__}: {last_error}",
-        retryable=True,
-    ) from last_error
+            if attempt < retries:
+                delay = base_delay * (2 ** attempt) * (0.5 + random.random())
+                log.warning(
+                    "llm_call_retry",
+                    model=model,
+                    attempt=attempt + 1,
+                    max_retries=retries,
+                    delay=round(delay, 3),
+                    error=f"{type(last_error).__name__}: {last_error}",
+                )
+                await asyncio.sleep(delay)
+        else:
+            # 该模型重试耗尽，尝试下一个 fallback
+            log.warning("llm_model_exhausted", model=model, next_fallback=models_to_try[model_idx + 1] if model_idx + 1 < len(models_to_try) else None)
+            continue
+
+    # 所有模型都失败了，给出友好错误
+    friendly_msg = _build_friendly_error(last_error)
+    raise LLMCallError(friendly_msg, retryable=False) from last_error
+
+
+def _build_friendly_error(last_error: BaseException | None) -> str:
+    """生成用户友好的错误信息，包含排查建议。"""
+    base = "所有可用模型均调用失败"
+    if last_error:
+        err_text = f"{type(last_error).__name__}: {last_error}"
+        base += f"：{err_text}"
+
+    suggestions = [
+        "1. 检查 Ollama 是否运行：`ollama serve` 或访问 http://127.0.0.1:11434",
+        "2. 确认模型已下载：`ollama pull qwen2.5:7b`",
+        "2. 如需云端模型，请配置环境变量 LINGXI_LLM__API_KEY 与 LINGXI_LLM__BASE_URL",
+        "3. 查看日志获取完整错误堆栈",
+    ]
+    return base + "\n" + "\n".join(suggestions)
 
 
 def _field(obj: Any, name: str, default: Any = None) -> Any:
@@ -266,66 +293,80 @@ async def stream_llm(
     *,
     tools: list[dict[str, Any]] | None = None,
 ) -> AsyncIterator[dict[str, Any]]:
-    """流式 LLM 调用。
+    """流式 LLM 调用（含多模型降级）。
 
     Yields:
         ``{"type": "token", "content": "..."}``      —— 文本增量
         ``{"type": "tool_call", "tool_name": ..., "arguments": {...}, "id": ...}``
+        ``{"type": "error", "error": "..."}``        —— 所有模型失败时的友好错误
 
     🔗 工程逻辑
         走 `stream=True`，由 LiteLLM 统一处理各家网关的流式协议差异；
         tool_calls 的多片增量由 `_ToolCallAccumulator` 按 index 归并。
+        模型失败时自动尝试 fallback_models，最终失败 yield 友好错误。
     """
     from litellm import acompletion
 
     settings = get_settings()
     llm_cfg = settings.llm
-    kwargs: dict[str, Any] = {
-        "model": llm_cfg.model,
-        "messages": messages,
-        "temperature": llm_cfg.temperature,
-        "max_tokens": llm_cfg.max_tokens,
-        "api_key": llm_cfg.api_key.get_secret_value() if llm_cfg.api_key else None,
-        "base_url": llm_cfg.base_url,
-        "timeout": 30,
-        "stream": True,
-    }
-    if tools:
-        kwargs["tools"] = tools
-        kwargs["tool_choice"] = "auto"
+    models_to_try = [llm_cfg.model] + [m for m in llm_cfg.fallback_models if m != llm_cfg.model]
 
-    response = await acompletion(**kwargs)
-    acc = _ToolCallAccumulator()
-    async for chunk in response:
-        choices = getattr(chunk, "choices", None) or []
-        if not choices:
-            continue
-        delta = _field(choices[0], "delta")
-        if delta is None:
-            continue
-        content = _field(delta, "content")
-        if isinstance(content, str) and content:
-            yield {"type": "token", "content": content}
-        tool_deltas = _field(delta, "tool_calls")
-        if tool_deltas:
-            acc.feed(list(tool_deltas))
-
-    for call in acc.drain():
-        raw_args = call["arguments"]
-        try:
-            parsed = json.loads(raw_args) if raw_args else {}
-        except json.JSONDecodeError:
-            parsed = {}
-        if not isinstance(parsed, dict):
-            parsed = {}
-        payload: dict[str, Any] = {
-            "type": "tool_call",
-            "tool_name": call["tool_name"],
-            "arguments": parsed,
+    for model in models_to_try:
+        kwargs: dict[str, Any] = {
+            "model": model,
+            "messages": messages,
+            "temperature": llm_cfg.temperature,
+            "max_tokens": llm_cfg.max_tokens,
+            "api_key": llm_cfg.api_key.get_secret_value() if llm_cfg.api_key else None,
+            "base_url": llm_cfg.base_url,
+            "timeout": 30,
+            "stream": True,
         }
-        if call["id"]:
-            payload["id"] = call["id"]
-        yield payload
+        if tools:
+            kwargs["tools"] = tools
+            kwargs["tool_choice"] = "auto"
+
+        try:
+            response = await acompletion(**kwargs)
+            acc = _ToolCallAccumulator()
+            async for chunk in response:
+                choices = getattr(chunk, "choices", None) or []
+                if not choices:
+                    continue
+                delta = _field(choices[0], "delta")
+                if delta is None:
+                    continue
+                content = _field(delta, "content")
+                if isinstance(content, str) and content:
+                    yield {"type": "token", "content": content}
+                tool_deltas = _field(delta, "tool_calls")
+                if tool_deltas:
+                    acc.feed(list(tool_deltas))
+
+            for call in acc.drain():
+                raw_args = call["arguments"]
+                try:
+                    parsed = json.loads(raw_args) if raw_args else {}
+                except json.JSONDecodeError:
+                    parsed = {}
+                if not isinstance(parsed, dict):
+                    parsed = {}
+                payload: dict[str, Any] = {
+                    "type": "tool_call",
+                    "tool_name": call["tool_name"],
+                    "arguments": parsed,
+                }
+                if call["id"]:
+                    payload["id"] = call["id"]
+                yield payload
+            return  # 成功则返回，不再尝试后续模型
+
+        except Exception as e:  # noqa: BLE001
+            log.warning("stream_llm_model_failed", model=model, error=f"{type(e).__name__}: {e}")
+            continue  # 尝试下一个模型
+
+    # 所有模型失败
+    yield {"type": "error", "error": _build_friendly_error(None)}
 
 
 __all__ = [

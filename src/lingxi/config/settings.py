@@ -61,14 +61,27 @@ class GewechatConfig(BaseModel):
 
 
 class LLMConfig(BaseModel):
-    """多模型路由配置。"""
+    """多模型路由配置。
 
-    provider: Literal["openai", "anthropic", "deepseek", "ollama", "litellm"] = "litellm"
-    model: str = "gpt-4o-mini"
+    🔗 工程逻辑
+        默认使用 Ollama 本地模型，零配置即可跑通；用户可通过环境变量
+        切换到 OpenAI/DeepSeek 等云端模型。litellm 作为统一网关，
+        统一处理各家 API 差异，Ollama 作为零配置 fallback。
+
+    优先级：环境变量 > YAML > 默认值（Ollama 本地）
+    """
+
+    provider: Literal["openai", "anthropic", "deepseek", "ollama", "litellm"] = "ollama"
+    model: str = "qwen2.5:7b"
     api_key: SecretStr | None = None
-    base_url: str | None = None
+    base_url: str | None = "http://127.0.0.1:11434/v1"
     temperature: float = 0.2
     max_tokens: int = 1024
+
+    # 备用模型链（按优先级尝试），用于主模型失败时的自动降级
+    fallback_models: list[str] = Field(default_factory=lambda: [
+        "qwen2.5:7b", "llama3.1:8b", "mistral:7b"
+    ])
 
 
 class EmbeddingConfig(BaseModel):

@@ -7,8 +7,8 @@
     "build": "next build",
     "start": "next start",
     "lint": "next lint",
-    "tauri:dev": "TAURI=1 next dev",
-    "tauri:build": "TAURI=1 next build && cargo tauri build --manifest-path ../src-tauri/Cargo.toml",
+    "tauri:dev": "cross-env TAURI=1 next dev",
+    "tauri:build": "cross-env TAURI=1 next build && cargo tauri build -- --manifest-path ../src-tauri/Cargo.toml",
     "tauri:dev:rust": "cargo tauri dev --manifest-path ../src-tauri/Cargo.toml"
   },
   "dependencies": {
@@ -25,6 +25,7 @@
     "autoprefixer": "^10.4.19",
     "postcss": "^8.4.38",
     "tailwindcss": "^3.4.4",
-    "typescript": "^5.9.3"
+    "typescript": "^5.9.3",
+    "cross-env": "^7.0.3"
   }
 }

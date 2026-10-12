@@ -1,29 +1,26 @@
 use std::path::PathBuf;
-use tauri::{Manager, Runtime};
-use tauri_plugin_shell::ShellExt;
+use tauri::{AppHandle, Manager};
+use tokio::io::{AsyncBufReadExt, BufReader};
 use tokio::process::Command as TokioCommand;
 
 pub struct PythonSidecar {
-    child: Option<tokio::process::Child>,
-    executable: PathBuf,
-    admin_token: String,
-    port: u16,
+    pub child: Option<tokio::process::Child>,
+    pub executable: PathBuf,
+    pub admin_token: String,
+    pub port: u16,
 }
 
 impl PythonSidecar {
-    pub fn new(app_handle: &tauri::AppHandle) -> anyhow::Result<Self> {
-        // 从资源目录解析 sidecar 路径
+    pub fn new(app_handle: &AppHandle) -> anyhow::Result<Self> {
         let executable = app_handle
             .path()
             .resolve("lingxi-server", tauri::path::BaseDirectory::Resource)?
             .with_extension(if cfg!(windows) { "exe" } else { "" });
 
-        // 读取 admin token（开发环境从环境变量，生产环境从配置文件）
         let admin_token = std::env::var("LINGXI_ADMIN_TOKEN")
             .or_else(|_| std::env::var("LINGXI_SECURITY__ADMIN_TOKEN"))
             .unwrap_or_else(|_| "change-me-in-production".to_string());
 
-        // 固定端口（也可随机选取并写入配置文件）
         let port = 8080;
 
         Ok(Self {
@@ -34,7 +31,7 @@ impl PythonSidecar {
         })
     }
 
-    pub async fn start(&mut self, app_handle: tauri::AppHandle) -> anyhow::Result<()> {
+    pub async fn start(&mut self, app_handle: AppHandle) -> anyhow::Result<()> {
         println!(">>> Starting Python sidecar: {:?}", self.executable);
 
         let mut cmd = TokioCommand::new(&self.executable);
@@ -48,43 +45,91 @@ impl PythonSidecar {
         #[cfg(windows)]
         {
             use std::os::windows::process::CommandExt;
-            cmd.creation_flags(0x08000000); // CREATE_NO_WINDOW
+            cmd.creation_flags(0x08000000);
         }
 
         let mut child = cmd.spawn()?;
 
-        // 读取 stdout 到日志
         if let Some(stdout) = child.stdout.take() {
             let app = app_handle.clone();
             tokio::spawn(async move {
-                use tokio::io::{AsyncBufReadExt, BufReader};
                 let reader = BufReader::new(stdout).lines();
-                for await line in reader {
-                    if let Ok(l) = line {
-                        println!("[lingxi-server] {}", l);
-                    }
+                let mut lines = reader;
+                while let Some(line) = lines.next_line().await.unwrap_or(None) {
+                    println!("[lingxi-server] {}", line);
                 }
             });
         }
 
-        // 读取 stderr 到日志
         if let Some(stderr) = child.stderr.take() {
             tokio::spawn(async move {
-                use tokio::io::{AsyncBufReadExt, BufReader};
                 let reader = BufReader::new(stderr).lines();
-                for await line in reader {
-                    if let Ok(l) = line {
-                        eprintln!("[lingxi-server ERR] {}", l);
-                    }
+                let mut lines = reader;
+                while let Some(line) = lines.next_line().await.unwrap_or(None) {
+                    eprintln!("[lingxi-server ERR] {}", line);
                 }
             });
         }
 
         self.child = Some(child);
 
-        // 等待健康检查通过
         Self::wait_health(self.port).await?;
         println!(">>> Python sidecar started on port {}", self.port);
+        Ok(())
+    }
+
+    /// 静态方法：不持有 self 锁的独立启动（用于 Tauri setup 中的 spawn）
+    pub async fn start_standalone(
+        executable: PathBuf,
+        admin_token: String,
+        port: u16,
+        app_handle: AppHandle,
+    ) -> anyhow::Result<()> {
+        println!(">>> Starting Python sidecar: {:?}", executable);
+
+        let mut cmd = TokioCommand::new(&executable);
+        cmd.env("LINGXI_SECURITY__ADMIN_TOKEN", &admin_token)
+            .env("LINGXI_DASHBOARD_PORT", port.to_string())
+            .env("LINGXI_DATA_DIR", Self::data_dir()?)
+            .stdout(std::process::Stdio::piped())
+            .stderr(std::process::Stdio::piped())
+            .kill_on_drop(true);
+
+        #[cfg(windows)]
+        {
+            use std::os::windows::process::CommandExt;
+            cmd.creation_flags(0x08000000);
+        }
+
+        let mut child = cmd.spawn()?;
+
+        if let Some(stdout) = child.stdout.take() {
+            let app = app_handle.clone();
+            tokio::spawn(async move {
+                let reader = BufReader::new(stdout).lines();
+                let mut lines = reader;
+                while let Some(line) = lines.next_line().await.unwrap_or(None) {
+                    println!("[lingxi-server] {}", line);
+                }
+            });
+        }
+
+        if let Some(stderr) = child.stderr.take() {
+            tokio::spawn(async move {
+                let reader = BufReader::new(stderr).lines();
+                let mut lines = reader;
+                while let Some(line) = lines.next_line().await.unwrap_or(None) {
+                    eprintln!("[lingxi-server ERR] {}", line);
+                }
+            });
+        }
+
+        Self::wait_health(port).await?;
+        println!(">>> Python sidecar started on port {}", port);
+
+        // child 设置了 kill_on_drop，析构时自动清理
+        // 这里不存入 self.child，由外部管理
+        drop(child);
         Ok(())
     }
 
@@ -111,7 +156,11 @@ impl PythonSidecar {
             format!("{}/Library/Application Support", home)
         } else {
             std::env::var("XDG_DATA_HOME")
-                .unwrap_or_else(|_| format!("{}/.local/share", std::env::var("HOME")?))
+                .unwrap_or_else(|_| {
+                    std::env::var("HOME")
+                        .map(|h| format!("{}/.local/share", h))
+                        .unwrap_or_else(|_| "/tmp/.local/share".to_string())
+                })
         };
         let path = PathBuf::from(dir).join("lingxi");
         std::fs::create_dir_all(&path)?;

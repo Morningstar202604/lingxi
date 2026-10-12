@@ -112,7 +112,9 @@ class TestLLMRetry:
             return _resp("好了")
 
         agent = ZhiXiAgent(registry=ToolRegistry(), max_steps=3)
-        with patch("litellm.acompletion", new=AsyncMock(side_effect=flaky)):
+        # 禁用 fallback，只测主模型重试
+        with patch("litellm.acompletion", new=AsyncMock(side_effect=flaky)), \
+             patch.object(get_settings().llm, "fallback_models", []):
             r = await agent.run(raw_message="hi", chat_id="c", user_id="u", channel="qq_private", system_prompt="SP")
 
         assert calls["n"] == 3, "没有重试"
@@ -129,7 +131,8 @@ class TestLLMRetry:
             raise ValueError("Invalid API key provided")
 
         agent = ZhiXiAgent(registry=ToolRegistry(), max_steps=3)
-        with patch("litellm.acompletion", new=AsyncMock(side_effect=fatal)):
+        with patch("litellm.acompletion", new=AsyncMock(side_effect=fatal)), \
+             patch.object(get_settings().llm, "fallback_models", []):
             r = await agent.run(raw_message="hi", chat_id="c", user_id="u", channel="qq_private", system_prompt="SP")
 
         assert calls["n"] == 1, "致命错误仍在重试"
@@ -141,7 +144,8 @@ class TestLLMRetry:
             raise RuntimeError("gateway down")
 
         agent = ZhiXiAgent(registry=ToolRegistry(), max_steps=3)
-        with patch("litellm.acompletion", new=AsyncMock(side_effect=always_fail)):
+        with patch("litellm.acompletion", new=AsyncMock(side_effect=always_fail)), \
+             patch.object(get_settings().llm, "fallback_models", []):
             r = await agent.run(raw_message="hi", chat_id="c", user_id="u", channel="qq_private", system_prompt="SP")
 
         assert "LLM 调用失败" in r["escalate_reason"]
@@ -170,6 +174,7 @@ class TestLLMRetry:
         try:
             with (
                 patch("litellm.acompletion", new=AsyncMock(side_effect=fail)),
+                patch.object(settings.llm, "fallback_models", []),
                 pytest.raises(LLMCallError),
             ):
                 await call_llm([{"role": "user", "content": "x"}])
@@ -354,7 +359,8 @@ class TestTrueStreaming:
                 yield _Chunk(t)
 
         agent = ZhiXiAgent(registry=ToolRegistry(), max_steps=2)
-        with patch("litellm.acompletion", new=AsyncMock(return_value=gen())):
+        with patch("litellm.acompletion", new=AsyncMock(return_value=gen())), \
+             patch.object(get_settings().llm, "fallback_models", []):
             events = [
                 e async for e in agent.astream("hi", "c", "u", "qq_private", "SP")
             ]
@@ -365,16 +371,23 @@ class TestTrueStreaming:
     @pytest.mark.asyncio
     async def test_stream_errors_become_events(self) -> None:
         """流式异常必须转成事件，不能把连接炸掉。"""
+        from lingxi.agent.llm import stream_llm
 
         async def gen(**kw: Any) -> Any:
             raise RuntimeError("stream broke")
             yield  # pragma: no cover
 
-        agent = ZhiXiAgent(registry=ToolRegistry(), max_steps=2)
-        with patch("litellm.acompletion", new=AsyncMock(return_value=gen())):
+        # 直接测试 stream_llm，禁用 fallback
+        settings = get_settings()
+        old_fallback = settings.llm.fallback_models
+        settings.llm.fallback_models = []
+        try:
             events = [
-                e async for e in agent.astream("hi", "c", "u", "qq_private", "SP")
+                e async for e in stream_llm([{"role": "user", "content": "hi"}])
             ]
+        finally:
+            settings.llm.fallback_models = old_fallback
+
         assert any(e["type"] == "error" for e in events), events
 
     @pytest.mark.asyncio

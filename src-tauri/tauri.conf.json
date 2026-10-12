@@ -37,16 +37,11 @@
     "externalBin": ["lingxi-server"]
   },
   "plugins": {
-    "shell": {
-      "sidecar": true
-    },
-    "process": {
-      "sidecar": true
-    },
+    "shell": {},
+    "process": {},
     "fs": {
-      "scope": {
-        "allow": ["$APPDATA/lingxi/**", "$TEMP/lingxi/**"]
-      }
+      "requireLiteralLeadingDot": false,
+      "scopeDroppedPaths": false
     }
   }
 }
