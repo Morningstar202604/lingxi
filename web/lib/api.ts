@@ -5,9 +5,9 @@
 // 安全：NEXT_PUBLIC_* 会被编译进客户端 bundle 下发给每个访客，
 // 绝不能内置管理凭据默认值。凭据必须由运维在登录后注入。
 const ADMIN_TOKEN = process.env.NEXT_PUBLIC_ADMIN_TOKEN || "";
-// Dashboard 全部经 Next rewrite 代理访问（同源，无需 CORS）。
-// 后端地址在 next.config.js 由 DASHBOARD_API_URL 配置。
-const API_BASE = "/api/proxy";
+// Tauri 模式下直接访问 sidecar (localhost:8080)，否则走 Next 代理
+const IS_TAURI = typeof window !== "undefined" && (window as any).__TAURI__;
+const API_BASE = IS_TAURI ? "http://127.0.0.1:8080" : "/api/proxy";
 
 function authHeaders(): HeadersInit {
   if (!ADMIN_TOKEN) {

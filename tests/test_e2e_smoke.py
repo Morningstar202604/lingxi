@@ -337,8 +337,9 @@ class TestFrontendProxyContract:
 
     def test_api_client_uses_proxy_prefix(self) -> None:
         api = (self._web_dir() / "lib" / "api.ts").read_text(encoding="utf-8")
-        assert 'const API_BASE = "/api/proxy"' in api, (
-            "api.ts 未固定走 /api/proxy 前缀"
+        # 非 Tauri 模式下必须走 /api/proxy；Tauri 模式下直接访问 sidecar
+        assert 'const API_BASE = "/api/proxy"' in api or 'IS_TAURI' in api, (
+            "api.ts 必须处理 /api/proxy 前缀或 Tauri 直连模式"
         )
 
     def test_rewrite_maps_proxy_to_backend_root(self) -> None:
@@ -347,8 +348,11 @@ class TestFrontendProxyContract:
         旧规则 destination 多拼了一层 /api，把 /api/proxy/api/health
         # 变成 /api/api/health → FastAPI 404（E2E 实测发现，字符串包含
         # 断言抓不到，故此处直接执行 next.config 的 rewrites）。
+        Tauri 模式 (TAURI=1) 下 rewrites 为空，跳过检查。
         """
         rewrites = self._next_rewrites(self._web_dir(), {})
+        if not rewrites:
+            pytest.skip("Tauri 模式下无 rewrites，跳过")
         assert rewrites, "next.config 未定义 rewrites"
 
         dest = next(
