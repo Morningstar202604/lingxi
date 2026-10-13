@@ -54,7 +54,7 @@ dependencies = [
 mem0 = ["mem0ai>=0.1.0"]
 neo4j = ["neo4j>=5.24.0", "networkx>=3.4.0"]
 graph = ["networkx>=3.4.0"]
-# flow/postgres.py 的 PostgreSQL 后端（当前尚未接入默认启动路径，见 docs/AUDIT）
+# flow/postgres.py 的 PostgreSQL 后端（persistence.backend=postgresql 启用）
 postgres = ["asyncpg>=0.30.0"]
 dev = [
     "pytest>=8.3.0",
@@ -137,4 +137,10 @@ ignore_missing_imports = true
 # chromadb 是被 __main__.py:213 默认装配的重量级依赖，官方不提供 stub。
 [[tool.mypy.overrides]]
 module = ["asyncpg.*", "chromadb.*"]
+ignore_missing_imports = true
+
+# mem0ai 官方不带 py.typed；neo4j 驱动在旧版本里也无 stub。
+# 两者都是可选 extra，仅在对应后端启用时才 import。
+[[tool.mypy.overrides]]
+module = ["mem0", "neo4j", "neo4j.*"]
 ignore_missing_imports = true

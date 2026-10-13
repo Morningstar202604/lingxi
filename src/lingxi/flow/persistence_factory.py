@@ -1,4 +1,4 @@
-"""持久化后端工厂 — 根据配置选择 SQLite 或 PostgreSQL。
+"""持久化后端工厂 — 根据配置选择 SQLite / PostgreSQL / Mem0 / Neo4j。
 
 🔗 工程逻辑
     集中创建持久化三件套（tickets / queue / memory），
@@ -12,12 +12,21 @@
     工厂返回的三件套可直接替换原有 in-memory 实例，
     pipeline.py 无需任何改动。
 
+    记忆后端通过 ``mem0.enabled`` 切换：
+    - True → Mem0MemoryPipeline（Ollama 语义抽取 + Chroma 向量 + 内置图谱）
+    - False → 内置管线（SQLite 持久化 或 纯内存 n-gram）
+
+    实体图谱通过 ``neo4j.enabled`` 切换：
+    - True → Neo4jGraphStore（Cypher 多跳查询）
+    - False → SQLiteGraphStore / InMemoryGraphStore（零运维）
+
 🤖 AI 避坑
     - PostgreSQL 后端在 import 时就要检查 asyncpg 安装
     - DSN 要从 SecretStr 读取，不能硬编码
     - 异步创建方法（``async create_stores``）不能省
     - SQLite 创建是同步的，Postgres 是 async，工厂统一用 async 签名
     - Postgres 连接失败时应显式报错（fail-fast），不静默降级
+    - Mem0 / Neo4j 同样 fail-fast：enabled=True 但连不上，启动即报错
 """
 from __future__ import annotations
 
@@ -27,6 +36,38 @@ from lingxi.config import get_settings
 from lingxi.core import get_logger
 
 log = get_logger(__name__)
+
+
+def create_graph_backend(settings: Any = None, graph: Any = None) -> Any:
+    """按配置创建实体图谱后端。
+
+    优先级: 显式传入的 graph > neo4j.enabled > 持久化后端类型。
+    Mem0 后端自带图谱时传 None（记忆管线与图谱同生命周期）。
+    """
+    if graph is not None:
+        return graph
+    if settings is None:
+        settings = get_settings()
+
+    if settings.neo4j.enabled:
+        from lingxi.memory.neo4j_graph import Neo4jGraphStore
+
+        n4j = settings.neo4j
+        graph = Neo4jGraphStore(
+            uri=n4j.uri,
+            username=n4j.username,
+            password=n4j.password.get_secret_value(),
+        )
+        log.info("graph_backend_selected", backend="neo4j", uri=n4j.uri)
+        return graph
+
+    if settings.memory.persistent:
+        from lingxi.memory.graph_store import SQLiteGraphStore
+
+        return SQLiteGraphStore(
+            str(settings.data_dir / settings.memory.graph_db_path)
+        )
+    return None
 
 
 async def create_stores(
@@ -116,12 +157,15 @@ async def _create_postgres_stores(settings: Any, graph: Any = None) -> tuple[Any
     pg_cfg = settings.persistence.postgres
     dsn: str = pg_cfg.dsn.get_secret_value()
 
-    writer = await PostgresWriter.create(
+    # 池必须建在 runner 的后台循环上：同步包装器（SyncPostgres*）都在那个循环
+    # 里执行协程，池建在当前调用方的循环上会让每次查询都报
+    # "Future attached to a different loop"。
+    writer = PostgresWriter.create_on_runner(
         dsn,
         min_size=pg_cfg.pool_min,
         max_size=pg_cfg.pool_max,
     )
-    await writer.init_schema()
+    writer.init_schema_on_runner()
 
     async_tickets = PostgresTicketStore(writer)
     async_queue = PostgresEscalationQueue(writer, ticket_store=async_tickets)

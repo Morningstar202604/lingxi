@@ -346,6 +346,48 @@ def create_dashboard_app(
             ticket.transition(TicketStatus.CLOSED)
         return {"ticket_id": ticket_id, "status": "completed"}
 
+    # ── 入站 Webhook（HMAC-SHA256 验签）──
+    # 出站签名用同一套 header（security/hmac.py 的 sign_webhook_payload），
+    # 接收方验签用 verify_webhook_signature：时间戳容差 + 常量时间比较。
+    # 未配置 inbound_hmac_secret 时端点整体不挂载（404），不产生半开面。
+    _inbound_secret = (
+        settings.webhook.inbound_hmac_secret.get_secret_value()
+        if settings.webhook.inbound_hmac_secret
+        else None
+    )
+    # SecretStr 实例本身恒为真值（repr 掩码串），空 secret 必须按未配置处理，
+    # 否则会出现"配了空密钥的验签端点"——任何请求都能算出正确签名。
+    if _inbound_secret:
+
+        @app.post("/api/webhook/inbound")
+        async def webhook_inbound(
+            request: Request,
+            x_zhixi_signature: str | None = Header(default=None, alias="X-ZhiXi-Signature"),
+            x_zhixi_timestamp: str | None = Header(default=None, alias="X-ZhiXi-Timestamp"),
+        ) -> dict[str, Any]:
+            """验签入站 Webhook。payload 原样返回，由调用方（规则引擎/外部系统）消费。"""
+            from lingxi.security.hmac import verify_webhook_signature
+
+            body = await request.body()
+            if x_zhixi_signature is None or x_zhixi_timestamp is None:
+                raise HTTPException(status_code=401, detail="Missing X-ZhiXi-Signature / X-ZhiXi-Timestamp")
+            ok = verify_webhook_signature(
+                body,
+                _inbound_secret,
+                x_zhixi_signature,
+                x_zhixi_timestamp,
+                max_age_seconds=settings.webhook.inbound_max_age_seconds,
+            )
+            if not ok:
+                raise HTTPException(status_code=401, detail="Signature verification failed")
+            try:
+                payload = json.loads(body) if body else {}
+            except json.JSONDecodeError:
+                payload = {"raw": body.decode("utf-8", errors="replace")}
+            return {"received": True, "payload": payload}
+
+        log.info("inbound_webhook_endpoint_mounted")
+
     @app.get("/api/sessions")
     async def list_sessions(
         x_admin_token: str | None = Header(None),

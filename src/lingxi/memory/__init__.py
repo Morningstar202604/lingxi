@@ -16,6 +16,10 @@ from lingxi.memory.graph_store import (
     SQLiteGraphStore,
 )
 from lingxi.memory.lorebook import Lorebook, LorebookEntry
+
+# 可选后端：Mem0 / Neo4j 需要额外依赖与外部服务，构造时 fail-fast。
+from lingxi.memory.mem0_backend import Mem0MemoryPipeline
+from lingxi.memory.neo4j_graph import Neo4jGraphStore
 from lingxi.memory.pipeline import (
     MemoryItem,
     MemoryPipeline,
@@ -28,9 +32,11 @@ __all__ = [
     "InMemoryGraphStore",
     "Lorebook",
     "LorebookEntry",
+    "Mem0MemoryPipeline",
     "MemoryItem",
     "MemoryPipeline",
     "MemoryRecallResult",
+    "Neo4jGraphStore",
     "Relation",
     "SQLiteGraphStore",
 ]

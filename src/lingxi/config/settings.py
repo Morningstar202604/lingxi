@@ -28,6 +28,38 @@ class PostgresConfig(BaseModel):
     pool_max: int = 10
 
 
+class Neo4jConfig(BaseModel):
+    """Neo4j 图谱后端配置 (可选, 大规模多跳查询)。"""
+
+    enabled: bool = False
+    uri: str = "bolt://127.0.0.1:7687"
+    username: str = "neo4j"
+    password: SecretStr = SecretStr("zhixi_neo4j")
+
+
+class Mem0Config(BaseModel):
+    """Mem0 语义记忆后端配置 (可选, 自动事实抽取 + 向量召回 + 遗忘)。
+
+    启用前提: 安装 mem0ai extra + 可访问的 embedding 提供方
+    (默认 ollama: nomic-embed-text)。未装依赖或后端不可达时
+    配置校验 fail-fast 报错, 不静默降级。
+    """
+
+    enabled: bool = False
+    # embedding 提供方: "ollama" (本地, 配合 Ollama 服务) | "openai"
+    embed_provider: Literal["ollama", "openai"] = "ollama"
+    embed_model: str = "nomic-embed-text"
+    # ollama 服务地址（原生 API 根，不带 /v1 —— mem0 的 ollama 客户端
+    # 自己拼 /api/tags、/api/embed；带 /v1 会 404。构造时会自动去掉尾缀 /v1）
+    base_url: str = "http://127.0.0.1:11434"
+    api_key: SecretStr | None = None
+    # 记忆抽取 LLM (默认跟 llm 配置走 ollama)
+    llm_model: str = "qwen2.5:7b"
+    # 向量库: 本地 chroma 文件 (相对 data_dir)
+    collection: str = "zhixi_mem0"
+    history_db: str = "mem0_history.db"
+
+
 class PersistenceConfig(BaseModel):
     """持久化后端选择配置。"""
 
@@ -288,6 +320,11 @@ class WebhookConfig(BaseModel):
     hmac_secret: SecretStr | None = None  # None 时不签名（兼容旧规则）
     timeout: int = 5
     max_retries: int = 2
+    # 入站 HMAC 验签密钥。None = 入站验签端点整体关闭（404）。
+    # 与出站共用一把 secret 即可双向对称；生产建议用不同值。
+    inbound_hmac_secret: SecretStr | None = None
+    # 入站时间戳容差（防重放窗口），默认 5 分钟
+    inbound_max_age_seconds: int = 300
 
 
 class Settings(BaseSettings):
@@ -321,6 +358,8 @@ class Settings(BaseSettings):
     metrics: MetricsConfig = Field(default_factory=MetricsConfig)
     webhook: WebhookConfig = Field(default_factory=WebhookConfig)
     persistence: PersistenceConfig = Field(default_factory=PersistenceConfig)
+    neo4j: Neo4jConfig = Field(default_factory=Neo4jConfig)
+    mem0: Mem0Config = Field(default_factory=Mem0Config)
 
     @field_validator("data_dir", mode="before")
     @classmethod

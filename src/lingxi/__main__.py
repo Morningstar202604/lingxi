@@ -34,7 +34,6 @@ from lingxi.flow.ticket import TicketStore
 from lingxi.im.gewechat import GewechatAdapter
 from lingxi.im.napcat import NapCatAdapter
 from lingxi.memory import MemoryPipeline
-from lingxi.memory.graph_store import InMemoryGraphStore, SQLiteGraphStore
 from lingxi.memory.lorebook import Lorebook, LorebookEntry
 from lingxi.persona.guardrails import resolve_permission_level
 from lingxi.persona.injector import PersonaInjector
@@ -204,6 +203,17 @@ class Engine:
             aclose = getattr(self.agent, "aclose", None)
             if callable(aclose):
                 await aclose()
+            # 关闭持久化后端（Postgres 连接池 / SQLite 句柄），三件套共享 writer 时幂等
+            for obj in (self.tickets, self.queue, self.memory):
+                close = getattr(obj, "close", None)
+                if not callable(close):
+                    continue
+                try:
+                    result = close()
+                    if asyncio.iscoroutine(result):
+                        await result
+                except Exception:
+                    log.warning("store_close_failed", obj=type(obj).__name__)
 
 
 def build_default_engine(
@@ -246,16 +256,21 @@ def build_default_engine(
     if escalation_queue is None:
         escalation_queue = EscalationQueue()
     if memory_pipeline is None:
-        # 传入实体图谱：编码出的记忆会抽出实体并建图，
-        # 否则 MemoryItem.entities 恒为空、graph_store 整块无人使用。
-        # 生产用 SQLite（重启不丢）；不持久化时用内存实现。
-        if settings.memory.persistent:
-            graph_store: Any = SQLiteGraphStore(
-                str(settings.data_dir / settings.memory.graph_db_path),
+        if settings.mem0.enabled:
+            # Mem0 语义后端（自带向量 + 图谱），Ollama 不可达时构造即 fail-fast
+            from lingxi.memory.mem0_backend import Mem0MemoryPipeline
+
+            memory_pipeline = Mem0MemoryPipeline.create(
+                settings, settings.data_dir
             )
         else:
-            graph_store = InMemoryGraphStore()
-        memory_pipeline = MemoryPipeline(graph=graph_store)
+            # 实体图谱：编码出的记忆会抽实体建图，否则 MemoryItem.entities 恒空、
+            # graph_store 整块无人使用。按 settings 选 Neo4j / SQLite / 内存。
+            from lingxi.flow.persistence_factory import create_graph_backend
+            from lingxi.memory.graph_store import InMemoryGraphStore
+
+            graph_store: Any = create_graph_backend(settings) or InMemoryGraphStore()
+            memory_pipeline = MemoryPipeline(graph=graph_store)
 
     memory = memory_pipeline
     tickets = ticket_store
@@ -419,7 +434,7 @@ def build_default_engine(
     assigner = TicketAssigner(seat_store)
 
     log.info("engine_built", channels=im_channels, adapters=len(adapters),
-             persistent=hasattr(tickets, '_writer'),
+             persistent=hasattr(tickets, '_writer') or hasattr(tickets, 'writer'),
              permission_level=permission_level)
     return Engine(
         agent=agent,
@@ -768,27 +783,39 @@ async def _build_persistent_engine(
     args: argparse.Namespace,
 ) -> Engine:
     """异步创建持久化存储 + 构建引擎。"""
-    from lingxi.flow.persistence_factory import create_stores
-    from lingxi.memory.graph_store import SQLiteGraphStore
+    from lingxi.flow.persistence_factory import (
+        create_graph_backend,
+        create_stores,
+    )
 
     settings = get_settings()
     backend = settings.persistence.backend
 
-    # 图谱：SQLite 后端用 SQLiteGraphStore；PostgreSQL 暂无图谱后端，传 None
-    if backend == "postgresql":
+    # 图谱：PostgreSQL 且未启用 Neo4j 时记忆管线不挂图谱（graph=None）；
+    # 其余情况交给工厂（neo4j.enabled → Neo4jGraphStore，持久化 → SQLiteGraphStore）
+    if backend == "postgresql" and not settings.neo4j.enabled:
         graph = None
     else:
-        # 图谱随记忆一起持久化：否则持久化模式下实体图谱整体失效
-        # （编码不建边、recall_hybrid 图谱分支恒空、MCP graph://stats 不注册）
-        graph = SQLiteGraphStore(
-            str(settings.data_dir / settings.memory.graph_db_path),
-        )
+        graph = create_graph_backend(settings)
 
-    tickets, queue, memory = await create_stores(graph=graph)
+    tickets, queue, mem_store = await create_stores(graph=graph)
+
+    # Mem0 记忆后端独立于 tickets/queue 持久化后端，任何 backend 下都可启用
+    if settings.mem0.enabled:
+        from lingxi.memory.mem0_backend import Mem0MemoryPipeline
+
+        memory = Mem0MemoryPipeline.create(settings, settings.data_dir)
+    else:
+        memory = mem_store
+
+    pending = (
+        queue.pending_count() if callable(getattr(queue, "pending_count", None))
+        else (queue.pending_count if hasattr(queue, "pending_count") else 0)
+    )
     log.info("persistent_stores_created",
              backend=backend,
-             tickets=0,
-             queue=queue.pending_count if hasattr(queue, 'pending_count') else 0,
+             mem0=settings.mem0.enabled,
+             queue=pending,
              memories=memory.total_memories if hasattr(memory, 'total_memories') else 0)
     return build_default_engine(
         ticket_store=tickets,

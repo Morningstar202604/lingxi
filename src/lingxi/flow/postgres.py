@@ -104,11 +104,41 @@ class PostgresWriter:
         log.info("postgres_pool_created", dsn=_mask_dsn(dsn), min=min_size, max=max_size)
         return inst
 
+    @classmethod
+    def create_on_runner(
+        cls,
+        dsn: str,
+        min_size: int = 2,
+        max_size: int = 10,
+    ) -> PostgresWriter:
+        """在后台 runner 事件循环上创建连接池。
+
+        asyncpg 的连接绑定在**创建它的那个事件循环**上。同步包装器
+        （SyncPostgres*）把每个协程都扔到 runner 的独立后台循环里执行，
+        因此池必须也在那个循环上创建；否则每个调用都会撞
+        ``got Future ... attached to a different loop``（Engine 里
+        `asyncio.run` 建池、另一个循环查库，必然触发）。
+        """
+        writer: PostgresWriter = _get_runner().run(
+            cls.create(dsn, min_size=min_size, max_size=max_size)
+        )
+        return writer
+
+    def init_schema_on_runner(self) -> None:
+        """在 runner 循环上建表（与 create_on_runner 配对）。"""
+        _get_runner().run(self.init_schema())
+
     async def close(self) -> None:
-        """关闭连接池。"""
-        if self._pool:
-            await self._pool.close()
-            log.info("postgres_pool_closed")
+        """关闭连接池（可重复调用，多 store 共享同一池时幂等）。"""
+        if self._pool is None:
+            return
+        pool, self._pool = self._pool, None
+        await pool.close()
+        log.info("postgres_pool_closed")
+
+    def close_on_runner(self) -> None:
+        """在 runner 循环上关池（池绑定在该循环，不能从别的循环 close）。"""
+        _get_runner().run(self.close())
 
     # -- Schema -----------------------------------------------------------
 
@@ -370,12 +400,47 @@ class PostgresTicketStore:
         )
         return [_rebuild_ticket(_ticket_from_row(r)) for r in rows]
 
-    async def list_idle(self, limit: int = 100) -> list[Any]:
+    async def list_escalated(self, limit: int = 100) -> list[Any]:
         """列出 escalated 状态的工单（等待人工处理）。"""
         rows = await self.writer.fetch(
             """SELECT * FROM tickets
                WHERE status = 'escalated'
                ORDER BY updated_at DESC LIMIT $1""",
+            limit,
+        )
+        return [_rebuild_ticket(_ticket_from_row(r)) for r in rows]
+
+    async def get_or_create(self, chat_id: str, user_id: str = "", channel: str = "") -> Any:
+        """获取该 chat 的活跃工单，没有则创建（对齐 TicketStore.get_or_create）。"""
+        from lingxi.flow.ticket import TicketStatus
+
+        row = await self.writer.fetchrow(
+            "SELECT ticket_id FROM tickets "
+            "WHERE chat_id = $1 AND status NOT IN ($2, $3) LIMIT 1",
+            chat_id,
+            TicketStatus.CLOSED.value,
+            TicketStatus.RESOLVED.value,
+        )
+        if row:
+            ticket = await self.get(row["ticket_id"])
+            if ticket is not None:
+                return ticket
+        return await self.create(chat_id, user_id, channel)
+
+    async def list_idle(self, idle_seconds: float = 1800, limit: int = 100) -> list[Any]:
+        """列出超过 idle_seconds 未更新的活跃工单（自动关闭扫描用）。
+
+        对齐 TicketStore.list_idle(idle_seconds) 的语义。
+        """
+        from datetime import timedelta
+
+        cutoff = datetime.now(UTC) - timedelta(seconds=idle_seconds)
+        rows = await self.writer.fetch(
+            """SELECT * FROM tickets
+               WHERE status NOT IN ('closed', 'resolved')
+                 AND updated_at < $1
+               ORDER BY updated_at ASC LIMIT $2""",
+            cutoff,
             limit,
         )
         return [_rebuild_ticket(_ticket_from_row(r)) for r in rows]
@@ -472,9 +537,12 @@ class PostgresEscalationQueue:
         })
 
     async def dequeue(self, agent_id: str) -> Any:
-        """原子出队 — 认领最早的未认领条目并删除。
+        """原子出队 — 认领最早的未认领条目并删除，返回 QueueEntry。
 
-        使用事务保证 DELETE + SELECT 原子性。
+        与其他两套后端同语义（in-memory / SQLite 版的 dequeue 都返回
+        QueueEntry）。此前返回 Ticket：dashboard 的 claim 路由读
+        entry.reason / entry.category，而 Ticket 只有 escalation_reason，
+        用 Postgres 后端认领必 500。
         """
         async with self.writer.acquire() as conn, conn.transaction():
             row = await conn.fetchrow(
@@ -485,21 +553,34 @@ class PostgresEscalationQueue:
                            ORDER BY enqueued_at LIMIT 1
                            FOR UPDATE SKIP LOCKED
                        )
-                       RETURNING ticket_id"""
+                       RETURNING ticket_id, chat_id, category, reason, enqueued_at"""
             )
         if not row:
             return None
 
-        ticket_id: str = row["ticket_id"]
-        log.debug("pg_queue_dequeued", ticket_id=ticket_id, agent_id=agent_id)
+        from lingxi.flow.queue import QueueEntry
+        from lingxi.flow.ticket import TicketCategory
+
+        try:
+            category = TicketCategory(row["category"])
+        except ValueError:
+            category = TicketCategory.OTHER
+
+        entry = QueueEntry(
+            ticket_id=row["ticket_id"],
+            chat_id=row["chat_id"],
+            category=category,
+            reason=row["reason"],
+            enqueued_at=_parse_pg_ts(row["enqueued_at"]),
+            claimed_by=agent_id,
+            claimed_at=time.time(),
+        )
+        log.debug("pg_queue_dequeued", ticket_id=entry.ticket_id, agent_id=agent_id)
         self._publish("claimed", {
-            "ticket_id": ticket_id,
+            "ticket_id": entry.ticket_id,
             "agent_id": agent_id,
         })
-
-        if self._ticket_store is not None:
-            return await self._ticket_store.get(ticket_id)
-        return None
+        return entry
 
     async def complete(self, ticket_id: str) -> None:
         """从队列移除（已解决或关闭）。"""
@@ -739,8 +820,19 @@ class SyncPostgresTicketStore:
     def list_active(self, limit: int = 100) -> list[Any]:
         return self._runner.run(self._async.list_active(limit))  # type: ignore[no-any-return]
 
-    def list_idle(self, limit: int = 100) -> list[Any]:
-        return self._runner.run(self._async.list_idle(limit))  # type: ignore[no-any-return]
+    def list_idle(self, idle_seconds: float = 1800, limit: int = 100) -> list[Any]:
+        """对齐 TicketStore.list_idle(idle_seconds)：按空闲时长列。"""
+        return self._runner.run(self._async.list_idle(idle_seconds, limit))  # type: ignore[no-any-return]
+
+    def get_or_create(self, chat_id: str, user_id: str = "", channel: str = "") -> Any:
+        return self._runner.run(self._async.get_or_create(chat_id, user_id, channel))
+
+    def list_escalated(self) -> list[Any]:
+        return self._runner.run(self._async.list_escalated())  # type: ignore[no-any-return]
+
+    def close(self) -> None:
+        """关闭共享连接池（池绑定在 runner 循环，必须在该循环上关）。"""
+        self._async.writer.close_on_runner()
 
 
 class SyncPostgresEscalationQueue:
@@ -757,7 +849,15 @@ class SyncPostgresEscalationQueue:
     def enqueue(self, ticket: Any, *, reason: str = "") -> None:
         self._runner.run(self._async.enqueue(ticket, reason=reason))
 
-    def dequeue(self, agent_id: str) -> Any:
+    async def dequeue(self, agent_id: str) -> Any:
+        """与 InMemory/Persistent 队列同签名（async）：dashboard 走 `await`。
+
+        实际查询在 runner 后台循环执行（池绑定在那里），用 to_thread 包一层
+        以免阻塞 dashboard 所在的事件循环。
+        """
+        return await asyncio.to_thread(self._dequeue_sync, agent_id)
+
+    def _dequeue_sync(self, agent_id: str) -> Any:
         return self._runner.run(self._async.dequeue(agent_id))
 
     def complete(self, ticket_id: str) -> None:
@@ -784,6 +884,29 @@ class SyncPostgresEscalationQueue:
 
     def size(self) -> int:
         return self.pending_count()
+
+    def snapshot(self) -> dict[str, Any]:
+        """Dashboard /api/queue 与 /api/dashboard/summary 依赖此方法。"""
+        pending = [
+            {
+                "ticket_id": t,
+                "category": "",
+                "reason": "",
+                "wait_seconds": 0,
+            }
+            for t in self.list_pending()
+        ]
+        claimed = self.list_claimed()
+        return {
+            "pending_count": len(pending),
+            "claimed_count": len(claimed),
+            "longest_wait": 0,
+            "top_5_pending": pending[:5],
+        }
+
+    def close(self) -> None:
+        """关闭底层连接池（进程退出时调用，多 store 共享同一池时幂等）。"""
+        self._async.writer.close_on_runner()
 
 
 class SyncPostgresMemoryPipeline:
