@@ -1,5 +1,6 @@
 #!/usr/bin/env python3
 """把 Python 后端打包为单文件 sidecar，供 Tauri 调用。"""
+import platform
 import shutil
 import subprocess
 import sys
@@ -79,5 +80,21 @@ if test_result.returncode != 0 and "unrecognized arguments" not in test_result.s
     print(f">>> WARNING: Sidecar test failed: {test_result.stderr}")
 else:
     print(">>> Sidecar basic test passed")
+
+# 6. 同步到 Tauri externalBin 命名（cargo tauri build 打包用的就是这份）
+# externalBin: ["lingxi-server"] 会按 `lingxi-server-<target-triple>` 查找，
+# 只更新 dist/ 而不更新这份，cargo tauri build 打出来的安装包里
+# 还是上一次的旧 sidecar（曾实测：动态端口契约在打包产物里失效）。
+_machine = platform.machine().lower()
+if sys.platform == "win32":
+    _triple = "x86_64-pc-windows-msvc" if _machine in ("amd64", "x86_64") else "aarch64-pc-windows-msvc"
+elif sys.platform == "darwin":
+    _triple = "aarch64-apple-darwin" if _machine in ("arm64", "aarch64") else "x86_64-apple-darwin"
+else:
+    _triple = "aarch64-unknown-linux-gnu" if _machine in ("aarch64", "arm64") else "x86_64-unknown-linux-gnu"
+
+tauri_bin = ROOT / "src-tauri" / f"lingxi-server-{_triple}{'.exe' if sys.platform == 'win32' else ''}"
+shutil.copy2(exe, tauri_bin)
+print(f">>> Synced to Tauri externalBin: {tauri_bin}")
 
 print(">>> Build complete!")
