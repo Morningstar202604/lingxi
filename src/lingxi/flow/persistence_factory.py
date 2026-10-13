@@ -183,13 +183,8 @@ async def _create_postgres_stores(settings: Any, graph: Any = None) -> tuple[Any
     return tickets, queue, memory
 
 
-# Public aliases (convenience wrappers)
-create_memory_stores = _create_memory_stores
-
-
 __all__ = [
     "create_stores",
-    "create_memory_stores",
     "_create_sqlite_stores",
     "_create_memory_stores",
     "_create_postgres_stores",

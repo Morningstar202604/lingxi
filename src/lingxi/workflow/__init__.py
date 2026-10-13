@@ -46,8 +46,6 @@ from lingxi.workflow.executor import (
 )
 from lingxi.workflow.mermaid import (
     to_mermaid,
-    to_mermaid_with_highlight,
-    to_topological_view,
 )
 from lingxi.workflow.models import (
     DAGEdge,
@@ -57,7 +55,6 @@ from lingxi.workflow.models import (
     WorkflowDAG,
 )
 from lingxi.workflow.router import create_workflow_router
-from lingxi.workflow.router import router as workflow_router
 from lingxi.workflow.validator import validate_dag
 
 __all__ = [
@@ -72,8 +69,6 @@ __all__ = [
     "ValidationError",
     # ── Mermaid export ──
     "to_mermaid",
-    "to_mermaid_with_highlight",
-    "to_topological_view",
     # ── Build / serialize ──
     "build_default_pipeline_dag",
     "to_yaml",
@@ -87,5 +82,4 @@ __all__ = [
     "evaluate_condition",
     # ── FastAPI router ──
     "create_workflow_router",
-    "workflow_router",
 ]

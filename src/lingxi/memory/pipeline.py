@@ -124,11 +124,14 @@ class MemoryPipeline:
 
     def store(self, item: MemoryItem) -> None:
         """存储一条记忆。如果同一 user_id + 相似的 fact 已存在，更新而非重复。"""
-        # 去重：完全相同的 fact 已存在 → 更新置信度和最后访问时间
+        # 去重：完全相同的 fact 已存在 → 更新置信度和最后访问时间。
+        # 只刷 last_accessed、不加 access_count：access_count 语义是"召回命中
+        # 次数"（遗忘决策依据），重复"写入"不是一次命中，用 touch() 会把它
+        # 抬成虚假热度（AUDIT-2026-10-10 #29）。
         for existing in self._memories.values():
             if existing.user_id == item.user_id and existing.fact == item.fact:
                 existing.confidence = max(existing.confidence, item.confidence)
-                existing.touch()
+                existing.last_accessed = datetime.now()
                 log.debug("memory_updated", memory_id=existing.memory_id)
                 return
 

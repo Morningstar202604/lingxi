@@ -224,8 +224,4 @@ def create_workflow_router(components: dict[str, Any] | None = None) -> APIRoute
     return router
 
 
-# 默认导出一个可直接 include 的 router 实例
-# (向后兼容，不需要传参的场景)
-router = create_workflow_router()
-
-__all__ = ["create_workflow_router", "router"]
+__all__ = ["create_workflow_router"]

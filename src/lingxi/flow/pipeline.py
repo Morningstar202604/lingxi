@@ -94,12 +94,18 @@ class CustomerServicePipeline:
         max_concurrent = get_settings().agent.max_concurrent_sessions
         self._semaphore = asyncio.Semaphore(max_concurrent) if max_concurrent > 0 else None
 
+        # chat_id → 实际渠道映射。构造 send_message 桥梁时只有 chat_id，
+        # 而 QQ 群号与 QQ 私聊号都是纯数字，格式启发式区分不了
+        # （AUDIT-2026-10-10 #15）——用事件里带进来的真实 channel 兜底。
+        self._chat_channels: dict[str, Any] = {}
+
         # 注册工具桥梁（让 Agent 内的 send_message / knowledge_search 真正生效）
         if send_message_func is not None:
             async def _bridge_send(chat_id: str, content: str) -> bool:
                 try:
+                    channel = self._chat_channels.get(chat_id) or self._detect_channel(chat_id)
                     msg = OutboundMessage.text(
-                        channel=self._detect_channel(chat_id),
+                        channel=channel,
                         target_id=chat_id, content=content,
                     )
                     await send_message_func(msg)
@@ -180,6 +186,14 @@ class CustomerServicePipeline:
         current_permission 由调用方按 user/chat 解析（resolve_permission_level），
         传入后会写进 AgentState 供 execute_tool 节点鉴权；None 则用引擎默认值。
         """
+        # 记下本会话的真实渠道（send_message 桥梁回发时用它，不靠猜）。
+        # 上限 4096，超了丢最早一半：这只是启发式的兜底缓存，不是业务数据。
+        if event.chat_id and event.channel is not None:
+            self._chat_channels[event.chat_id] = event.channel
+            if len(self._chat_channels) > 4096:
+                for k in list(self._chat_channels)[:2048]:
+                    self._chat_channels.pop(k, None)
+
         text = event.text.strip()
         if not text:
             # 处理非文本消息（图片/语音/文件）：放行到后续 Agent 处理
@@ -395,13 +409,20 @@ class CustomerServicePipeline:
         reply_text: str,
         send_func: SendFunc | None = None,
     ) -> PipelineResult:
-        """升级工单并发兜底回复。"""
+        """升级工单并发兜底回复。
+
+        状态转换失败（如工单已关闭）时只告警、**不入队**：旧实现无条件
+        enqueue 会留下"已关闭工单躺在人工队列里"的幽灵待办
+        （AUDIT-2026-10-10 #28），坐席认领后无单可处理。
+        """
+        escalated_ok = True
         try:
             ticket.transition(TicketStatus.ESCALATED)
         except ValueError:
             if ticket.status == TicketStatus.ESCALATED:
-                pass  # 已被升级过
+                pass  # 已被升级过（幂等）
             else:
+                escalated_ok = False
                 log.warning(
                     "escalate_failed",
                     ticket_id=ticket.ticket_id,
@@ -411,17 +432,24 @@ class CustomerServicePipeline:
         ticket.escalation_reason = reason
         ticket.add_message("agent_escalated", reply_text)
 
-        self._queue.enqueue(ticket, reason=reason)
+        if escalated_ok:
+            self._queue.enqueue(ticket, reason=reason)
 
-        # 审计日志: 升级事件 (fire-and-forget, 失败仅告警)
-        self._record_audit(
-            "ticket.escalated",
-            actor="agent",
-            target=ticket.ticket_id,
-            detail=reason,
-        )
+            # 审计日志: 升级事件 (fire-and-forget, 失败仅告警)
+            self._record_audit(
+                "ticket.escalated",
+                actor="agent",
+                target=ticket.ticket_id,
+                detail=reason,
+            )
 
-        log.info("ticket_escalated", ticket_id=ticket.ticket_id, reason=reason)
+            log.info("ticket_escalated", ticket_id=ticket.ticket_id, reason=reason)
+        else:
+            log.info(
+                "ticket_escalate_skipped_queue",
+                ticket_id=ticket.ticket_id,
+                status=ticket.status.value,
+            )
 
         if send_func:
             # channel 字符串 → ChannelType 枚举

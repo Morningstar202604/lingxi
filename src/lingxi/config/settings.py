@@ -6,18 +6,33 @@
     - Pydantic Settings 自然融合两者：ENV 优先级高于 YAML
     - 启动时立即校验（fail-fast），不运行时才爆炸
 
+    env 文件还有个数据目录候选（`$LINGXI_DATA_DIR/lingxi.env`）：
+    桌面版由 Tauri 壳注入 LINGXI_DATA_DIR，用户在「模型设置」页写的云端
+    API Key 存这里，双击 App 即可生效，不需要碰项目目录。
+
 🤖 AI 避坑
     - 不要在 Settings 里放动态状态（计数器、连接池引用），它是只读的
     - SecretStr 类型用于密钥，repr 时自动掩码
     - 不要在模块顶层调用 get_settings()，用依赖注入模式
     - lru_cache 的生命周期 = 进程生命周期，进程内单例够用
+    - 多 env 文件时 pydantic-settings 是"后者覆盖前者"，lingxi.env 放后面
 """
+import os
 from functools import cache
 from pathlib import Path
 from typing import ClassVar, Literal
 
 from pydantic import BaseModel, Field, SecretStr, field_validator, model_validator
 from pydantic_settings import BaseSettings, SettingsConfigDict
+
+
+def _env_file_candidates() -> tuple[str, ...]:
+    """env 文件候选（后者覆盖前者）：项目根 .env + 数据目录 lingxi.env。"""
+    files = [".env"]
+    data_dir = os.environ.get("LINGXI_DATA_DIR", "")
+    if data_dir:
+        files.append(str(Path(data_dir) / "lingxi.env"))
+    return tuple(files)
 
 
 class PostgresConfig(BaseModel):
@@ -335,7 +350,7 @@ class Settings(BaseSettings):
 
     model_config = SettingsConfigDict(
         env_prefix="LINGXI_",
-        env_file=".env",
+        env_file=_env_file_candidates(),
         env_file_encoding="utf-8",
         env_nested_delimiter="__",
         extra="ignore",

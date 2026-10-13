@@ -167,14 +167,3 @@ class KnowledgeService:
     @property
     def store(self) -> VectorStore:
         return self._store
-
-
-# 全局单例
-_default_service: KnowledgeService | None = None
-
-
-async def get_knowledge_service() -> KnowledgeService:
-    global _default_service
-    if _default_service is None:
-        _default_service = KnowledgeService()
-    return _default_service

@@ -19,6 +19,7 @@ from __future__ import annotations
 
 import argparse
 import asyncio
+import os
 from dataclasses import dataclass
 from typing import TYPE_CHECKING, Any, cast
 
@@ -82,6 +83,48 @@ def _is_loopback_host(host: str | None) -> bool:
     if not host:
         return False
     return host.strip().lower() in _LOOPBACK_HOSTS
+
+
+def _resolve_dashboard_port(host: str, preferred: int) -> int:
+    """为首选端口冲突做动态规避：占用则向后顺延，全占则交给 OS 分配。
+
+    🔗 工程逻辑
+        Dashboard 的默认端口是 8080，本机经常被别的开发服务占用
+        （实测：一个无关的 `python -m http.server 8080` 就能让整个
+        Dashboard 起不来）。与其让用户自己去 `netstat` 找是谁占了端口，
+        不如自动顺延：8080 → 8081 → … → 8080+19，仍失败则让 OS 分配。
+
+    🤖 AI 避坑
+        - 探测用**裸 bind**，不要设 SO_REUSEADDR：Windows 下该选项允许
+          两个 socket 绑同一端口（端口劫持），会让探测彻底失真。
+        - preferred=0 表示"随便给一个"，直接走 OS 分配。
+        - 只探测 TCP（uvicorn 只监听 TCP）；不处理 IPv6 双栈细节，
+          host 原样传给 bind，与 uvicorn 最终绑定的地址一致。
+    """
+    import socket
+
+    def _try_bind(port: int) -> int | None:
+        s = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+        try:
+            s.bind((host, port))
+            actual: int = int(s.getsockname()[1])
+            return actual
+        except OSError:
+            return None
+        finally:
+            s.close()
+
+    if preferred == 0:
+        got = _try_bind(0)
+        return got if got is not None else 0
+
+    for candidate in range(preferred, preferred + 20):
+        got = _try_bind(candidate)
+        if got is not None:
+            return got
+    # 20 个都占着：交给 OS 分配（几乎不可能失败）
+    got = _try_bind(0)
+    return got if got is not None else preferred
 
 
 @dataclass
@@ -408,7 +451,7 @@ def build_default_engine(
             chat_id=event.chat_id,
             default_level=permission_level,
         )
-        await pipeline.handle_event(
+        result = await pipeline.handle_event(
             event,
             system_prompt=system_prompt,
             memory_block=memory_block,
@@ -416,6 +459,22 @@ def build_default_engine(
             send_func=_send,
             current_permission=level,
         )
+        # 升级即尝试自动分派坐席：TicketAssigner 此前只在 HTTP 端点/工作流
+        # 节点里可达，消息链路的升级从不触发分派（席位永远闲着）。
+        # 无空闲坐席时 try_assign 返回 (False, 原因)，只记日志不阻塞。
+        if getattr(result, "escalated", False) and assigner is not None:
+            try:
+                _ticket = tickets.get(result.ticket_id)
+                if _ticket is not None:
+                    ok, info = assigner.try_assign(_ticket)
+                    log.info(
+                        "seat_auto_assign",
+                        ticket_id=result.ticket_id,
+                        assigned=ok,
+                        seat_or_reason=info,
+                    )
+            except Exception:
+                log.warning("seat_auto_assign_failed", ticket_id=result.ticket_id)
 
     # 所有适配器共享同一个事件处理入口
     for _adapter in adapters:
@@ -693,7 +752,9 @@ def _parse_args(argv: list[str] | None = None) -> argparse.Namespace:
         help="Dashboard 监听地址（默认仅本机，前端经 Next.js 代理访问）",
     )
     parser.add_argument(
-        "--dashboard-port", type=int, default=8080, help="Dashboard 端口",
+        "--dashboard-port", type=int,
+        default=int(os.environ.get("LINGXI_DASHBOARD_PORT", "8080") or "8080"),
+        help="Dashboard 端口（被占用时自动向后顺延；0 = 交给 OS 分配）",
     )
     parser.add_argument(
         "--no-dashboard", action="store_true", help="不启动 Dashboard HTTP 服务",
@@ -757,11 +818,32 @@ def main(argv: list[str] | None = None) -> None:
         return
 
     dashboard_host = None if args.no_dashboard else args.dashboard_host
+
+    # 端口冲突自动顺延（动态灵活：8080 被占 → 8081 → …）。
+    dashboard_port = args.dashboard_port
+    if dashboard_host:
+        resolved = _resolve_dashboard_port(dashboard_host, dashboard_port)
+        if resolved != dashboard_port:
+            log.info(
+                "dashboard_port_switched",
+                preferred=dashboard_port,
+                actual=resolved,
+                reason="preferred port in use",
+            )
+            print(
+                f"[zhixi] 端口 {dashboard_port} 被占用，Dashboard 改用 {resolved}",
+                flush=True,
+            )
+        dashboard_port = resolved
+        # 机器可读端口行：Tauri 壳解析它来发现真实端口（被占后自动换的值）。
+        # 格式是跨进程契约，改了要同步 src-tauri/src/python_sidecar.rs。
+        print(f"ZHIXI_DASHBOARD_PORT={dashboard_port}", flush=True)
+
     log.info(
         "zhixi_engine_starting",
         ws_url=settings.onebot.ws_url,
         model=settings.llm.model,
-        dashboard=(f"{dashboard_host}:{args.dashboard_port}"
+        dashboard=(f"{dashboard_host}:{dashboard_port}"
                   if dashboard_host else "disabled"),
         persistent=persistent,
     )
@@ -769,7 +851,7 @@ def main(argv: list[str] | None = None) -> None:
         asyncio.run(
             engine.run(
                 dashboard_host=dashboard_host,
-                dashboard_port=args.dashboard_port,
+                dashboard_port=dashboard_port,
             )
         )
     except KeyboardInterrupt:

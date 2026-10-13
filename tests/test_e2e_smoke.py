@@ -340,17 +340,20 @@ class TestFrontendDirectConnectionContract:
         )
 
     def test_auth_headers_never_throw(self) -> None:
-        """未配置凭据时不得抛错——那会让所有页面的 useEffect 连锁失败。"""
+        """未配置凭据时不得抛错——那会让所有页面的 useEffect 连锁失败。
+
+        凭据头在 api()/apiRaw()/subscribeSSE() 里按**运行时令牌**内联构造
+        （桌面版令牌由 Tauri invoke 注入，不再是模块级 authHeaders()）。
+        契约不变：缺凭据是正常状态，只能"有条件附带"，不能 throw/白屏。
+        """
         api = (self._web_dir() / "lib" / "api.ts").read_text(encoding="utf-8")
-        head = api.index("function authHeaders()")
-        body = api[head : api.index("\n}\n", head)]
-        code = "\n".join(
-            ln for ln in body.splitlines() if not ln.strip().startswith("//")
+        # 三处调用点都必须用条件附带的形式
+        assert api.count('rt.token ? { "x-admin-token": rt.token } : {}') == 3, (
+            "api()/apiRaw()/subscribeSSE() 必须统一按运行时令牌有条件附带凭据头"
         )
-        assert "throw" not in code, (
-            "authHeaders() 必须返回 {} 而不是 throw："
-            "未配置凭据是正常状态，不该让整个页面白屏"
-        )
+        # 不允许"缺凭据就抛错"的写法
+        assert "!rt.token) throw" not in api
+        assert "!ENV_ADMIN_TOKEN) throw" not in api
 
     def test_no_hardcoded_admin_token_in_client(self) -> None:
         """NEXT_PUBLIC_* 会进 bundle，禁止内置默认凭据。"""

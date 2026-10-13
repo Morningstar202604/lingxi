@@ -89,6 +89,11 @@ class NapCatAdapter(IMAdapter):
                 log.warning("napcat_connection_lost", backoff=backoff)
                 await asyncio.sleep(backoff)
                 backoff = min(backoff * 2, 60.0)
+            finally:
+                # 连接退出（正常断开/异常/取消）都清引用：否则 send() 里
+                # `if self._ws` 会把已关闭的连接当成可用，向死连接写数据
+                # 白等 30s 超时（AUDIT-2026-10-10 #23）。
+                self._ws = None
 
         self._running = False
         log.info("napcat_adapter_exited")
@@ -174,7 +179,19 @@ class NapCatAdapter(IMAdapter):
         params["auto_escape"] = True
 
         resp = await self._api_call(action, params)
-        return bool(resp) and resp.get("status") != "timeout"
+        # OneBot 返回 {"status": "ok"|"failed"|"async"}：只认 ok/async 为成功。
+        # 此前只排除 "timeout"，status="failed"（被风控/无权限/目标不存在）
+        # 会被当成发送成功 —— 上层据此认为回复已送达，用户其实什么都没收到。
+        status = str(resp.get("status", "")) if resp else ""
+        if status not in ("ok", "async"):
+            log.warning(
+                "napcat_send_failed",
+                action=action,
+                status=status or "empty-response",
+                retcode=resp.get("retcode") if resp else None,
+            )
+            return False
+        return True
 
     # ── 内部实现 ──
 

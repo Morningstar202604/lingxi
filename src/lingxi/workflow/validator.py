@@ -19,10 +19,6 @@ if TYPE_CHECKING:
     from lingxi.workflow.models import WorkflowDAG
 
 
-class ValidationError(Exception):
-    """DAG 验证失败异常。"""
-
-
 # DFS 三色标记: WHITE=未访问, GRAY=正在访问, BLACK=已完成
 _WHITE, _GRAY, _BLACK = 0, 1, 2
 
@@ -124,4 +120,4 @@ def validate_dag(dag: WorkflowDAG) -> list[str]:
     return errors
 
 
-__all__ = ["ValidationError", "validate_dag"]
+__all__ = ["validate_dag"]
