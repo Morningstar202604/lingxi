@@ -88,13 +88,21 @@ pip install -e .
 
 ### 4. Sidecar 启动慢 / 端口冲突
 - 首次启动需解压 sidecar (~3-5 秒)，后续秒开
-- 端口固定 8080，如冲突修改 `src-tauri/src/python_sidecar.rs` 的 `port` 字段
+- **端口已动态化**：默认首选 8080，被占用时 Python 侧自动顺延（8081…）
+  并通过 stdout 的 `ZHIXI_DASHBOARD_PORT=<n>` 行上报真实端口；
+  壳进程解析该行、前端经 `invoke("get_backend_port")` 运行时取真实地址。
+  无需再改代码——想固定端口就设环境变量 `LINGXI_DASHBOARD_PORT`
+- 后端进程意外退出/无响应：守护循环会打印**退出码 + stderr 尾部**（诊断死因）
+  并自动退避重启（最多 5 次），重启也重新选端口
 
 ### 5. 前端无法连接后端
 检查：
 1. Sidecar 是否启动成功 (控制台日志 `[lingxi-server]`)
-2. `http://127.0.0.1:8080/api/health` 返回 200
-3. `NEXT_PUBLIC_ADMIN_TOKEN` 环境变量已设置
+2. 启动日志里的 `ZHIXI_DASHBOARD_PORT=<n>`，然后访问
+   `http://127.0.0.1:<n>/api/health` 应返回 200
+3. 桌面版令牌由壳自动注入（每次安装随机生成，存
+   `%APPDATA%\lingxi\auth_token`），**不需要**手动设置
+   `NEXT_PUBLIC_ADMIN_TOKEN`；浏览器 dev 模式才需要
 
 ---
 
@@ -137,7 +145,7 @@ cd web && TAURI=1 npm run build
 │  ┌─────────────────────────────┐   │
 │  │      Next.js 前端 (React)    │   │
 │  │  - Dashboard / Queue / etc   │   │
-│  │  - fetch → http://127.0.0.1:8080  │
+│  │  - fetch → 127.0.0.1:<动态端口>  │
 │  └──────────────┬───────────────┘   │
 └─────────────────┼───────────────────┘
                   │ HTTP/JSON (localhost)
@@ -151,5 +159,6 @@ cd web && TAURI=1 npm run build
 ```
 
 - 前端打包为静态文件 (`next export`)，运行时由 Tauri WebView 加载
-- 后端作为 sidecar 随主进程启动/停止，监听 `127.0.0.1:8080`
+- 后端作为 sidecar 随主进程启动/停止，监听动态端口（默认 8080 起步，
+  被占自动顺延；前端运行时经 `get_backend_port` 发现真实地址）
 - 无需用户安装 Python/Node/NapCat/PostgreSQL —— 全部内置

@@ -27,15 +27,16 @@
 
 | 模块 | 状态 | 说明 |
 |---|---|---|
-| Webhook HMAC-SHA256 出站签名 | ⚠️ | `security/hmac.py` 出站签名可用；入站验签端点未实现 |
+| Webhook HMAC-SHA256 | ✅ | 出站签名 + **入站验签端点** `/api/webhook/inbound`（时间戳容差 + 常量时间比较；未配密钥不挂载） |
 | JWT RBAC | ⚠️ | 4 角色×12 权限已实现，`auth.enabled` 默认关闭；Dashboard 管理面另走 `x-admin-token` 单因子（fail-closed）；多租户只有字段、无查询隔离 |
 | A/B 测试框架 | ✅ | 7 个 REST 端点，生产进程已挂载（`/experiments*`） |
 | Prometheus 指标 | ✅ | 12 指标 + ASGI 中间件 + `/metrics`（需 `metrics.scrape_token` 或 admin token） |
 | SSE 流式推理 | ✅ | `/api/events` 事件流 + `/api/stream/chat` + `/api/sessions/{chat_id}/stream` 均已挂载 |
-| 坐席管理 | ✅ | `/api/seats*` 5 端点，含分配策略与利用率（需 admin token） |
+| 坐席管理 | ✅ | `/api/seats*` 5 端点，含分配策略与利用率（需 admin token）；升级时消息链路自动尝试分派 |
 | 工作流 DAG | ✅ | `/graph*` 4 端点：Mermaid 输出 / YAML / 校验 / 预览；`/api/workflow/execute` 按拓扑+条件边真实执行 |
 | MCP / OpenAI 兼容 | ✅ | `/mcp/*` + `/v1/tools*`，凭据校验；三原语齐全（tools / resources / prompts，JSON-RPC 走 `/mcp/rpc`） |
-| 可插拔持久化 | ⚠️ | SQLite + Memory 在用；PostgreSQL 后端代码存在但 async 接口与 pipeline 同步调用不兼容，未接入 |
+| 可插拔持久化 | ✅ | SQLite / **PostgreSQL**（连接池固定在后台 runner 循环，端到端实测通过）/ Memory 三后端 |
+| 语义记忆 / 图谱后端 | ✅ | **Mem0**（Ollama 抽取+向量召回）与 **Neo4j**（双向邻居语义）可选启用，活服务契约测试锁住 |
 
 ## 实现状态（实测校正）
 
@@ -45,11 +46,11 @@
 | # | 历史缺陷 | 现状 |
 |---|---|---|
 | 1 | `acompletion` 不传 `tools=` → 工具调用链路断裂 | ✅ 已下发 `tools=` + `tool_choice="auto"`，多 tool_calls 全量执行并配对回填 |
-| 2 | Mem0 / Neo4j 零实现 | ⚠️ 仍未实现，但**死配置已删除**，配置面与真实能力一致 |
+| 2 | Mem0 / Neo4j 零实现 | ✅ **均已真实实现**（`mem0.enabled` / `neo4j.enabled` 启用）：Mem0 语义抽取+向量召回、Neo4j 双向邻居图谱，活服务契约测试锁住 |
 | 3 | MCP 只实现 tools 一个原语 | ✅ 三原语齐全：`/mcp/rpc` 走 JSON-RPC，`resources/list` `resources/read` `prompts/list` `prompts/get` 全实现，接真实数据源（知识库 / 人格配置 / 实体图谱） |
 | 4 | 分级权限来源是进程级全局常量 | ✅ `resolve_permission_level(user, chat)` 按 `security.permission_rules` 给到 |
 | 5 | 向量检索默认配置下静默失效 | ⚠️ 未配 embedding key 时降级零向量（见下「已知限制」） |
-| 6 | seat / workflow / mcp / experiments / SSE 生产零挂载 | ✅ 路由 24 → **47**，并用 `test_full_route_inventory` 锁住 |
+| 6 | seat / workflow / mcp / experiments / SSE 生产零挂载 | ✅ 路由 24 → **54**（2026-10-13 增入站验签 + 模型状态），并用 `test_full_route_inventory` 锁住 |
 | 7 | `/metrics` 匿名可读 | ✅ 需 `metrics.scrape_token`（回退 admin token），未配置则 503 |
 
 新增修掉的三个高危点：
@@ -97,9 +98,9 @@ L4 红线无论谁批都不放行。审批记录按 (工具, 参数, 会话) 指
 | 项 | 原因 |
 |---|---|
 | 向量检索降级零向量 | 未配 embedding key 时的既有降级策略，需配 `LINGXI_EMBEDDING__API_KEY` 才生效 |
-| PostgreSQL 后端未接入 | 524 行代码存在且工厂可达，但 async 接口与 pipeline 同步调用不兼容 |
 | 趋势图只画本次会话采样 | 后端不存时序历史，页面不伪造数据 |
-| 图谱持久化仅覆盖持久化模式 | `persistent=true`（默认）时接 SQLiteGraphStore；内存模式下 `InMemoryGraphStore` 重启即丢，Neo4j 后端未实现 |
+| Mem0 全局记忆计数为估算 | mem0 2.x 的 `get_all` 必须带 entity filter；总数退化为查询底层向量库（chroma）计数 |
+| A/B 分流不参与消息链路 | 实验引擎的管理/分配/指标 API 已就绪（`/api/experiments*`），但"哪个实验驱动人格覆盖"属产品定义，未硬编码进消息流 |
 
 ## 开源复用
 
@@ -123,11 +124,32 @@ L4 红线无论谁批都不放行。审批记录按 (工具, 参数, 会话) 指
 
 ## 快速开始
 
+### 第 1 步：接一个大模型（云端 API 优先）
+
+引擎不内置模型。**推荐云端 API**：成熟稳定、免下载、按量计费成本低。
+到下面任一平台申请 Key（国内可直连），把环境变量写进 `.env`：
+
+| 平台 | 申请入口 | 环境变量片段 |
+|---|---|---|
+| DeepSeek（推荐） | https://platform.deepseek.com/api_keys | `LINGXI_LLM__PROVIDER=deepseek`<br>`LINGXI_LLM__MODEL=deepseek-chat`<br>`LINGXI_LLM__API_KEY=<你的 Key>`<br>`LINGXI_LLM__BASE_URL=https://api.deepseek.com` |
+| 通义千问 | https://bailian.console.aliyun.com/ | `LINGXI_LLM__PROVIDER=openai`<br>`LINGXI_LLM__MODEL=qwen-plus`<br>`LINGXI_LLM__API_KEY=<DashScope Key>`<br>`LINGXI_LLM__BASE_URL=https://dashscope.aliyuncs.com/compatible-mode/v1` |
+| 智谱 GLM（有免费档） | https://open.bigmodel.cn/usercenter/apikeys | `LINGXI_LLM__PROVIDER=openai`<br>`LINGXI_LLM__MODEL=glm-4-flash`<br>`LINGXI_LLM__API_KEY=<Key>`<br>`LINGXI_LLM__BASE_URL=https://open.bigmodel.cn/api/paas/v4` |
+| OpenAI | https://platform.openai.com/api-keys | `LINGXI_LLM__PROVIDER=openai`<br>`LINGXI_LLM__MODEL=gpt-4o-mini`<br>`LINGXI_LLM__API_KEY=sk-...` |
+
+> 控制台「模型」页（`/setup`）内置同样的配置卡片，可一键复制变量、
+> 实时查看当前模型可用状态。
+
+**本地模型（可选）**：完全离线、数据不出机器，适合隐私场景。
+安装 [Ollama](https://ollama.com/download) 后执行
+`ollama pull qwen2.5:7b`（默认配置即指向本地 Ollama，无需改任何变量）。
+
+### 第 2 步：安装与启动
+
 ```bash
 # 1. 安装依赖（需要 Python 3.11+）
 pip install -e ".[dev]"
 
-# 2. 运行测试（648 tests）
+# 2. 运行测试（726 tests）
 pytest tests/ -q
 
 # 3. 配置凭据（管理面 / 指标端点 fail-closed，不配就启动不了管理功能）
@@ -143,6 +165,7 @@ export LINGXI_AUTH__ADMIN_PASSWORD="<引导管理员口令>"
 # 4. 启动引擎（开发模式，需已运行 NapCat）
 LINGXI_ONEBOT__WS_URL=ws://127.0.0.1:3001 python -m lingxi
 # PowerShell: $env:LINGXI_ONEBOT__WS_URL="ws://127.0.0.1:3001"; python -m lingxi
+# 端口 8080 被占用时会自动顺延（8081、8082…），启动日志会打印实际端口
 
 # 5. 控制台（另开终端）
 cd web
