@@ -176,6 +176,7 @@ async def _reason_stream(state: AgentState, registry: ToolRegistry | None) -> di
 
     parts: list[str] = []
     tool_calls_raw: list[Any] = []
+    stream_error: str | None = None
     try:
         async for event in stream_llm(state["messages"], tools=tool_schemas):
             kind = event.get("type")
@@ -197,6 +198,12 @@ async def _reason_stream(state: AgentState, registry: ToolRegistry | None) -> di
                     "tool_name": event.get("tool_name", ""),
                     "arguments": event.get("arguments", {}),
                 })
+            elif kind == "error":
+                # ⚠️ 别漏这个分支。stream_llm 的失败形态是 yield error 事件
+                # 而不是抛异常（为了让前端拿到结构化错误），漏掉它时
+                # parts 为空 → 图照常走完 → SSE 只剩 agent_start/agent_end，
+                # 用户看到"发完消息什么都没有"。
+                stream_error = event.get("error", "模型调用失败")
     except Exception as e:  # noqa: BLE001 — 流式边界统一转成 escalate 结论
         log.error("llm_stream_failed", chat_id=state["chat_id"], error=str(e))
         # 双向收敛：state 走 escalate（pipeline 会入队转人工），
@@ -206,6 +213,18 @@ async def _reason_stream(state: AgentState, registry: ToolRegistry | None) -> di
             "next_step": "escalate",
             "escalate_reason": f"LLM 调用失败: {type(e).__name__}",
             "final_reply": "服务暂时不可用，请稍后再试。",
+            "step_count": state["step_count"] + 1,
+        }
+
+    if stream_error:
+        log.error(
+            "llm_stream_exhausted", chat_id=state["chat_id"], error=stream_error,
+        )
+        writer({"type": "error", "error": stream_error})
+        return {
+            "next_step": "escalate",
+            "escalate_reason": "LLM 调用失败",
+            "final_reply": stream_error,
             "step_count": state["step_count"] + 1,
         }
 
@@ -241,6 +260,27 @@ def _build_reason_update(
     否则流式修好了非流式还是坏的，或反过来。
     """
     parsed = _parse_reason_output(content, tool_calls_raw)
+
+    # 空输出不是"想不出结论"，而是**这次调用没拿到东西**。
+    # 当成"再想一轮"会让图白跑 max_steps/2 次同样的失败调用（实测 4 轮），
+    # 既拖慢响应又放大配额消耗。直接转人工并把原因带给用户。
+    if not content.strip() and not parsed.get("tool_calls"):
+        log.error(
+            "llm_empty_output",
+            chat_id=state.get("chat_id"),
+            provider=get_settings().llm.provider,
+            model=get_settings().llm.model,
+        )
+        return {
+            "messages": [*state["messages"], {"role": "assistant", "content": ""}],
+            "step_count": state["step_count"] + 1,
+            "confidence": 0.0,
+            "next_step": "escalate",
+            "escalate_reason": "LLM 返回空内容",
+            "final_reply": (
+                "模型这次没有返回任何内容，我已转接人工同事协助处理。"
+            ),
+        }
 
     confidence = parsed.get("confidence") or 0.0
     if confidence == 0.0:

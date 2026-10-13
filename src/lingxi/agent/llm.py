@@ -76,6 +76,38 @@ def is_retryable(exc: BaseException) -> bool:
     return not any(m in text for m in _FATAL_MARKERS)
 
 
+# litellm 通过 model 字符串的前缀决定走哪家 provider（"ollama/qwen2.5:7b"）。
+# 配置里分开写 provider + model 是给人看的，调用前必须合成 litellm 认的形态 ——
+# 否则 litellm 报 "LLM Provider NOT provided"，而单测里 acompletion 被 mock，
+# 这个错会一路绿灯到真实运行才炸。
+_PREFIXABLE_PROVIDERS = frozenset(
+    {"openai", "anthropic", "deepseek", "ollama", "gemini", "azure", "xai"}
+)
+
+
+def resolve_model_name(provider: str, model: str) -> str:
+    """把 (provider, model) 合成 litellm 的 ``provider/model`` 字符串。
+
+    规则（缺省即最省心的一种）：
+    - model 已含 ``/`` → 原样返回（用户自己写了完整路径，尊重之）
+    - provider == "litellm" → 原样返回（litellm 自己就是 provider，不该加前缀）
+    - provider 在可加前缀名单里 → 拼 ``provider/model``
+    - provider 未知 → 原样返回，交给 litellm 报错，别在这里猜
+
+    🤖 AI 避坑
+        ``ollama/qwen2.5:7b`` 里那个斜杠是 provider 分隔符；模型名本身
+        带斜杠的（如 ``openrouter/meta-llama/llama-3``）已在第一步被
+        ``contains("/")`` 拦下，不会被二次加前缀。
+    """
+    if not provider or provider == "litellm" or not model:
+        return model
+    if "/" in model:
+        return model
+    if provider in _PREFIXABLE_PROVIDERS:
+        return f"{provider}/{model}"
+    return model
+
+
 class TokenUsage:
     """一次或多次 LLM 调用的 token 累计。"""
 
@@ -159,12 +191,19 @@ async def call_llm(
     retries = settings.agent.llm_max_retries
     base_delay = settings.agent.llm_retry_base_delay
 
-    # 构建尝试链：主模型 + 备用模型
-    models_to_try = [llm_cfg.model] + [m for m in llm_cfg.fallback_models if m != llm_cfg.model]
+    # 构建尝试链：主模型 + 备用模型。
+    # 合成 litellm 的 "provider/model" 形态；只在这里做一次，
+    # call_llm / stream_llm 共用同一个 helper，别处再拼一遍必然漂移。
+    models_to_try = [llm_cfg.model] + [
+        m for m in llm_cfg.fallback_models if m != llm_cfg.model
+    ]
+    wire_models = [resolve_model_name(llm_cfg.provider, m) for m in models_to_try]
 
-    for model_idx, model in enumerate(models_to_try):
+    for model_idx, (model, wire_model) in enumerate(
+        zip(models_to_try, wire_models, strict=True),
+    ):
         kwargs: dict[str, Any] = {
-            "model": model,
+            "model": wire_model,
             "messages": messages,
             "temperature": llm_cfg.temperature,
             "max_tokens": llm_cfg.max_tokens,
@@ -217,19 +256,55 @@ async def call_llm(
 
 
 def _build_friendly_error(last_error: BaseException | None) -> str:
-    """生成用户友好的错误信息，包含排查建议。"""
+    """生成用户友好的错误信息，包含排查建议。
+
+    目标是「用户能照着做」：只说 "调用失败" 等于把排查成本推给用户。
+    因此先判定**哪一类**没配好（没起服务 / 没下模型 / 没给凭据 / 名字写错），
+    再只给对应的那几步 —— 全量罗列 4 步会让人不知道先做哪个。
+    """
+    settings = get_settings()
+    cfg = settings.llm
     base = "所有可用模型均调用失败"
     if last_error:
-        err_text = f"{type(last_error).__name__}: {last_error}"
-        base += f"：{err_text}"
+        base += f"：{type(last_error).__name__}: {last_error}"
 
-    suggestions = [
-        "1. 检查 Ollama 是否运行：`ollama serve` 或访问 http://127.0.0.1:11434",
-        "2. 确认模型已下载：`ollama pull qwen2.5:7b`",
-        "2. 如需云端模型，请配置环境变量 LINGXI_LLM__API_KEY 与 LINGXI_LLM__BASE_URL",
-        "3. 查看日志获取完整错误堆栈",
-    ]
-    return base + "\n" + "\n".join(suggestions)
+    err_text = f"{type(last_error).__name__} {last_error}".lower() if last_error else ""
+
+    def has(*markers: str) -> bool:
+        return any(m in err_text for m in markers)
+
+    if has("api key", "unauthorized", "authentication", "401"):
+        steps = [
+            "当前 provider 是云端 API，但没给可用凭据：设置 "
+            "LINGXI_LLM__API_KEY，或改用本地模型："
+            "LINGXI_LLM__PROVIDER=ollama",
+        ]
+    elif has("provider not provided", "llm provider"):
+        steps = [
+            f"litellm 无法判断模型走哪家服务商：确认 LINGXI_LLM__PROVIDER 与 "
+            f"LINGXI_LLM__MODEL 配置一致（当前 provider={cfg.provider}、model={cfg.model}）",
+        ]
+    elif has("model not found", "does not exist", "not found", "404"):
+        steps = [
+            f"服务端没有这个模型名：执行 `ollama list` 核对，"
+            f"或用 `ollama pull {cfg.model}` 下载",
+        ]
+    elif has("connection", "refused", "unreachable", "name or service"):
+        steps = [
+            f"连不上 {cfg.base_url or '默认地址'}：确认本地模型服务已启动"
+            "（Ollama：`ollama serve`），或在环境变量里改 LINGXI_LLM__BASE_URL",
+        ]
+    else:
+        steps = [
+            f"1. 核对配置：LINGXI_LLM__PROVIDER={cfg.provider}、"
+            f"LINGXI_LLM__MODEL={cfg.model}、"
+            f"LINGXI_LLM__BASE_URL={cfg.base_url}",
+            "2. 用云端模型则补 LINGXI_LLM__API_KEY；用本地模型则先 "
+            "`ollama serve` 并 `ollama pull <模型名>`",
+            "3. 查看启动终端的完整异常堆栈（含 litellm 原始报错）",
+        ]
+
+    return base + "\n" + "\n".join(steps)
 
 
 def _field(obj: Any, name: str, default: Any = None) -> Any:
@@ -309,11 +384,14 @@ async def stream_llm(
 
     settings = get_settings()
     llm_cfg = settings.llm
-    models_to_try = [llm_cfg.model] + [m for m in llm_cfg.fallback_models if m != llm_cfg.model]
+    models_to_try = [llm_cfg.model] + [
+        m for m in llm_cfg.fallback_models if m != llm_cfg.model
+    ]
 
+    last_error: BaseException | None = None
     for model in models_to_try:
         kwargs: dict[str, Any] = {
-            "model": model,
+            "model": resolve_model_name(llm_cfg.provider, model),
             "messages": messages,
             "temperature": llm_cfg.temperature,
             "max_tokens": llm_cfg.max_tokens,
@@ -362,11 +440,12 @@ async def stream_llm(
             return  # 成功则返回，不再尝试后续模型
 
         except Exception as e:  # noqa: BLE001
+            last_error = e
             log.warning("stream_llm_model_failed", model=model, error=f"{type(e).__name__}: {e}")
             continue  # 尝试下一个模型
 
-    # 所有模型失败
-    yield {"type": "error", "error": _build_friendly_error(None)}
+    # 所有模型失败：yield 结构化 error 事件（不是 raise，也不是空流）
+    yield {"type": "error", "error": _build_friendly_error(last_error)}
 
 
 __all__ = [
@@ -376,5 +455,6 @@ __all__ = [
     "call_llm",
     "extract_content",
     "is_retryable",
+    "resolve_model_name",
     "stream_llm",
 ]

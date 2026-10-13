@@ -293,87 +293,64 @@ class TestAdminAuthHardening:
         assert client.get("/api/health").status_code == 200
 
 
-# ── 前端代理契约（AUDIT-2026-10-10 #2） ──
+# ── 前端直连契约（替代已删除的 /api/proxy rewrite）──
 
 
-class TestFrontendProxyContract:
-    """前端 API 调用路径必须落在 next.config.js rewrite 规则内。"""
+class TestFrontendDirectConnectionContract:
+    """前端必须**直连**后端；rewrites 代理会让 SSE 永久缓冲。
+
+    旧契约锁的是 `/api/proxy` rewrite（防"把 /api 拼两次"造成的 404）。
+    那个方案对 SSE 是死路：Next rewrites 会缓冲响应体，浏览器拿到
+    200 text/event-stream 却一帧都收不到，实时事件流永远卡在"连接中"。
+    因此契约改为：api.ts 直连 + NEXT_PUBLIC_API_BASE 可覆盖 +
+    next.config.js 不再声明 rewrites（避免有人把它加回来）。
+    """
 
     @staticmethod
     def _web_dir() -> Path:
         return Path(__file__).resolve().parents[1] / "web"
 
-    @staticmethod
-    def _next_rewrites(web_dir: Path, env: dict[str, str]) -> list[dict]:
-        """用 Node 真实执行 next.config.js 拿 rewrites 结果。
-
-        不做静态文本解析：exec 会因 JS 注释含中文全角括号而 SyntaxError，
-        而正则匹配抓不到 "拼两次 /api" 这类真实错误（本轮 E2E 实测踩过）。
-        """
-        import json as _json
-        import shutil
-
-        node = shutil.which("node")
-        if node is None:
-            pytest.skip("node 不可用，跳过 next.config 校验")
-
-        # 注意：node -e 下 process.argv[2] 不是脚本路径，须用环境变量传入
-        probe = (
-            "const c = require(process.env.LX_CFG);\n"
-            "Promise.resolve(c.rewrites()).then(r => "
-            "console.log(JSON.stringify(r)));"
-        )
-        proc = subprocess.run(
-            [node, "-e", probe],
-            capture_output=True, text=True, timeout=60,
-            env={
-                **os.environ,
-                **env,
-                "LX_CFG": str(web_dir / "next.config.js"),
-            },
-        )
-        assert proc.returncode == 0, f"next.config 执行失败: {proc.stderr[:300]}"
-        return _json.loads(proc.stdout.strip().splitlines()[-1])
-
-    def test_api_client_uses_proxy_prefix(self) -> None:
+    def test_api_client_does_not_use_proxy_prefix(self) -> None:
         api = (self._web_dir() / "lib" / "api.ts").read_text(encoding="utf-8")
-        # 非 Tauri 模式下必须走 /api/proxy；Tauri 模式下直接访问 sidecar
-        assert 'const API_BASE = "/api/proxy"' in api or 'IS_TAURI' in api, (
-            "api.ts 必须处理 /api/proxy 前缀或 Tauri 直连模式"
+        assert "/api/proxy" not in api, (
+            "前端不能再走 /api/proxy：Next rewrites 会缓冲 SSE 响应体，"
+            "/api/events 会一直停在「连接中」"
         )
 
-    def test_rewrite_maps_proxy_to_backend_root(self) -> None:
-        """真实校验重写结果：/api/proxy/<p> 必须映射到后端根 /<p>。
+    def test_api_base_defaults_to_loopback_backend(self) -> None:
+        api = (self._web_dir() / "lib" / "api.ts").read_text(encoding="utf-8")
+        assert "http://127.0.0.1:8080" in api, "API_BASE 默认值应指向本机后端"
 
-        旧规则 destination 多拼了一层 /api，把 /api/proxy/api/health
-        # 变成 /api/api/health → FastAPI 404（E2E 实测发现，字符串包含
-        # 断言抓不到，故此处直接执行 next.config 的 rewrites）。
-        Tauri 模式 (TAURI=1) 下 rewrites 为空，跳过检查。
-        """
-        rewrites = self._next_rewrites(self._web_dir(), {})
-        if not rewrites:
-            pytest.skip("Tauri 模式下无 rewrites，跳过")
-        assert rewrites, "next.config 未定义 rewrites"
+    def test_api_base_overridable_by_env(self) -> None:
+        """跨机部署须能不改代码换地址。"""
+        api = (self._web_dir() / "lib" / "api.ts").read_text(encoding="utf-8")
+        assert "NEXT_PUBLIC_API_BASE" in api, (
+            "API_BASE 必须支持 NEXT_PUBLIC_API_BASE 覆盖（跨机部署用）"
+        )
 
-        dest = next(
-            r["destination"] for r in rewrites
-            if r["source"].startswith("/api/proxy")
+    def test_next_config_declares_no_rewrites(self) -> None:
+        """代理一旦被加回来，SSE 会重新变成「200 但无数据」。"""
+        cfg = (self._web_dir() / "next.config.js").read_text(encoding="utf-8")
+        # 注释里提到 rewrites 是正常的（解释为什么删掉），只查真实声明
+        code = "\n".join(
+            ln for ln in cfg.splitlines() if not ln.strip().startswith("//")
         )
-        backend_path = dest.replace(":path*", "api/health")
-        assert not backend_path.endswith("/api/api/health"), (
-            f"rewrite 把 /api 拼了两次: {backend_path}"
+        assert "rewrites" not in code, (
+            "next.config.js 不应再声明 rewrites；前端已改为直连后端"
         )
-        assert backend_path.endswith("/api/health"), backend_path
 
-    def test_backend_address_configurable(self) -> None:
-        """后端地址须可由 DASHBOARD_API_URL 覆盖（不改代码）。"""
-        rewrites = self._next_rewrites(
-            self._web_dir(), {"DASHBOARD_API_URL": "http://192.168.1.9:9000"}
+    def test_auth_headers_never_throw(self) -> None:
+        """未配置凭据时不得抛错——那会让所有页面的 useEffect 连锁失败。"""
+        api = (self._web_dir() / "lib" / "api.ts").read_text(encoding="utf-8")
+        head = api.index("function authHeaders()")
+        body = api[head : api.index("\n}\n", head)]
+        code = "\n".join(
+            ln for ln in body.splitlines() if not ln.strip().startswith("//")
         )
-        assert rewrites
-        assert any(
-            "192.168.1.9:9000" in r["destination"] for r in rewrites
-        ), f"DASHBOARD_API_URL 未被采纳: {rewrites}"
+        assert "throw" not in code, (
+            "authHeaders() 必须返回 {} 而不是 throw："
+            "未配置凭据是正常状态，不该让整个页面白屏"
+        )
 
     def test_no_hardcoded_admin_token_in_client(self) -> None:
         """NEXT_PUBLIC_* 会进 bundle，禁止内置默认凭据。"""

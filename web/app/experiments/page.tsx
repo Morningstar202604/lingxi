@@ -8,6 +8,7 @@ import {
   updateExperimentStatus,
   type Experiment,
 } from "@/lib/api";
+import ApiErrorPanel from "@/components/ApiState";
 
 const STATUS_LABELS: Record<string, string> = {
   draft: "草稿",
@@ -25,7 +26,7 @@ const STATUS_COLORS: Record<string, string> = {
 
 export default function ExperimentsPage() {
   const [experiments, setExperiments] = useState<Experiment[]>([]);
-  const [error, setError] = useState<string | null>(null);
+  const [error, setError] = useState<unknown>(null);
   const [showCreate, setShowCreate] = useState(false);
   const [form, setForm] = useState({
     name: "",
@@ -40,7 +41,7 @@ export default function ExperimentsPage() {
       setExperiments(data);
       setError(null);
     } catch (e) {
-      setError((e as Error).message);
+      setError(e);
     }
   }, []);
 
@@ -65,7 +66,7 @@ export default function ExperimentsPage() {
       setForm({ name: "", description: "", metric: "resolution_rate", minSample: 30 });
       await load();
     } catch (e) {
-      setError((e as Error).message);
+      setError(e);
     }
   };
 
@@ -74,7 +75,7 @@ export default function ExperimentsPage() {
       await updateExperimentStatus(name, status);
       await load();
     } catch (e) {
-      setError((e as Error).message);
+      setError(e);
     }
   };
 
@@ -84,26 +85,15 @@ export default function ExperimentsPage() {
       await deleteExperiment(name);
       await load();
     } catch (e) {
-      setError((e as Error).message);
+      setError(e);
     }
   };
 
-  if (error && experiments.length === 0) {
-    return (
-      <div className="flex flex-col items-center justify-center py-20">
-        <div className="card border-lingxi-red/30 max-w-md text-center">
-          <p className="text-lingxi-red text-sm font-medium">无法连接后端</p>
-          <p className="text-xs text-lingxi-muted mt-2">{error}</p>
-          <button
-            onClick={load}
-            className="mt-4 px-4 py-2 bg-lingxi-orange/10 text-lingxi-orange border border-lingxi-orange/30 rounded-lg text-xs hover:bg-lingxi-orange/20 transition-colors"
-          >
-            重试
-          </button>
-        </div>
-      </div>
-    );
-  }
+  // 早期返回只在"完全没有任何数据"时保留；否则错误降级为非阻断横幅，
+// 已有数据继续可读（否则一次 500 就把整个页面清空）。
+if (error && experiments.length === 0) {
+  return <ApiErrorPanel error={error} onRetry={load} />;
+}
 
   return (
     <div className="space-y-6">
@@ -259,13 +249,8 @@ export default function ExperimentsPage() {
         </div>
       )}
 
-      {error && experiments.length > 0 && (
-        <div className="card border-lingxi-red/30 text-center">
-          <p className="text-lingxi-red text-xs">{error}</p>
-          <button onClick={load} className="mt-2 text-xs text-lingxi-orange hover:underline">
-            重试
-          </button>
-        </div>
+      {Boolean(error) && experiments.length > 0 && (
+        <ApiErrorPanel error={error} onRetry={load} compact />
       )}
     </div>
   );

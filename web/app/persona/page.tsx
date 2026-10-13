@@ -9,6 +9,7 @@
 import { useCallback, useEffect, useState } from "react";
 
 import { fetchPersona, previewPersona, type PersonaState } from "@/lib/api";
+import ApiErrorPanel from "@/components/ApiState";
 
 const MODULE_LABELS: Record<string, string> = {
   time_awareness: "时间感知",
@@ -37,7 +38,7 @@ const VERDICT_STYLE: Record<string, string> = {
 
 export default function PersonaPage() {
   const [state, setState] = useState<PersonaState | null>(null);
-  const [error, setError] = useState<string | null>(null);
+  const [error, setError] = useState<unknown>(null);
 
   const [probe, setProbe] = useState("我要退货");
   const [prompt, setPrompt] = useState<string | null>(null);
@@ -50,7 +51,7 @@ export default function PersonaPage() {
       setState(await fetchPersona());
       setError(null);
     } catch (e) {
-      setError((e as Error).message);
+      setError(e);
     }
   }, []);
 
@@ -66,25 +67,14 @@ export default function PersonaPage() {
       setVerdict(r.guardrail.verdict);
       setChars(r.chars);
     } catch (e) {
-      setError((e as Error).message);
+      setError(e);
     } finally {
       setPreviewing(false);
     }
   }, [probe]);
 
-  if (error) {
-    return (
-      <div className="card border-lingxi-red/30">
-        <p className="text-lingxi-red text-sm font-medium">人格配置加载失败</p>
-        <p className="text-xs text-lingxi-muted mt-2">{error}</p>
-        <button
-          onClick={load}
-          className="mt-3 px-3 py-1.5 rounded-lg text-xs border border-lingxi-orange/30 bg-lingxi-orange/10 text-lingxi-orange"
-        >
-          重试
-        </button>
-      </div>
-    );
+  if (error && !state) {
+    return <ApiErrorPanel error={error} onRetry={load} />;
   }
 
   if (!state) {
@@ -93,6 +83,13 @@ export default function PersonaPage() {
 
   return (
     <div className="space-y-4 page-enter">
+      {Boolean(error) && (
+        <ApiErrorPanel error={error} onRetry={load} compact>
+          <span className="text-xs text-lingxi-muted ml-2">
+            显示的是上一次成功加载的人格配置
+          </span>
+        </ApiErrorPanel>
+      )}
       <div className="card">
         <h3 className="text-sm font-medium text-white mb-3">身份定义</h3>
         <dl className="grid grid-cols-1 md:grid-cols-4 gap-4 text-xs">

@@ -30,6 +30,7 @@ from fastapi import APIRouter, Depends, Header, HTTPException, status
 from pydantic import BaseModel, Field
 
 from lingxi.core import get_logger
+from lingxi.core.admin_auth import require_admin
 from lingxi.seat.models import Seat, SeatStatus, SeatStore
 
 if TYPE_CHECKING:
@@ -37,29 +38,14 @@ if TYPE_CHECKING:
 
 log = get_logger(__name__)
 
-# 与 SecurityConfig.admin_token 的默认值一致，用于识别"未改配置"
-_DEFAULT_ADMIN_TOKEN = "change-me-in-production"
-
 
 def _require_admin(x_admin_token: str | None = Header(None)) -> None:
-    """坐席接口的管理凭据校验。
+    """坐席接口的管理凭据校验（委托 core.admin_auth —— 全项目唯一实现）。
 
     这些端点能注册坐席、分配与释放工单 —— 属于写管理面。此前该模块从未挂载，
     所以没有鉴权也无人察觉；一旦 include_router 就会变成裸奔的写接口。
     """
-    import secrets
-
-    from lingxi.config.settings import get_settings
-
-    settings = get_settings()
-    expected = settings.security.admin_token.get_secret_value()
-    if expected == _DEFAULT_ADMIN_TOKEN and not settings.debug:
-        raise HTTPException(
-            status_code=503,
-            detail="未配置管理凭据：请设置 LINGXI_SECURITY__ADMIN_TOKEN",
-        )
-    if not x_admin_token or not secrets.compare_digest(x_admin_token, expected):
-        raise HTTPException(status_code=401, detail="Unauthorized")
+    require_admin(x_admin_token)
 
 
 # ── Request / Response 模型 ─────────────────────────────────────

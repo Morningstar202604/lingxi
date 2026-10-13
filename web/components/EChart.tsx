@@ -13,6 +13,7 @@ import { useEffect, useRef } from "react";
 
 import { BarChart, GaugeChart, LineChart, PieChart } from "echarts/charts";
 import {
+  GraphicComponent,
   GridComponent,
   LegendComponent,
   TitleComponent,
@@ -21,6 +22,9 @@ import {
 import * as echarts from "echarts/core";
 import { CanvasRenderer } from "echarts/renderers";
 
+// GraphicComponent 不可省：StatusDonut 用 `graphic` 在圆心画"总数"。
+// 少注册它不会让构建或类型检查报错，只在浏览器控制台报
+// "[ECharts] Component graphic is used but not imported"，然后圆心数字不显示。
 echarts.use([
   LineChart,
   PieChart,
@@ -30,6 +34,7 @@ echarts.use([
   TooltipComponent,
   LegendComponent,
   TitleComponent,
+  GraphicComponent,
   CanvasRenderer,
 ]);
 

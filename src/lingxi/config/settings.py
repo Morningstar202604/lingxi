@@ -167,6 +167,33 @@ class SecurityConfig(BaseModel):
 
     admin_token: SecretStr = SecretStr("change-me-in-production")
     permission_model: Literal["open", "standard", "strict"] = "standard"
+
+    # 本机免密模式（仅在 Dashboard 只监听 loopback 时生效）。
+    #
+    # 背景：AUDIT-2026-10-10 #8 把"未配置 admin_token"改成 fail-closed，
+    # 安全上正确，但默认部署 `--dashboard-host 127.0.0.1` 也被打死了 ——
+    # 用户双击 exe、什么都不配，看到的却是满屏 503。
+    #
+    # 切分依据是**暴露面**而不是"有没有配置"：
+    # - 只监听 127.0.0.1/::1 → 服务在网络上不可达，免密是产品的一部分
+    # - 监听 0.0.0.0 → 工单/认领/关闭暴露给同网段任何主机，必须配 token
+    #
+    # 配了 token 的部署一律照常校验；这里只影响"压根没配"这一种情况。
+    # 需要收紧（哪怕只跑本机也要求凭据）时置 False。
+    allow_anonymous_local: bool = True
+
+    # ── CORS（前端直连后端时必需）──
+    #
+    # 为什么前端不再走 Next rewrites 代理：`/api/events` 是 SSE 长连接，
+    # 而 Next dev 的 rewrites 会缓冲响应体（实测：浏览器拿到 200
+    # text/event-stream 却一帧都收不到，urllib 直连同一端点立即收到
+    # `event: connected`）。代理只对普通请求友好，对流式是死路。
+    # 改成前端直连 + 后端开 CORS，dev 与 Tauri 两条路径行为一致。
+    #
+    # 默认只放行 loopback 来源：Dashboard 默认也只监听 loopback，两侧对齐。
+    # 要给局域网的前端访问，把具体 origin 加进 cors_origins。
+    cors_allow_loopback: bool = True
+    cors_origins: list[str] = Field(default_factory=list)
     blocked_commands: list[str] = Field(default_factory=lambda: [
         "rm -rf /", "mkfs", "dd if=/dev/zero", ":(){ :|:& };:",
     ])

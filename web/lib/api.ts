@@ -5,18 +5,132 @@
 // 安全：NEXT_PUBLIC_* 会被编译进客户端 bundle 下发给每个访客，
 // 绝不能内置管理凭据默认值。凭据必须由运维在登录后注入。
 const ADMIN_TOKEN = process.env.NEXT_PUBLIC_ADMIN_TOKEN || "";
-// Tauri 模式下直接访问 sidecar (localhost:8080)，否则走 Next 代理
-const IS_TAURI = typeof window !== "undefined" && (window as any).__TAURI__;
-const API_BASE = IS_TAURI ? "http://127.0.0.1:8080" : "/api/proxy";
+
+// 前端**直连**后端，不走 Next rewrites 代理。
+// 原因：/api/events 是 SSE 长连接，Next dev 的 rewrites 会缓冲响应体 ——
+// 浏览器拿到 200 text/event-stream 却一帧都收不到（实测复现）。
+// 代理只对普通请求友好，对流式是死路；后端已开 loopback CORS（见
+// flow/dashboard_api.py::_install_cors），dev 与 Tauri 因此行为一致。
+//
+// 需要跨机访问时用 NEXT_PUBLIC_API_BASE 覆盖，例如 http://10.0.0.5:8080，
+// 同时在服务端 security.cors_origins 里放行该 origin。
+export const API_BASE =
+  process.env.NEXT_PUBLIC_API_BASE || "http://127.0.0.1:8080";
+
+/** 是否已注入管理凭据（仅用于界面提示，不阻断请求）。 */
+export function hasAdminToken(): boolean {
+  return Boolean(ADMIN_TOKEN);
+}
 
 function authHeaders(): HeadersInit {
-  if (!ADMIN_TOKEN) {
-    throw new Error(
-      "未配置 NEXT_PUBLIC_ADMIN_TOKEN：请在 .env.local 设置后重启前端",
-    );
+  // ⚠️ 刻意**不抛错**。此前这里 throw，导致 useEffect 里的 fetch 全部失败，
+  // 页面直接渲染"无法连接后端"整屏错误 —— 而后端其实好好的，只是没配凭据。
+  // 正确做法：照常发请求（不带凭据），让后端返回权威的 503/401 与处置建议，
+  // 再由 <ApiState> 把那句建议原样呈现给用户。
+  // 带错 token 会被后端 401，不会静默放行，所以这里省掉 header 是安全的。
+  // 不带 Content-Type：GET 请求加 application/json 会触发 CORS 预检。
+  return ADMIN_TOKEN ? { "x-admin-token": ADMIN_TOKEN } : {};
+}
+
+/** 结构化 API 错误：带状态码、后端 detail 与可执行建议。 */
+export class ApiError extends Error {
+  readonly status: number;
+  readonly detail: string;
+  readonly hint: string;
+
+  constructor(status: number, detail: string, hint = "") {
+    super(detail || `HTTP ${status}`);
+    this.name = "ApiError";
+    this.status = status;
+    this.detail = detail;
+    this.hint = hint;
   }
-  // 不带 Content-Type：GET 请求加 application/json 会触发 CORS 预检
-  return { "x-admin-token": ADMIN_TOKEN };
+
+  /** 是不是"没配凭据"——界面据此换成引导配置而不是"连不上"。 */
+  get isAuth(): boolean {
+    return this.status === 401 || this.status === 403 || this.status === 503;
+  }
+
+  /** 是不是"后端根本没起来"。 */
+  get isOffline(): boolean {
+    return this.status === 0;
+  }
+}
+
+function hintFor(status: number): string {
+  switch (status) {
+    case 0:
+      return "请确认后端已启动：python -m lingxi（默认监听 127.0.0.1:8080）";
+    case 401:
+    case 403:
+      return "管理凭据不匹配：在 .env.local 设置 NEXT_PUBLIC_ADMIN_TOKEN 为后端 LINGXI_SECURITY__ADMIN_TOKEN 的值，重启前端";
+    case 503:
+      return "后端未配置管理凭据且未以本地模式运行：设置 LINGXI_SECURITY__ADMIN_TOKEN，或确认 --dashboard-host 为 127.0.0.1";
+    case 404:
+      return "端点不存在：该功能需要对应模块已挂载（检查启动日志里的路由注册）";
+    default:
+      return status >= 500
+        ? "后端内部错误：查看启动终端的异常堆栈"
+        : "请检查请求参数";
+  }
+}
+
+/**
+ * 统一的响应处理：解析 FastAPI 的 `{"detail": ...}`，转成 ApiError。
+ *
+ * 此前各 fetch 直接 `throw new Error("API error: 503")` —— 把后端已经写好的
+ * "请设置 LINGXI_SECURITY__ADMIN_TOKEN" 原文丢掉了，用户只看到一个编号。
+ */
+async function unwrap<T>(res: Response): Promise<T> {
+  if (res.ok) return (await res.json()) as T;
+  let detail = "";
+  try {
+    const body = await res.json();
+    if (body && typeof body.detail === "string") detail = body.detail;
+  } catch {
+    /* 非 JSON 响应（如 502 网关 HTML）*/
+  }
+  throw new ApiError(res.status, detail, hintFor(res.status));
+}
+
+/** 统一 fetch 包装：带上凭据、禁用缓存、把失败转成 ApiError。 */
+async function api<T>(
+  path: string,
+  init: RequestInit & { json?: unknown } = {},
+): Promise<T> {
+  const { json, ...rest } = init;
+  let res: Response;
+  try {
+    res = await fetch(`${API_BASE}${path}`, {
+      ...rest,
+      headers: {
+        ...authHeaders(),
+        ...(json !== undefined ? { "Content-Type": "application/json" } : {}),
+        ...(rest.headers as Record<string, string> | undefined),
+      },
+      body: json !== undefined ? JSON.stringify(json) : undefined,
+      cache: "no-store",
+    });
+  } catch (e) {
+    // fetch 本身抛错 = 网络层不可达（后端没起/端口不对/CORS）
+    throw new ApiError(0, (e as Error).message || "网络请求失败");
+  }
+  return unwrap<T>(res);
+}
+
+/** 拿原始 Response（下载类接口），失败同样转 ApiError。 */
+async function apiRaw(path: string): Promise<Response> {
+  try {
+    const res = await fetch(`${API_BASE}${path}`, {
+      headers: authHeaders(),
+      cache: "no-store",
+    });
+    if (!res.ok) await unwrap(res);
+    return res;
+  } catch (e) {
+    if (e instanceof ApiError) throw e;
+    throw new ApiError(0, (e as Error).message || "网络请求失败");
+  }
 }
 
 export interface DashboardSummary {
@@ -103,31 +217,16 @@ export interface LogEntry {
 }
 
 export async function fetchSummary(): Promise<DashboardSummary> {
-  const res = await fetch(`${API_BASE}/api/dashboard/summary`, {
-    headers: authHeaders(),
-    cache: "no-store",
-  });
-  if (!res.ok) throw new Error(`API error: ${res.status}`);
-  return res.json();
+  return api<DashboardSummary>("/api/dashboard/summary");
 }
 
 export async function fetchTickets(status?: string): Promise<TicketSummary[]> {
   const qs = status ? `?status=${status}` : "";
-  const res = await fetch(`${API_BASE}/api/tickets${qs}`, {
-    headers: authHeaders(),
-    cache: "no-store",
-  });
-  if (!res.ok) throw new Error(`API error: ${res.status}`);
-  return res.json();
+  return api<TicketSummary[]>(`/api/tickets${qs}`);
 }
 
 export async function fetchQueue(): Promise<QueueSnapshot> {
-  const res = await fetch(`${API_BASE}/api/queue`, {
-    headers: authHeaders(),
-    cache: "no-store",
-  });
-  if (!res.ok) throw new Error(`API error: ${res.status}`);
-  return res.json();
+  return api<QueueSnapshot>("/api/queue");
 }
 
 export async function claimTicket(agentId: string): Promise<{
@@ -136,14 +235,20 @@ export async function claimTicket(agentId: string): Promise<{
   category: string;
   reason: string;
 } | null> {
-  const res = await fetch(
-    `${API_BASE}/api/queue/claim?agent_id=${encodeURIComponent(agentId)}`,
-    { method: "POST", headers: authHeaders() },
-  );
-  // 后端空队列返回 404（REST 语义），前端映射为 null 表示"无可认领"
-  if (res.status === 204 || res.status === 404) return null;
-  if (!res.ok) throw new Error(`API error: ${res.status}`);
-  return res.json();
+  try {
+    return await api<{
+      ticket_id: string;
+      chat_id: string;
+      category: string;
+      reason: string;
+    }>(`/api/queue/claim?agent_id=${encodeURIComponent(agentId)}`, {
+      method: "POST",
+    });
+  } catch (e) {
+    // 后端空队列返回 404（REST 语义），前端映射为 null 表示"无可认领"
+    if (e instanceof ApiError && e.status === 404) return null;
+    throw e;
+  }
 }
 
 export function formatTime(unixSec: number): string {
@@ -187,21 +292,11 @@ export function statusLabel(s: string): string {
 }
 
 export async function fetchSessions(): Promise<SessionInfo[]> {
-  const res = await fetch(`${API_BASE}/api/sessions`, {
-    headers: authHeaders(),
-    cache: "no-store",
-  });
-  if (!res.ok) throw new Error(`API error: ${res.status}`);
-  return res.json();
+  return api<SessionInfo[]>("/api/sessions");
 }
 
 export async function fetchLogs(limit = 200): Promise<LogEntry[]> {
-  const res = await fetch(`${API_BASE}/api/logs?limit=${limit}`, {
-    headers: authHeaders(),
-    cache: "no-store",
-  });
-  if (!res.ok) throw new Error(`API error: ${res.status}`);
-  return res.json();
+  return api<LogEntry[]>(`/api/logs?limit=${limit}`);
 }
 
 export interface CompleteResult {
@@ -210,12 +305,10 @@ export interface CompleteResult {
 }
 
 export async function completeTicket(ticketId: string): Promise<CompleteResult> {
-  const res = await fetch(
-    `${API_BASE}/api/queue/complete?ticket_id=${encodeURIComponent(ticketId)}`,
-    { method: "POST", headers: authHeaders() },
+  return api<CompleteResult>(
+    `/api/queue/complete?ticket_id=${encodeURIComponent(ticketId)}`,
+    { method: "POST" },
   );
-  if (!res.ok) throw new Error(`API error: ${res.status}`);
-  return res.json();
 }
 
 // ── Knowledge 知识库 (RAG) ──
@@ -239,21 +332,11 @@ export interface RecallHit {
 }
 
 export async function fetchKnowledgeStats(): Promise<KnowledgeStats> {
-  const res = await fetch(`${API_BASE}/api/knowledge/stats`, {
-    headers: authHeaders(),
-    cache: "no-store",
-  });
-  if (!res.ok) throw new Error(`API error: ${res.status}`);
-  return res.json();
+  return api<KnowledgeStats>("/api/knowledge/stats");
 }
 
 export async function fetchKnowledgeDocs(): Promise<KnowledgeDoc[]> {
-  const res = await fetch(`${API_BASE}/api/knowledge/docs`, {
-    headers: authHeaders(),
-    cache: "no-store",
-  });
-  if (!res.ok) throw new Error(`API error: ${res.status}`);
-  return res.json();
+  return api<KnowledgeDoc[]>("/api/knowledge/docs");
 }
 
 export async function uploadKnowledge(
@@ -261,44 +344,33 @@ export async function uploadKnowledge(
   docId = "",
   source = "",
 ): Promise<{ doc_id: string; chunk_count: number; source: string }> {
-  const res = await fetch(`${API_BASE}/api/knowledge/upload`, {
-    method: "POST",
-    headers: { ...authHeaders(), "Content-Type": "application/json" },
-    body: JSON.stringify({ content, doc_id: docId, source }),
-  });
-  if (!res.ok) throw new Error(`API error: ${res.status}`);
-  return res.json();
+  return api<{ doc_id: string; chunk_count: number; source: string }>(
+    "/api/knowledge/upload",
+    { method: "POST", json: { content, doc_id: docId, source } },
+  );
 }
 
 export async function recallKnowledge(
   query: string,
   topK = 5,
 ): Promise<RecallHit[]> {
-  const res = await fetch(`${API_BASE}/api/knowledge/recall`, {
+  return api<RecallHit[]>("/api/knowledge/recall", {
     method: "POST",
-    headers: { ...authHeaders(), "Content-Type": "application/json" },
-    body: JSON.stringify({ query, top_k: topK }),
+    json: { query, top_k: topK },
   });
-  if (!res.ok) throw new Error(`API error: ${res.status}`);
-  return res.json();
 }
 
 export async function deleteKnowledgeDoc(docId: string): Promise<{ deleted_chunks: number }> {
-  const res = await fetch(
-    `${API_BASE}/api/knowledge/docs/${encodeURIComponent(docId)}`,
-    { method: "DELETE", headers: authHeaders() },
+  return api<{ deleted_chunks: number }>(
+    `/api/knowledge/docs/${encodeURIComponent(docId)}`,
+    { method: "DELETE" },
   );
-  if (!res.ok) throw new Error(`API error: ${res.status}`);
-  return res.json();
 }
 
 export async function resetKnowledge(): Promise<{ status: string }> {
-  const res = await fetch(`${API_BASE}/api/knowledge/reset`, {
+  return api<{ status: string }>("/api/knowledge/reset", {
     method: "POST",
-    headers: authHeaders(),
   });
-  if (!res.ok) throw new Error(`API error: ${res.status}`);
-  return res.json();
 }
 
 // ── Phase 3: 审计日志 (Audit Log) ──
@@ -321,19 +393,11 @@ export async function fetchAuditLogs(
   if (actor) params.set("actor", actor);
   params.set("limit", String(limit));
   const qs = params.toString();
-  const res = await fetch(`${API_BASE}/api/audit${qs ? `?${qs}` : ""}`, {
-    headers: authHeaders(),
-    cache: "no-store",
-  });
-  if (!res.ok) throw new Error(`API error: ${res.status}`);
-  return res.json();
+  return api<AuditEntry[]>(`/api/audit${qs ? `?${qs}` : ""}`);
 }
 
 export async function exportAudit(): Promise<void> {
-  const res = await fetch(`${API_BASE}/api/audit/export`, {
-    headers: authHeaders(),
-  });
-  if (!res.ok) throw new Error(`API error: ${res.status}`);
+  const res = await apiRaw("/api/audit/export");
   // 触发浏览器下载
   const blob = await res.blob();
   const url = URL.createObjectURL(blob);
@@ -352,14 +416,11 @@ export async function exportAudit(): Promise<void> {
 export async function summarizeSession(
   messages: Array<{ role: string; content: string }>,
 ): Promise<string> {
-  const res = await fetch(`${API_BASE}/api/sessions/summarize`, {
+  const data = await api<{ summary: string }>("/api/sessions/summarize", {
     method: "POST",
-    headers: { ...authHeaders(), "Content-Type": "application/json" },
-    body: JSON.stringify({ messages }),
+    json: { messages },
   });
-  if (!res.ok) throw new Error(`API error: ${res.status}`);
-  const data = await res.json();
-  return data.summary as string;
+  return data.summary;
 }
 
 // ── 实验管理 (A/B Testing) ──
@@ -400,21 +461,11 @@ export interface ExperimentDetail extends Experiment {
 }
 
 export async function fetchExperiments(): Promise<Experiment[]> {
-  const res = await fetch(`${API_BASE}/api/experiments`, {
-    headers: authHeaders(),
-    cache: "no-store",
-  });
-  if (!res.ok) throw new Error(`API error: ${res.status}`);
-  return res.json();
+  return api<Experiment[]>("/api/experiments");
 }
 
 export async function fetchExperiment(name: string): Promise<ExperimentDetail> {
-  const res = await fetch(`${API_BASE}/api/experiments/${encodeURIComponent(name)}`, {
-    headers: authHeaders(),
-    cache: "no-store",
-  });
-  if (!res.ok) throw new Error(`API error: ${res.status}`);
-  return res.json();
+  return api<ExperimentDetail>(`/api/experiments/${encodeURIComponent(name)}`);
 }
 
 export async function createExperiment(config: {
@@ -429,35 +480,27 @@ export async function createExperiment(config: {
   target_metric?: string;
   min_sample_size?: number;
 }): Promise<{ name: string; status: string }> {
-  const res = await fetch(`${API_BASE}/api/experiments`, {
+  return api<{ name: string; status: string }>("/api/experiments", {
     method: "POST",
-    headers: { ...authHeaders(), "Content-Type": "application/json" },
-    body: JSON.stringify(config),
+    json: config,
   });
-  if (!res.ok) throw new Error(`API error: ${res.status}`);
-  return res.json();
 }
 
 export async function updateExperimentStatus(
   name: string,
   status: string,
 ): Promise<{ name: string; status: string }> {
-  const res = await fetch(`${API_BASE}/api/experiments/${encodeURIComponent(name)}/status`, {
-    method: "PUT",
-    headers: { ...authHeaders(), "Content-Type": "application/json" },
-    body: JSON.stringify({ status }),
-  });
-  if (!res.ok) throw new Error(`API error: ${res.status}`);
-  return res.json();
+  return api<{ name: string; status: string }>(
+    `/api/experiments/${encodeURIComponent(name)}/status`,
+    { method: "PUT", json: { status } },
+  );
 }
 
 export async function deleteExperiment(name: string): Promise<{ deleted: string }> {
-  const res = await fetch(`${API_BASE}/api/experiments/${encodeURIComponent(name)}`, {
-    method: "DELETE",
-    headers: authHeaders(),
-  });
-  if (!res.ok) throw new Error(`API error: ${res.status}`);
-  return res.json();
+  return api<{ deleted: string }>(
+    `/api/experiments/${encodeURIComponent(name)}`,
+    { method: "DELETE" },
+  );
 }
 
 export async function recordExperimentMetric(
@@ -467,18 +510,18 @@ export async function recordExperimentMetric(
   resolved: boolean,
   escalated: boolean = false,
 ): Promise<{ recorded: boolean }> {
-  const res = await fetch(`${API_BASE}/api/experiments/${encodeURIComponent(name)}/metrics`, {
-    method: "POST",
-    headers: { ...authHeaders(), "Content-Type": "application/json" },
-    body: JSON.stringify({
-      variant_name: variantName,
-      user_id: userId,
-      resolved,
-      escalated,
-    }),
-  });
-  if (!res.ok) throw new Error(`API error: ${res.status}`);
-  return res.json();
+  return api<{ recorded: boolean }>(
+    `/api/experiments/${encodeURIComponent(name)}/metrics`,
+    {
+      method: "POST",
+      json: {
+        variant_name: variantName,
+        user_id: userId,
+        resolved,
+        escalated,
+      },
+    },
+  );
 }
 
 // ── SSE 事件流（fetch + ReadableStream）──
@@ -508,19 +551,28 @@ export async function subscribeSSE(
     opts.signal.addEventListener("abort", () => controller.abort(), { once: true });
   }
 
-  const res = await fetch(`${API_BASE}${path}`, {
-    method: opts.method ?? "GET",
-    headers: {
-      ...authHeaders(),
-      ...(opts.body ? { "Content-Type": "application/json" } : {}),
+  let res: Response;
+  try {
+    res = await fetch(`${API_BASE}${path}`, {
+      method: opts.method ?? "GET",
+      headers: {
+        ...authHeaders(),
+        ...(opts.body ? { "Content-Type": "application/json" } : {}),
     },
     body: opts.body ? JSON.stringify(opts.body) : undefined,
-    signal: controller.signal,
-    cache: "no-store",
-  });
+      signal: controller.signal,
+      cache: "no-store",
+    });
+  } catch (e) {
+    // 网络层不可达：让调用方按 ApiError 处理，不要伪装成"SSE 连接失败"
+    throw new ApiError(0, (e as Error).message || "SSE 网络请求失败");
+  }
 
   if (!res.ok || !res.body) {
-    throw new Error(`SSE 连接失败: ${res.status}`);
+    // 复用 unwrap 的 detail 解析：SSE 也会被 503（未配凭据）挡住，
+    // 报"连接失败"等于把后端写好的处置建议丢掉
+    await unwrap(res);
+    throw new ApiError(res.status, "SSE 响应没有可读流");
   }
 
   const reader = res.body.getReader();
@@ -609,12 +661,7 @@ export interface PersonaPreview {
 }
 
 export async function fetchPersona(): Promise<PersonaState> {
-  const res = await fetch(`${API_BASE}/api/persona`, {
-    headers: authHeaders(),
-    cache: "no-store",
-  });
-  if (!res.ok) throw new Error(`API error: ${res.status}`);
-  return res.json();
+  return api<PersonaState>("/api/persona");
 }
 
 export async function previewPersona(
@@ -622,15 +669,12 @@ export async function previewPersona(
   memoryBlock = "",
   lorebookBlock = "",
 ): Promise<PersonaPreview> {
-  const res = await fetch(`${API_BASE}/api/persona/preview`, {
+  return api<PersonaPreview>("/api/persona/preview", {
     method: "POST",
-    headers: { ...authHeaders(), "Content-Type": "application/json" },
-    body: JSON.stringify({
+    json: {
       message,
       memory_block: memoryBlock,
       lorebook_block: lorebookBlock,
-    }),
+    },
   });
-  if (!res.ok) throw new Error(`API error: ${res.status}`);
-  return res.json();
 }

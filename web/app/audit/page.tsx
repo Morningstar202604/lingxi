@@ -6,6 +6,7 @@ import {
   fetchAuditLogs,
   type AuditEntry,
 } from "@/lib/api";
+import ApiErrorPanel from "@/components/ApiState";
 
 const ACTIONS = [
   "",
@@ -40,7 +41,7 @@ export default function AuditPage() {
   const [actionFilter, setActionFilter] = useState("");
   const [actorFilter, setActorFilter] = useState("");
   const [loading, setLoading] = useState(true);
-  const [error, setError] = useState<string | null>(null);
+  const [error, setError] = useState<unknown>(null);
 
   const load = useCallback(async () => {
     try {
@@ -48,7 +49,7 @@ export default function AuditPage() {
       setEntries(data);
       setError(null);
     } catch (e) {
-      setError((e as Error).message);
+      setError(e);
     } finally {
       setLoading(false);
     }
@@ -100,9 +101,7 @@ export default function AuditPage() {
       </div>
 
       {error ? (
-        <div className="card border-lingxi-red/30 text-lingxi-red text-sm py-6 text-center">
-          {error}
-        </div>
+        <ApiErrorPanel error={error} onRetry={load} compact />
       ) : entries.length === 0 && !loading ? (
         <div className="card text-center py-12">
           <p className="text-sm text-lingxi-muted">暂无审计记录</p>

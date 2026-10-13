@@ -28,7 +28,6 @@ from __future__ import annotations
 import asyncio
 import contextlib
 import json
-import secrets
 from typing import Any
 
 from fastapi import FastAPI, Header, HTTPException, Request, Response
@@ -36,6 +35,7 @@ from sse_starlette.sse import EventSourceResponse
 
 from lingxi.config import get_settings
 from lingxi.core import get_logger
+from lingxi.core.admin_auth import require_admin, require_scrape, set_local_only
 from lingxi.core.logging import memory_handler
 from lingxi.flow.sla import format_sla_status
 from lingxi.flow.ticket import TicketStatus
@@ -45,8 +45,53 @@ from lingxi.persona.schema import PersonaConfig
 
 log = get_logger(__name__)
 
-# 与 SecurityConfig.admin_token 的默认值一致，用于识别"未改配置"
-_DEFAULT_ADMIN_TOKEN = "change-me-in-production"
+# 只允许 loopback 来源的 origin 正则：host 必须是 localhost / 127.0.0.1 / [::1]，
+# 端口任意（dev server 端口会变，写死端口等于给"换个端口启动"埋雷）。
+# 不用 `allow_origins=["*"]`：那等于对全网开放管理面。
+_LOOPBACK_ORIGIN_RE = r"^https?://(localhost|127\.0\.0\.1|\[::1\])(:\d+)?$"
+
+
+def _install_cors(app: FastAPI) -> None:
+    """让浏览器里的前端直连后端。
+
+    🔗 工程逻辑
+        前端不再经过 Next 的 rewrites 代理 —— 代理会缓冲 SSE 响应体，
+        /api/events 于是"200 但一帧不发"。直连 + CORS 才能让 dev 与
+        Tauri 两条路径行为一致（SSE、错误语义、状态码都相同）。
+
+    🤖 AI 避坑
+        - 正则只放行 loopback 来源；Dashboard 默认也只监听 loopback，两侧对齐
+        - allow_credentials=False：凭据走 x-admin-token 头而非 Cookie，
+          所以不需要 credentials 模式（那会强制禁止 `*`，且引入 CSRF 面）
+        - SSE 与普通 GET 共用一套 CORS，不要为 /api/events 单独开一套
+    """
+    from fastapi.middleware.cors import CORSMiddleware
+
+    settings = get_settings()
+    origins = list(settings.security.cors_origins)
+    if not origins and settings.security.cors_allow_loopback:
+        # 显式 origin 留空时启用 loopback 正则；两者都给，兼容性更好
+        app.add_middleware(
+            CORSMiddleware,
+            allow_origin_regex=_LOOPBACK_ORIGIN_RE,
+            allow_origins=origins,
+            allow_credentials=False,
+            allow_methods=["*"],
+            allow_headers=["*"],
+            expose_headers=["*"],
+        )
+        return
+    if origins:
+        app.add_middleware(
+            CORSMiddleware,
+            allow_origins=origins,
+            allow_credentials=False,
+            allow_methods=["*"],
+            allow_headers=["*"],
+            expose_headers=["*"],
+        )
+    else:
+        log.info("cors_disabled")
 
 
 def create_dashboard_app(
@@ -63,9 +108,16 @@ def create_dashboard_app(
     seat_store: Any = None,  # SeatStore | None — 坐席管理端点
     assigner: Any = None,  # TicketAssigner | None
     persona_config: Any = None,  # PersonaConfig | None — /api/persona 用
+    local_only: bool = False,  # 是否仅监听 loopback（决定未配 token 时能否免密）
 ) -> FastAPI:
     """创建 Dashboard FastAPI 应用。"""
     app = FastAPI(title="智犀 (ZhiXi) Dashboard v0.2.0", version="0.2.0")
+
+    # 暴露面登记一次即可：MCP / seat / workflow 三个子路由与 Dashboard 共用
+    # 同一套凭据策略，登记点也必须唯一（见 core/admin_auth.py）。
+    set_local_only(local_only)
+
+    _install_cors(app)
 
     # ── Prometheus 中间件 (自动记录所有 HTTP 请求) ──
     settings = get_settings()
@@ -101,7 +153,13 @@ def create_dashboard_app(
     # ── 实验管理路由 (A/B Testing) ──
     if experiment_engine is not None:
         from lingxi.experiment import create_experiment_router
-        app.include_router(create_experiment_router(experiment_engine))
+
+        # prefix="/api" 不是可选的：router 自身只声明 "/experiments"，
+        # 漏掉前缀时端点会挂在 "/experiments"（根路径），而前端请求的是
+        # "/api/experiments" → 整个 A/B 实验页 404。
+        # 单测自己 include 时带了前缀，所以一直没人发现（与
+        # AUDIT-2026-10-10 记录的"组件没透传"同一类问题）。
+        app.include_router(create_experiment_router(experiment_engine), prefix="/api")
 
     # ── 鉴权路由 (JWT RBAC) ──
     if auth_enabled:
@@ -140,54 +198,16 @@ def create_dashboard_app(
     app.include_router(create_openai_tools_router())
 
     def _check_admin(x_admin_token: str | None = Header(None)) -> None:
-        """Dashboard 管理面认证。
-
-        安全约束（见 docs/AUDIT-2026-10-10.md #8）：
-        - 常量时间比较，避免时序侧信道（secrets.compare_digest）
-        - 未配置自定义 token 且非 debug 时 fail-closed：
-          默认值 "change-me-in-production" 不再是可用凭据，
-          否则任何未改配置的部署都等于把工单/认领/关闭公开出去
-        """
-        settings = get_settings()
-        expected = settings.security.admin_token.get_secret_value()
-
-        if expected == _DEFAULT_ADMIN_TOKEN and not settings.debug:
-            raise HTTPException(
-                status_code=503,
-                detail=(
-                    "Dashboard 未配置管理凭据：请设置 "
-                    "LINGXI_SECURITY__ADMIN_TOKEN 环境变量"
-                ),
-            )
-
-        if not x_admin_token or not secrets.compare_digest(x_admin_token, expected):
-            raise HTTPException(status_code=401, detail="Unauthorized")
+        require_admin(
+            x_admin_token,
+            detail=(
+                "Dashboard 未配置管理凭据：请设置 "
+                "LINGXI_SECURITY__ADMIN_TOKEN 环境变量"
+            ),
+        )
 
     def _check_scrape(x_admin_token: str | None) -> None:
-        """/metrics 抓取鉴权：scrape_token 优先，未配置则回退 admin_token。
-
-        两者都没配置（非 debug）时同样 fail-closed —— 指标端点不是公开信息。
-        """
-        settings = get_settings()
-        scrape = settings.metrics.scrape_token
-        expected = (
-            scrape.get_secret_value() if scrape is not None
-            else settings.security.admin_token.get_secret_value()
-        )
-        if (
-            expected == _DEFAULT_ADMIN_TOKEN
-            and settings.metrics.scrape_token is None
-            and not settings.debug
-        ):
-            raise HTTPException(
-                status_code=503,
-                detail=(
-                    "/metrics 未配置抓取凭据：请设置 "
-                    "LINGXI_METRICS__SCRAPE_TOKEN 环境变量"
-                ),
-            )
-        if not x_admin_token or not secrets.compare_digest(x_admin_token, expected):
-            raise HTTPException(status_code=401, detail="Unauthorized")
+        require_scrape(x_admin_token)
 
     @app.get("/api/health")
     async def health() -> dict[str, Any]:
@@ -536,15 +556,12 @@ def create_dashboard_app(
     ) -> EventSourceResponse:
         """SSE 实时事件流: 升级/认领/关闭。
 
-        前端消费::
+        前端消费（前端直连后端，不走 Next 代理——代理会缓冲 SSE 响应体）::
 
-            const src = new EventSource("/api/proxy/api/events", {
+            const res = await fetch(`${API_BASE}/api/events`, {
                 headers: {"x-admin-token": TOKEN}
             });
-            src.addEventListener("escalated", (e) => {
-                const data = JSON.parse(e.data);
-                console.log("升级工单:", data.ticket_id);
-            });
+            // 自己解 SSE 帧，见 web/lib/api.ts::subscribeSSE
 
         sse_starlette 是 asyncio 原生 SSE 实现, 不依赖 Redis/broker,
         适用于单节点多订阅场景。往 EventSourceResponse 传入一个 async
@@ -705,9 +722,9 @@ def create_dashboard_app(
         ) -> EventSourceResponse:
             """SSE: 发送消息并实时接收 Agent 回复流。
 
-            前端消费::
+            前端消费（直连后端）::
 
-                const res = await fetch("/api/proxy/api/stream/chat", {
+                const res = await fetch(`${API_BASE}/api/stream/chat`, {
                     method: "POST",
                     headers: {
                         "Content-Type": "application/json",

@@ -2,6 +2,7 @@
 
 import { useCallback, useEffect, useRef, useState } from "react";
 import { fetchLogs, type LogEntry } from "@/lib/api";
+import ApiErrorPanel from "@/components/ApiState";
 
 const levelColor: Record<string, string> = {
   DEBUG: "text-gray-400",
@@ -14,7 +15,7 @@ const levelColor: Record<string, string> = {
 export default function LogsPage() {
   const [logs, setLogs] = useState<LogEntry[]>([]);
   const [loading, setLoading] = useState(true);
-  const [error, setError] = useState<string | null>(null);
+  const [error, setError] = useState<unknown>(null);
   const [paused, setPaused] = useState(false);
   const autoScroll = useRef(true);
   const container = useRef<HTMLDivElement>(null);
@@ -26,7 +27,7 @@ export default function LogsPage() {
       setLogs(data);
       setError(null);
     } catch (e) {
-      setError((e as Error).message);
+      setError(e);
     } finally {
       setLoading(false);
     }
@@ -71,9 +72,7 @@ export default function LogsPage() {
       </div>
 
       {error ? (
-        <div className="card border-lingxi-red/30 text-lingxi-red text-sm py-8 text-center">
-          {error}
-        </div>
+        <ApiErrorPanel error={error} onRetry={load} compact />
       ) : (
         <div
           ref={container}

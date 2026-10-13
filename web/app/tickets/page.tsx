@@ -8,6 +8,7 @@ import {
   statusLabel,
   type TicketSummary,
 } from "@/lib/api";
+import ApiErrorPanel from "@/components/ApiState";
 
 const STATUS_FILTERS = [
   { key: "", label: "全部" },
@@ -32,7 +33,7 @@ export default function TicketsPage() {
   const [tickets, setTickets] = useState<TicketSummary[]>([]);
   const [filter, setFilter] = useState("");
   const [loading, setLoading] = useState(true);
-  const [error, setError] = useState<string | null>(null);
+  const [error, setError] = useState<unknown>(null);
 
   const load = useCallback(async () => {
     try {
@@ -41,7 +42,7 @@ export default function TicketsPage() {
       setTickets(data);
       setError(null);
     } catch (e) {
-      setError((e as Error).message);
+      setError(e);
     } finally {
       setLoading(false);
     }
@@ -72,9 +73,7 @@ export default function TicketsPage() {
       </div>
 
       {error ? (
-        <div className="card border-lingxi-red/30 text-lingxi-red text-sm py-8 text-center">
-          {error}
-        </div>
+        <ApiErrorPanel error={error} onRetry={load} compact />
       ) : (
         <div className="card overflow-hidden p-0">
           <table className="w-full text-xs">

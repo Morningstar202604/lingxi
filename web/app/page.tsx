@@ -21,6 +21,7 @@ import {
   type QueueSnapshot,
   type TicketSummary,
 } from "@/lib/api";
+import ApiErrorPanel from "@/components/ApiState";
 
 /** 趋势线保留的采样点数：5s/次 × 60 ≈ 5 分钟 */
 const TREND_WINDOW = 60;
@@ -30,7 +31,7 @@ export default function DashboardPage() {
   const [queue, setQueue] = useState<QueueSnapshot | null>(null);
   const [recent, setRecent] = useState<TicketSummary[]>([]);
   const [trend, setTrend] = useState<TrendPoint[]>([]);
-  const [error, setError] = useState<string | null>(null);
+  const [error, setError] = useState<unknown>(null);
   const [lastSync, setLastSync] = useState<number | null>(null);
   const trendRef = useRef<TrendPoint[]>([]);
 
@@ -62,7 +63,8 @@ export default function DashboardPage() {
       setLastSync(Date.now());
       setError(null);
     } catch (e) {
-      setError((e as Error).message);
+      // 不清空已有数据：偶发一次抖动不该把整个面板换成错误页
+      setError(e);
     }
   }, []);
 
@@ -91,28 +93,27 @@ export default function DashboardPage() {
       ]
     : [];
 
-  if (error) {
-    return (
-      <div className="flex flex-col items-center justify-center py-20">
-        <div className="card border-lingxi-red/30 max-w-md text-center">
-          <p className="text-lingxi-red text-sm font-medium">无法连接后端</p>
-          <p className="text-xs text-lingxi-muted mt-2">{error}</p>
-          <p className="text-xs text-lingxi-muted mt-4">
-            请确保智犀后端已启动（端口 8080）
-          </p>
+  // 曾经这里是整页 early-return：一没配凭据就把 Dashboard 换成一块红牌。
+  // 现在改成**非阻断横幅**——真实数据（若有）照常渲染，只有缺失的那部分提示原因。
+  return (
+    <div className="space-y-6">
+      {Boolean(error) && !summary && (
+        <ApiErrorPanel error={error} onRetry={load} />
+      )}
+      {Boolean(error) && summary && (
+        <div className="flex items-center justify-between gap-3 rounded-lg border border-lingxi-orange/30 bg-lingxi-orange/[0.06] px-3 py-2">
+          <span className="text-xs text-lingxi-orange">
+            最近一次同步失败：显示的是上一次成功的数据
+          </span>
           <button
             onClick={load}
-            className="mt-4 px-4 py-2 bg-lingxi-orange/10 text-lingxi-orange border border-lingxi-orange/30 rounded-lg text-xs hover:bg-lingxi-orange/20 transition-colors"
+            className="text-xs px-2 py-1 rounded border border-lingxi-orange/30 text-lingxi-orange hover:bg-lingxi-orange/10 transition-colors"
           >
             重试
           </button>
         </div>
-      </div>
-    );
-  }
+      )}
 
-  return (
-    <div className="space-y-6">
       {/* 实时指标 */}
       <section>
         <div className="flex items-center justify-between mb-3">

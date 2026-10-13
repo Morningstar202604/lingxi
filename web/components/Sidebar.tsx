@@ -2,6 +2,9 @@
 
 import Link from "next/link";
 import { usePathname } from "next/navigation";
+import { useEffect, useState } from "react";
+
+import { API_BASE } from "@/lib/api";
 
 const NAV_LINKS = [
   { href: "/", label: "总览", icon: "◰" },
@@ -15,8 +18,41 @@ const NAV_LINKS = [
   { href: "/logs", label: "日志", icon: "◫" },
 ];
 
+/** 侧栏底部的引擎状态。此前这里写死"引擎在线"+绿点 —— 后端没起也照样显示在线，
+ *  用户先信了这个指示灯，才去怀疑真正的故障点。改为真实探测 /api/health
+ *  （该端点不需要凭据，所以未配置时也能反映"后端在不在"）。 */
+function useEngineStatus() {
+  const [state, setState] = useState<"checking" | "up" | "down">("checking");
+
+  useEffect(() => {
+    let alive = true;
+    const ping = async () => {
+      try {
+        const res = await fetch(`${API_BASE}/api/health`, { cache: "no-store" });
+        if (alive) setState(res.ok ? "up" : "down");
+      } catch {
+        if (alive) setState("down");
+      }
+    };
+    ping();
+    const id = setInterval(ping, 10_000);
+    return () => {
+      alive = false;
+      clearInterval(id);
+    };
+  }, []);
+
+  return state;
+}
+
 export default function Sidebar() {
   const pathname = usePathname() || "/";
+  const engine = useEngineStatus();
+  const dot =
+    engine === "up" ? "bg-lingxi-green" : engine === "down" ? "bg-lingxi-red" : "bg-lingxi-muted";
+  const label =
+    engine === "up" ? "引擎在线" : engine === "down" ? "引擎未连接" : "检测中…";
+
   return (
     <aside className="hidden md:flex w-56 flex-col bg-lingxi-navy/80 border-r border-white/5 p-4">
       <div className="flex items-center gap-3 px-3 py-4">
@@ -51,11 +87,11 @@ export default function Sidebar() {
       </nav>
       <div className="mt-auto pt-4 border-t border-white/5 space-y-2">
         <div className="flex items-center gap-2 px-3 text-xs text-lingxi-muted">
-          <span className="w-2 h-2 rounded-full bg-lingxi-green pulse-dot" />
-          引擎在线
+          <span className={`w-2 h-2 rounded-full ${dot} pulse-dot`} />
+          {label}
         </div>
         <div className="px-3 text-[10px] text-lingxi-muted/50">
-          ZhiXi v0.2.0 · 507 tests
+          ZhiXi v0.2.0
         </div>
       </div>
     </aside>

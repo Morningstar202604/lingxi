@@ -159,8 +159,15 @@ async def _stream_native(
 
     Agent 侧已把图、状态机、护栏、权限全部复用了非流式实现，
     这里只做「领域事件 → SSE」的一层映射。
+
+    🔗 契约：**零内容流不允许**
+        如果整条流既没有 message 也没有 error，前端只会收到
+        agent_start + agent_end，用户表现为"发完消息什么都没有"。
+        历史上真发生过：上层节点漏处理某个事件类型 → 图照常走完 →
+        流是空的。因此这里兜底补一个显式 error，而不是把问题留给用户发现。
     """
     collected: list[str] = []
+    saw_error = False
     async for ev in agent.astream(
         raw_message=raw_message,
         chat_id=chat_id,
@@ -187,10 +194,21 @@ async def _stream_native(
                 "success": ev.get("success", False),
             })
         elif kind == "error":
+            saw_error = True
             yield _sse_event("error", {"error": ev.get("error", "")})
 
     if collected:
         yield _sse_event("message", {"delta": "", "final": True})
+    elif not saw_error:
+        log.warning(
+            "agent_stream_empty",
+            chat_id=chat_id,
+            detail="astream 未产出任何 message/error 事件",
+        )
+        yield _sse_event(
+            "error",
+            {"error": "模型没有返回任何内容，请稍后重试或转接人工。"},
+        )
 
 
 async def _stream_fallback(

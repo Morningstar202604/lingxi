@@ -7,11 +7,12 @@ import {
   fetchQueue,
   type QueueSnapshot,
 } from "@/lib/api";
+import ApiErrorPanel from "@/components/ApiState";
 import QueuePanel from "@/components/QueuePanel";
 
 export default function QueuePage() {
   const [queue, setQueue] = useState<QueueSnapshot | null>(null);
-  const [error, setError] = useState<string | null>(null);
+  const [error, setError] = useState<unknown>(null);
   const [claiming, setClaiming] = useState(false);
 
   const load = useCallback(async () => {
@@ -20,7 +21,7 @@ export default function QueuePage() {
       setQueue(q);
       setError(null);
     } catch (e) {
-      setError((e as Error).message);
+      setError(e);
     }
   }, []);
 
@@ -37,7 +38,7 @@ export default function QueuePage() {
       await claimTicket("dashboard-agent");
       await load();
     } catch (e) {
-      setError((e as Error).message);
+      setError(e);
     } finally {
       setClaiming(false);
     }
@@ -61,9 +62,7 @@ export default function QueuePage() {
       </div>
 
       {error ? (
-        <div className="card border-lingxi-red/30 text-lingxi-red text-sm py-8 text-center">
-          {error}
-        </div>
+        <ApiErrorPanel error={error} onRetry={load} compact />
       ) : queue ? (
         <QueuePanel items={queue.top_5_pending} onClaim={handleClaim} />
       ) : (

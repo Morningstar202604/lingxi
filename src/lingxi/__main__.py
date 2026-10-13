@@ -63,6 +63,27 @@ if TYPE_CHECKING:
 
 log = get_logger(__name__)
 
+# 只监听这些地址时，服务在网络上不可达 → 未配置凭据时可按本地模式放行
+_LOOPBACK_HOSTS = frozenset({"127.0.0.1", "localhost", "::1", "[::1]"})
+
+
+def _is_loopback_host(host: str | None) -> bool:
+    """监听地址是否只对本机可见。
+
+    🔗 工程逻辑
+        这决定 `security.allow_anonymous_local` 的适用范围：
+        - True  → 未配 admin_token 时本机免密（默认部署，双击即用）
+        - False → 未配 admin_token 即 503 fail-closed（0.0.0.0 等）
+
+    🤖 AI 避坑
+        不要用 `host.startswith("127.")` 糊弄：`127.0.0.1.evil.com` 不是本机，
+        而 `127.0.0.2` 虽然也是 loopback 却不在此集合里 —— 白名单而非黑名单，
+        未知取值一律按"已暴露"处理（fail-closed 一侧）。
+    """
+    if not host:
+        return False
+    return host.strip().lower() in _LOOPBACK_HOSTS
+
 
 @dataclass
 class Engine:
@@ -91,7 +112,7 @@ class Engine:
     assigner: Any = None  # TicketAssigner | None
     permission_level: PermissionLevel = 1  # 未命中 permission_rules 时的基线等级
 
-    def dashboard_app(self) -> Any:
+    def dashboard_app(self, host: str | None = None) -> Any:
         """构建与本引擎共享存储的 Dashboard FastAPI 应用。
 
         ⚠️ 此前这里只传了存储类，agent / experiment_engine / auth_enabled 全是
@@ -99,6 +120,10 @@ class Engine:
         于是生产进程里 SSE 流式端点、A/B 实验端点、JWT 鉴权端点**一个都没挂上**
         （前端 6 处请求 /api/experiments 必然 404）。单元测试因为自己显式传参
         所以发现不了。现在把引擎持有的组件全部透传。
+
+        Args:
+            host: 实际监听地址。决定"未配置凭据时能否按本地模式免密"——
+                只有 loopback 才放行，0.0.0.0 仍然 fail-closed。
         """
         sla_monitor = getattr(self, "_sla_monitor", None)
         rule_engine = getattr(self, "_rule_engine", None)
@@ -115,6 +140,7 @@ class Engine:
             seat_store=getattr(self, "seat_store", None),
             assigner=getattr(self, "assigner", None),
             persona_config=self.injector._persona,
+            local_only=_is_loopback_host(host),
         )
         # 注册 Gewechat 回调路由 (HTTP POST from 微信服务器)
         for adapter in self.adapters:
@@ -139,7 +165,7 @@ class Engine:
         import uvicorn
 
         config = uvicorn.Config(
-            self.dashboard_app(),
+            self.dashboard_app(host),
             host=host,
             port=port,
             log_config=None,  # 交给 structlog 统一接管，避免双通道日志

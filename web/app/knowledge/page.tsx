@@ -12,6 +12,7 @@ import {
   type KnowledgeStats,
   type RecallHit,
 } from "@/lib/api";
+import ApiErrorPanel from "@/components/ApiState";
 
 export default function KnowledgePage() {
   const [stats, setStats] = useState<KnowledgeStats | null>(null);
@@ -23,7 +24,7 @@ export default function KnowledgePage() {
   const [query, setQuery] = useState("");
   const [recalling, setRecalling] = useState(false);
   const [hits, setHits] = useState<RecallHit[]>([]);
-  const [error, setError] = useState<string | null>(null);
+  const [error, setError] = useState<unknown>(null);
   const [resetting, setResetting] = useState(false);
 
   const loadStats = useCallback(async () => {
@@ -31,7 +32,7 @@ export default function KnowledgePage() {
       const data = await fetchKnowledgeStats();
       setStats(data);
     } catch (e) {
-      setError((e as Error).message);
+      setError(e);
     }
   }, []);
 
@@ -40,7 +41,7 @@ export default function KnowledgePage() {
       const data = await fetchKnowledgeDocs();
       setDocs(data);
     } catch (e) {
-      setError((e as Error).message);
+      setError(e);
     }
   }, []);
 
@@ -48,6 +49,11 @@ export default function KnowledgePage() {
     loadStats();
     loadDocs();
   }, [loadStats, loadDocs]);
+
+  const loadAll = useCallback(
+    () => Promise.all([loadStats(), loadDocs()]),
+    [loadStats, loadDocs],
+  );
 
   const handleUpload = async () => {
     if (!content.trim()) {
@@ -78,7 +84,7 @@ export default function KnowledgePage() {
       const results = await recallKnowledge(query);
       setHits(results);
     } catch (e) {
-      setError((e as Error).message);
+      setError(e);
     } finally {
       setRecalling(false);
     }
@@ -89,7 +95,7 @@ export default function KnowledgePage() {
       await deleteKnowledgeDoc(docId);
       await Promise.all([loadStats(), loadDocs()]);
     } catch (e) {
-      setError((e as Error).message);
+      setError(e);
     }
   };
 
@@ -101,7 +107,7 @@ export default function KnowledgePage() {
       setHits([]);
       await Promise.all([loadStats(), loadDocs()]);
     } catch (e) {
-      setError((e as Error).message);
+      setError(e);
     } finally {
       setResetting(false);
     }
@@ -109,10 +115,8 @@ export default function KnowledgePage() {
 
   return (
     <div className="space-y-6">
-      {error && (
-        <div className="card border-lingxi-red/30 text-lingxi-red text-sm py-3 px-4">
-          {error}
-        </div>
+      {Boolean(error) && (
+        <ApiErrorPanel error={error} onRetry={loadAll} compact />
       )}
 
       {/* Stats Cards */}

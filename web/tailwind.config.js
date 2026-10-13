@@ -12,6 +12,7 @@ module.exports = {
           orange: "#E8963E",
           green: "#2ECC71",
           red: "#E74C3C",
+          blue: "#5B8DEF",
           slate: "#2C3E50",
           muted: "#95A5A6",
         },

@@ -218,7 +218,11 @@ class TestProductionWiring:
         # 这 5 组曾经因为 __main__ 没传参而**一个都没挂上**
         assert "/api/stream/chat" in paths, "SSE 流式端点未挂载"
         assert "/api/sessions/{chat_id}/stream" in paths, "会话 SSE 端点未挂载"
-        assert "/experiments" in paths, "A/B 实验端点未挂载"
+        assert "/api/experiments" in paths, "A/B 实验端点未挂载"
+        assert "/experiments" not in paths, (
+            "A/B 实验端点漏了 /api 前缀：前端请求 /api/experiments，"
+            "挂在根路径会让整个 A/B 实验页 404"
+        )
         assert "/api/seats" in paths, "坐席端点未挂载"
         assert "/mcp/tools/list" in paths and "/v1/tools" in paths, "MCP 端点未挂载"
         assert "/api/workflow/graph" in paths, "工作流 DAG 端点未挂载"
@@ -310,11 +314,11 @@ class TestRouteInventory:
             "/api/seats/assign",
             "/api/seats/metrics",
             # A/B 实验
-            "/experiments",
-            "/experiments/{name}",
-            "/experiments/{name}/status",
-            "/experiments/{name}/metrics",
-            "/experiments/{name}/assign/{user_id}",
+            "/api/experiments",
+            "/api/experiments/{name}",
+            "/api/experiments/{name}/status",
+            "/api/experiments/{name}/metrics",
+            "/api/experiments/{name}/assign/{user_id}",
             # 工作流 DAG
             "/api/workflow/graph",
             "/api/workflow/graph/yaml",

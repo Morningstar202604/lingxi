@@ -19,12 +19,11 @@
 """
 from __future__ import annotations
 
-import secrets
 from typing import Any
 
 from fastapi import APIRouter, Header, HTTPException, Response
 
-from lingxi.config.settings import get_settings
+from lingxi.core.admin_auth import require_admin
 from lingxi.core.logging import get_logger
 from lingxi.workflow.builder import (
     ValidationError,
@@ -37,9 +36,6 @@ from lingxi.workflow.mermaid import to_mermaid
 from lingxi.workflow.validator import validate_dag
 
 log = get_logger(__name__)
-
-# 与 SecurityConfig.admin_token 的默认值一致，用于识别"未改配置"
-_DEFAULT_ADMIN_TOKEN = "change-me-in-production"
 
 
 def create_workflow_router(components: dict[str, Any] | None = None) -> APIRouter:
@@ -59,21 +55,8 @@ def create_workflow_router(components: dict[str, Any] | None = None) -> APIRoute
     router = APIRouter(prefix="/api/workflow", tags=["workflow"])
 
     def _check_admin(x_admin_token: str | None = Header(None)) -> None:
-        """Dashboard 管理面认证 — 与 dashboard_api.py 保持一致的策略。"""
-        settings = get_settings()
-        expected = settings.security.admin_token.get_secret_value()
-
-        if expected == _DEFAULT_ADMIN_TOKEN and not settings.debug:
-            raise HTTPException(
-                status_code=503,
-                detail=(
-                    "Dashboard 未配置管理凭据：请设置 "
-                    "LINGXI_SECURITY__ADMIN_TOKEN 环境变量"
-                ),
-            )
-
-        if not x_admin_token or not secrets.compare_digest(x_admin_token, expected):
-            raise HTTPException(status_code=401, detail="Unauthorized")
+        """Dashboard 管理面认证（委托 core.admin_auth —— 全项目唯一实现）。"""
+        require_admin(x_admin_token)
 
     @router.get("/graph")
     async def get_graph(

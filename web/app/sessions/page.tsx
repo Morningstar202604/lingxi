@@ -8,6 +8,7 @@ import {
   summarizeSession,
   type SessionInfo,
 } from "@/lib/api";
+import ApiErrorPanel from "@/components/ApiState";
 
 const statusColor: Record<string, string> = {
   intake: "text-blue-400",
@@ -28,7 +29,7 @@ function timeAgo(unixSec: number): string {
 export default function SessionsPage() {
   const [sessions, setSessions] = useState<SessionInfo[]>([]);
   const [loading, setLoading] = useState(true);
-  const [error, setError] = useState<string | null>(null);
+  const [error, setError] = useState<unknown>(null);
   const [summaryTxt, setSummaryTxt] = useState<string | null>(null);
   const [summarizingId, setSummarizingId] = useState<string | null>(null);
 
@@ -38,7 +39,7 @@ export default function SessionsPage() {
       setSessions(data);
       setError(null);
     } catch (e) {
-      setError((e as Error).message);
+      setError(e);
     } finally {
       setLoading(false);
     }
@@ -96,9 +97,7 @@ export default function SessionsPage() {
       )}
 
       {error ? (
-        <div className="card border-lingxi-red/30 text-lingxi-red text-sm py-8 text-center">
-          {error}
-        </div>
+        <ApiErrorPanel error={error} onRetry={load} compact />
       ) : sessions.length === 0 && !loading ? (
         <div className="card text-center py-12">
           <p className="text-sm text-lingxi-muted">暂无活跃会话</p>

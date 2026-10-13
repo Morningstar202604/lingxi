@@ -54,3 +54,13 @@ Thumbs.db
 # Secrets
 *.env
 .env.local
+
+# Tauri / Rust build artifacts
+src-tauri/target/
+src-tauri/gen/
+src-tauri/dist/
+build/pyi/
+build/lingxi-server.spec
+
+# Screenshots (verification artifacts)
+screenshots/

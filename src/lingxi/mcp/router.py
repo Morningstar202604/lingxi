@@ -22,39 +22,29 @@
 """
 from __future__ import annotations
 
-import secrets
 from typing import Any
 
 from fastapi import APIRouter, Header, HTTPException
 
 from lingxi.core import get_logger
+from lingxi.core.admin_auth import require_admin
 from lingxi.mcp.models import JSONRPCRequest, JSONRPCResponse, MCPErrorCode
 
 log = get_logger(__name__)
 
-# 与 SecurityConfig.admin_token 的默认值一致，用于识别"未改配置"
-_DEFAULT_ADMIN_TOKEN = "change-me-in-production"
-
 
 def _require_admin(x_admin_token: str | None) -> None:
-    """管理凭据校验（与 dashboard_api.py / workflow/router.py 同一套策略）。
+    """管理凭据校验（委托 core.admin_auth —— 全项目唯一实现）。
 
     🔗 安全
         此前这些端点**只看 X-Miner-Permission 头就放行** —— 那是一个权限等级，
         不是凭据，等于任何人都能声称自己是 L4 并直接调 shell。把接口挂上
         FastAPI 之前必须先补这一层，否则挂载本身就是在开后门。
-    """
-    from lingxi.config.settings import get_settings
 
-    settings = get_settings()
-    expected = settings.security.admin_token.get_secret_value()
-    if expected == _DEFAULT_ADMIN_TOKEN and not settings.debug:
-        raise HTTPException(
-            status_code=503,
-            detail="未配置管理凭据：请设置 LINGXI_SECURITY__ADMIN_TOKEN",
-        )
-    if not x_admin_token or not secrets.compare_digest(x_admin_token, expected):
-        raise HTTPException(status_code=401, detail="Unauthorized")
+    ⚠️ 本文件曾各自复制一份判定逻辑，与 dashboard_api / seat / workflow 漂移；
+    现统一走 core.admin_auth，暴露面（loopback）也由那里单点登记。
+    """
+    require_admin(x_admin_token)
 
 
 def create_mcp_router() -> APIRouter:
