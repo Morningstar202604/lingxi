@@ -56,8 +56,14 @@ function formatValue(value: number | string): string {
 
 function MetricCard({ label, value, color = "navy", sub, trend, action }: MetricCardProps) {
   const isNumber = typeof value === "number";
-  const animated = isNumber ? useCountUp(value) : 0;
-  const shown = isNumber && Math.abs(animated - value) < 0.5 ? value : (isNumber ? animated : value);
+  // Hook 必须无条件调用（react-hooks/rules-of-hooks）：非数字值传 0 让它空转，
+  // 展示时再按类型区分。条件调用会让组件在 value 类型变化时崩掉。
+  const animated = useCountUp(isNumber ? value : 0);
+  const shown = isNumber
+    ? Math.abs(animated - value) < 0.5
+      ? value
+      : animated
+    : value;
 
   return (
     <div className="card transition-colors hover:border-lingxi-orange/30 relative overflow-hidden">

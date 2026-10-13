@@ -16,9 +16,10 @@ export default function RootLayout({
   return (
     <html lang="zh-CN">
       <body className="font-sans antialiased">
-        <div className="flex min-h-screen">
+        {/* 小屏纵向堆叠（移动端导航条 + 内容），md 起恢复侧栏 + 内容两栏 */}
+        <div className="flex flex-col md:flex-row min-h-screen">
           <Sidebar />
-          <main className="flex-1 overflow-auto">
+          <main className="flex-1 min-w-0 overflow-auto">
             <header className="sticky top-0 z-10 backdrop-blur-md bg-[#0f1729]/80 border-b border-white/5 px-6 py-3 flex items-center justify-between">
               <h2 className="text-sm font-medium text-white/80">智犀控制台 · ZhiXi v0.2.0</h2>
               <div className="flex items-center gap-3 text-xs text-lingxi-muted">

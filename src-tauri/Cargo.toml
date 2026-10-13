@@ -20,3 +20,5 @@ serde_json = "1"
 tokio = { version = "1", features = ["macros", "rt-multi-thread", "process", "fs", "time"] }
 anyhow = "1"
 reqwest = { version = "0.12", features = ["json"] }
+# 每次安装随机生成本地管理令牌（uuid v4 底层 getrandom），持久化到数据目录
+uuid = { version = "1", features = ["v4"] }

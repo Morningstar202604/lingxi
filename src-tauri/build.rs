@@ -1,5 +1,3 @@
-use std::env;
-use std::path::PathBuf;
 use tauri_build::build;
 
 fn main() {

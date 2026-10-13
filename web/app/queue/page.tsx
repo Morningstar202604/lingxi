@@ -2,6 +2,7 @@
 
 import { useCallback, useEffect, useState } from "react";
 import {
+  ApiError,
   claimTicket,
   completeTicket,
   fetchQueue,
@@ -13,6 +14,7 @@ import QueuePanel from "@/components/QueuePanel";
 export default function QueuePage() {
   const [queue, setQueue] = useState<QueueSnapshot | null>(null);
   const [error, setError] = useState<unknown>(null);
+  const [notice, setNotice] = useState("");
   const [claiming, setClaiming] = useState(false);
 
   const load = useCallback(async () => {
@@ -34,11 +36,19 @@ export default function QueuePage() {
   const handleClaim = useCallback(async () => {
     if (claiming) return;
     setClaiming(true);
+    setNotice("");
     try {
       await claimTicket("dashboard-agent");
       await load();
     } catch (e) {
-      setError(e);
+      // 404 = 队列为空（后端对空队列返回 404 而不是空对象）——
+      // 这不是错误，是正常状态，别弹整屏红字（AUDIT-2026-10-10 #26）。
+      if (e instanceof ApiError && e.status === 404) {
+        setNotice("当前没有待认领工单");
+        await load();
+      } else {
+        setError(e);
+      }
     } finally {
       setClaiming(false);
     }
@@ -60,6 +70,12 @@ export default function QueuePage() {
           {claiming ? "认领中..." : "立即认领"}
         </button>
       </div>
+
+      {notice && (
+        <div className="text-xs text-lingxi-muted px-3 py-2 rounded-lg border border-white/10 bg-white/5">
+          {notice}
+        </div>
+      )}
 
       {error ? (
         <ApiErrorPanel error={error} onRetry={load} compact />

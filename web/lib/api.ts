@@ -4,7 +4,8 @@
 
 // 安全：NEXT_PUBLIC_* 会被编译进客户端 bundle 下发给每个访客，
 // 绝不能内置管理凭据默认值。凭据必须由运维在登录后注入。
-const ADMIN_TOKEN = process.env.NEXT_PUBLIC_ADMIN_TOKEN || "";
+const ENV_API_BASE = process.env.NEXT_PUBLIC_API_BASE || "http://127.0.0.1:8080";
+const ENV_ADMIN_TOKEN = process.env.NEXT_PUBLIC_ADMIN_TOKEN || "";
 
 // 前端**直连**后端，不走 Next rewrites 代理。
 // 原因：/api/events 是 SSE 长连接，Next dev 的 rewrites 会缓冲响应体 ——
@@ -12,24 +13,68 @@ const ADMIN_TOKEN = process.env.NEXT_PUBLIC_ADMIN_TOKEN || "";
 // 代理只对普通请求友好，对流式是死路；后端已开 loopback CORS（见
 // flow/dashboard_api.py::_install_cors），dev 与 Tauri 因此行为一致。
 //
-// 需要跨机访问时用 NEXT_PUBLIC_API_BASE 覆盖，例如 http://10.0.0.5:8080，
-// 同时在服务端 security.cors_origins 里放行该 origin。
-export const API_BASE =
-  process.env.NEXT_PUBLIC_API_BASE || "http://127.0.0.1:8080";
-
-/** 是否已注入管理凭据（仅用于界面提示，不阻断请求）。 */
-export function hasAdminToken(): boolean {
-  return Boolean(ADMIN_TOKEN);
+// 地址与凭据在**运行时**解析：
+// - 浏览器（dev/部署）：NEXT_PUBLIC_API_BASE / NEXT_PUBLIC_ADMIN_TOKEN 兜底
+// - Tauri 桌面版：后端端口是动态的（8080 被占会自动顺延），令牌是每次
+//   安装随机生成的 —— 通过 invoke("get_backend_port"/"get_admin_token")
+//   向壳进程要真实值；后端重启换端口后（网络层失败）会重新解析。
+interface RuntimeInfo {
+  base: string;
+  token: string;
 }
 
-function authHeaders(): HeadersInit {
-  // ⚠️ 刻意**不抛错**。此前这里 throw，导致 useEffect 里的 fetch 全部失败，
-  // 页面直接渲染"无法连接后端"整屏错误 —— 而后端其实好好的，只是没配凭据。
-  // 正确做法：照常发请求（不带凭据），让后端返回权威的 503/401 与处置建议，
-  // 再由 <ApiState> 把那句建议原样呈现给用户。
-  // 带错 token 会被后端 401，不会静默放行，所以这里省掉 header 是安全的。
-  // 不带 Content-Type：GET 请求加 application/json 会触发 CORS 预检。
-  return ADMIN_TOKEN ? { "x-admin-token": ADMIN_TOKEN } : {};
+let runtimePromise: Promise<RuntimeInfo> | null = null;
+
+function isTauriRuntime(): boolean {
+  return (
+    typeof window !== "undefined" && "__TAURI_INTERNALS__" in (window as object)
+  );
+}
+
+async function resolveRuntime(): Promise<RuntimeInfo> {
+  if (runtimePromise) return runtimePromise;
+  runtimePromise = (async (): Promise<RuntimeInfo> => {
+    if (!isTauriRuntime()) {
+      return { base: ENV_API_BASE, token: ENV_ADMIN_TOKEN };
+    }
+    try {
+      const { invoke } = await import("@tauri-apps/api/core");
+      const [port, token] = await Promise.all([
+        invoke<number>("get_backend_port"),
+        invoke<string>("get_admin_token"),
+      ]);
+      if (typeof port === "number" && port > 0) {
+        return { base: `http://127.0.0.1:${port}`, token: token || "" };
+      }
+      return { base: ENV_API_BASE, token: ENV_ADMIN_TOKEN };
+    } catch {
+      // 壳命令不可用（例如纯浏览器访问 build 产物）→ 退回构建期配置
+      return { base: ENV_API_BASE, token: ENV_ADMIN_TOKEN };
+    }
+  })();
+  return runtimePromise;
+}
+
+/** 网络层失败（后端重启/换端口）后调用：下次请求重新解析地址与令牌。 */
+export function invalidateRuntime(): void {
+  runtimePromise = null;
+}
+
+/** 是否已有管理凭据（仅用于界面提示，不阻断请求）。 */
+export function hasAdminToken(): boolean {
+  // 桌面版令牌由 Tauri 壳在运行时注入，必然存在
+  return Boolean(ENV_ADMIN_TOKEN) || isTauriRuntime();
+}
+
+/** 真实探测后端健康（Sidebar 状态灯用；非 Tauri 与 Tauri 走同一解析）。 */
+export async function pingHealth(): Promise<boolean> {
+  try {
+    const rt = await resolveRuntime();
+    const res = await fetch(`${rt.base}/api/health`, { cache: "no-store" });
+    return res.ok;
+  } catch {
+    return false;
+  }
 }
 
 /** 结构化 API 错误：带状态码、后端 detail 与可执行建议。 */
@@ -99,12 +144,13 @@ async function api<T>(
   init: RequestInit & { json?: unknown } = {},
 ): Promise<T> {
   const { json, ...rest } = init;
+  const rt = await resolveRuntime();
   let res: Response;
   try {
-    res = await fetch(`${API_BASE}${path}`, {
+    res = await fetch(`${rt.base}${path}`, {
       ...rest,
       headers: {
-        ...authHeaders(),
+        ...(rt.token ? { "x-admin-token": rt.token } : {}),
         ...(json !== undefined ? { "Content-Type": "application/json" } : {}),
         ...(rest.headers as Record<string, string> | undefined),
       },
@@ -112,7 +158,9 @@ async function api<T>(
       cache: "no-store",
     });
   } catch (e) {
-    // fetch 本身抛错 = 网络层不可达（后端没起/端口不对/CORS）
+    // fetch 本身抛错 = 网络层不可达（后端没起/端口不对/CORS）。
+    // 后端可能正在重启或换了端口 → 让下次请求重新解析运行时地址。
+    invalidateRuntime();
     throw new ApiError(0, (e as Error).message || "网络请求失败");
   }
   return unwrap<T>(res);
@@ -120,15 +168,17 @@ async function api<T>(
 
 /** 拿原始 Response（下载类接口），失败同样转 ApiError。 */
 async function apiRaw(path: string): Promise<Response> {
+  const rt = await resolveRuntime();
   try {
-    const res = await fetch(`${API_BASE}${path}`, {
-      headers: authHeaders(),
+    const res = await fetch(`${rt.base}${path}`, {
+      headers: rt.token ? { "x-admin-token": rt.token } : {},
       cache: "no-store",
     });
     if (!res.ok) await unwrap(res);
     return res;
   } catch (e) {
     if (e instanceof ApiError) throw e;
+    invalidateRuntime();
     throw new ApiError(0, (e as Error).message || "网络请求失败");
   }
 }
@@ -552,19 +602,21 @@ export async function subscribeSSE(
   }
 
   let res: Response;
+  const rt = await resolveRuntime();
   try {
-    res = await fetch(`${API_BASE}${path}`, {
+    res = await fetch(`${rt.base}${path}`, {
       method: opts.method ?? "GET",
       headers: {
-        ...authHeaders(),
+        ...(rt.token ? { "x-admin-token": rt.token } : {}),
         ...(opts.body ? { "Content-Type": "application/json" } : {}),
-    },
-    body: opts.body ? JSON.stringify(opts.body) : undefined,
+      },
+      body: opts.body ? JSON.stringify(opts.body) : undefined,
       signal: controller.signal,
       cache: "no-store",
     });
   } catch (e) {
     // 网络层不可达：让调用方按 ApiError 处理，不要伪装成"SSE 连接失败"
+    invalidateRuntime();
     throw new ApiError(0, (e as Error).message || "SSE 网络请求失败");
   }
 
@@ -677,4 +729,40 @@ export async function previewPersona(
       lorebook_block: lorebookBlock,
     },
   });
+}
+
+// ── 模型接入状态（/setup 页）──
+
+export interface CloudPreset {
+  id: string;
+  label: string;
+  tag: string;
+  provider: string;
+  model: string;
+  base_url: string;
+  env: Record<string, string>;
+  key_page: string;
+}
+
+export interface SetupStatus {
+  llm: {
+    provider: string;
+    model: string;
+    base_url: string | null;
+    api_key_configured: boolean;
+    ready: boolean;
+  };
+  ollama: {
+    reachable: boolean;
+    base_url: string;
+    models: string[];
+    install_url: string;
+    pull_hint: string;
+  };
+  cloud_presets: CloudPreset[];
+  env_file_hint: string;
+}
+
+export async function fetchSetupStatus(): Promise<SetupStatus> {
+  return api<SetupStatus>("/api/setup/status");
 }
