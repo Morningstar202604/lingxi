@@ -132,6 +132,126 @@ class TestModelNameResolution:
         )
 
 
+class TestBaseUrlNormalization:
+    """base_url 必须按 provider 归一化。
+
+    实测（2026-10-14）：litellm 的 ollama 走原生 API（/api/chat），
+    默认 base_url 带 OpenAI 兼容的 /v1 时**每次调用都 404**
+    （`OllamaException - 404 page not found`）——而配置默认值恰好是
+    `http://127.0.0.1:11434/v1`，README 承诺的零配置路径实际跑不通。
+    归一化层去掉该后缀，用户环境变量里写好的 /v1 也一并纠正。
+    """
+
+    def test_ollama_v1_suffix_stripped(self) -> None:
+        from lingxi.agent.llm import resolve_base_url
+
+        assert resolve_base_url("ollama", "http://127.0.0.1:11434/v1") == (
+            "http://127.0.0.1:11434"
+        )
+
+    def test_ollama_trailing_slash_tolerated(self) -> None:
+        from lingxi.agent.llm import resolve_base_url
+
+        assert resolve_base_url("ollama", "http://127.0.0.1:11434/v1/") == (
+            "http://127.0.0.1:11434"
+        )
+
+    def test_ollama_native_url_unchanged(self) -> None:
+        from lingxi.agent.llm import resolve_base_url
+
+        assert resolve_base_url("ollama", "http://127.0.0.1:11434") == (
+            "http://127.0.0.1:11434"
+        )
+
+    def test_openai_compatible_keeps_v1(self) -> None:
+        """OpenAI 兼容端点要求 /v1，不能被误删。"""
+        from lingxi.agent.llm import resolve_base_url
+
+        assert resolve_base_url("openai", "https://api.deepseek.com/v1") == (
+            "https://api.deepseek.com/v1"
+        )
+
+    def test_none_passthrough(self) -> None:
+        from lingxi.agent.llm import resolve_base_url
+
+        assert resolve_base_url("ollama", None) is None
+
+    @pytest.mark.asyncio
+    async def test_call_llm_sends_normalized_base_url(self, no_fallback: None) -> None:
+        """端到端：默认配置（带 /v1）传给 litellm 时已被去掉。"""
+        from lingxi.agent.llm import call_llm
+
+        seen: dict[str, Any] = {}
+
+        async def capture(**kw: Any) -> Any:
+            seen.update(kw)
+            return _resp("好")
+
+        with patch("litellm.acompletion", new=AsyncMock(side_effect=capture)):
+            await call_llm([{"role": "user", "content": "hi"}])
+
+        base = seen.get("base_url") or ""
+        assert not base.endswith("/v1"), (
+            f"ollama 的 base_url 带着 /v1 传给 litellm 必 404: {base!r}"
+        )
+
+
+class TestJsonMode:
+    """无工具时下发 response_format（结构化输出走官方参数，不靠手搓解析）。"""
+
+    @pytest.mark.asyncio
+    async def test_json_mode_sets_response_format(self, no_fallback: None) -> None:
+        from lingxi.agent.llm import call_llm
+
+        seen: dict[str, Any] = {}
+
+        async def capture(**kw: Any) -> Any:
+            seen.update(kw)
+            return _resp('{"answer": "好"}')
+
+        with patch("litellm.acompletion", new=AsyncMock(side_effect=capture)):
+            await call_llm([{"role": "user", "content": "hi"}], json_mode=True)
+
+        assert seen.get("response_format") == {"type": "json_object"}
+
+    @pytest.mark.asyncio
+    async def test_tools_take_precedence_over_json_mode(self, no_fallback: None) -> None:
+        """带工具时走 function calling，不同时下发 json 约束。"""
+        from lingxi.agent.llm import call_llm
+
+        seen: dict[str, Any] = {}
+
+        async def capture(**kw: Any) -> Any:
+            seen.update(kw)
+            return _resp("好")
+
+        tools = [{"type": "function", "function": {"name": "noop", "parameters": {}}}]
+        with patch("litellm.acompletion", new=AsyncMock(side_effect=capture)):
+            await call_llm(
+                [{"role": "user", "content": "hi"}], tools=tools, json_mode=True
+            )
+
+        assert "response_format" not in seen, (
+            "tools= 与 response_format 同时下发会被部分 provider 拒绝"
+        )
+        assert seen.get("tool_choice") == "auto"
+
+    @pytest.mark.asyncio
+    async def test_json_mode_off_by_default(self, no_fallback: None) -> None:
+        from lingxi.agent.llm import call_llm
+
+        seen: dict[str, Any] = {}
+
+        async def capture(**kw: Any) -> Any:
+            seen.update(kw)
+            return _resp("好")
+
+        with patch("litellm.acompletion", new=AsyncMock(side_effect=capture)):
+            await call_llm([{"role": "user", "content": "hi"}])
+
+        assert "response_format" not in seen
+
+
 # ── 2. 失败必须是可见事件，而不是空流 ──
 
 

@@ -370,21 +370,26 @@ class TestTrueStreaming:
 
     @pytest.mark.asyncio
     async def test_stream_errors_become_events(self) -> None:
-        """流式异常必须转成事件，不能把连接炸掉。"""
+        """流式异常必须转成事件，不能把连接炸掉。
+
+        此前这个测试**没有真的注入异常**（gen 定义了却从未使用），
+        实际靠"本地 Ollama base_url 带 /v1 必 404"这个 bug 来触发 error —
+        等于用环境缺陷冒充行为验证：bug 一修（llm.resolve_base_url 归一化），
+        测试立刻失败。现在显式 patch acompletion 抛错。
+        """
         from lingxi.agent.llm import stream_llm
 
-        async def gen(**kw: Any) -> Any:
+        async def boom(**kw: Any) -> Any:
             raise RuntimeError("stream broke")
-            yield  # pragma: no cover
 
-        # 直接测试 stream_llm，禁用 fallback
         settings = get_settings()
         old_fallback = settings.llm.fallback_models
         settings.llm.fallback_models = []
         try:
-            events = [
-                e async for e in stream_llm([{"role": "user", "content": "hi"}])
-            ]
+            with patch("litellm.acompletion", new=AsyncMock(side_effect=boom)):
+                events = [
+                    e async for e in stream_llm([{"role": "user", "content": "hi"}])
+                ]
         finally:
             settings.llm.fallback_models = old_fallback
 

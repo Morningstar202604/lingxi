@@ -108,6 +108,34 @@ def resolve_model_name(provider: str, model: str) -> str:
     return model
 
 
+# 各 provider 的 base_url 归一化规则。
+#
+# 背景（实测 2026-10-14）：litellm 的 ollama 走**原生 API**（/api/chat），
+# 默认 base_url 若带 OpenAI 兼容的 /v1 后缀，每次调用都是
+# `APIConnectionError: OllamaException - 404 page not found`。
+# README 承诺"装好 Ollama 即默认配置可用"，而默认 base_url 恰好是
+# `http://127.0.0.1:11434/v1` —— 零配置路径实际跑不通（本地实测复现）。
+#
+# 处理方式：在归一化层按 provider 去掉该后缀，而不是改配置默认值 ——
+# 用户环境变量里已经写好的 /v1 也一并纠正，不需要用户改配置。
+_STRIP_V1_PROVIDERS = frozenset({"ollama"})
+
+
+def resolve_base_url(provider: str, base_url: str | None) -> str | None:
+    """按 provider 归一化 base_url（官方客户端要求的形态）。
+
+    - ollama：litellm 走原生 API，去掉尾部的 /v1（带它必 404）
+    - 其余 provider：原样返回（OpenAI 兼容端点通常就要求 /v1）
+    """
+    if not base_url:
+        return base_url
+    if provider in _STRIP_V1_PROVIDERS:
+        trimmed = base_url.rstrip("/")
+        if trimmed.endswith("/v1"):
+            return trimmed[:-3]
+    return base_url
+
+
 class TokenUsage:
     """一次或多次 LLM 调用的 token 累计。"""
 
@@ -170,6 +198,7 @@ async def call_llm(
     messages: list[dict[str, Any]],
     *,
     tools: list[dict[str, Any]] | None = None,
+    json_mode: bool = False,
     usage: TokenUsage | None = None,
 ) -> Any:
     """带重试 + 多模型降级的 LLM 调用。失败抛 LLMCallError。
@@ -179,6 +208,10 @@ async def call_llm(
     Args:
         messages: 完整消息历史
         tools: OpenAI function-calling 工具清单（None = 不带工具）
+        json_mode: True 时下发 response_format={"type": "json_object"}，
+            让服务端保证输出是合法 JSON（litellm 官方参数，各 provider 声明
+            支持）。仅在**无工具**时生效：带 tools= 时模型走 function calling，
+            两个约束同时下发会被部分 provider 拒绝。
         usage: 可选的 token 计量累加器
 
     Returns:
@@ -208,12 +241,17 @@ async def call_llm(
             "temperature": llm_cfg.temperature,
             "max_tokens": llm_cfg.max_tokens,
             "api_key": llm_cfg.api_key.get_secret_value() if llm_cfg.api_key else None,
-            "base_url": llm_cfg.base_url,
+            # provider 归一化：ollama 必须去掉 /v1（litellm 走原生 API，带它必 404）
+            "base_url": resolve_base_url(llm_cfg.provider, llm_cfg.base_url),
             "timeout": 30,
         }
         if tools:
             kwargs["tools"] = tools
             kwargs["tool_choice"] = "auto"
+        elif json_mode:
+            # 无工具时的结构化输出：让服务端保证 JSON 合法性，
+            # 把"围栏/散文混排"的解析负担交还给 provider（llm_json 只兜底）
+            kwargs["response_format"] = {"type": "json_object"}
 
         last_error: BaseException | None = None
         for attempt in range(retries + 1):
@@ -396,7 +434,8 @@ async def stream_llm(
             "temperature": llm_cfg.temperature,
             "max_tokens": llm_cfg.max_tokens,
             "api_key": llm_cfg.api_key.get_secret_value() if llm_cfg.api_key else None,
-            "base_url": llm_cfg.base_url,
+            # provider 归一化：ollama 必须去掉 /v1（litellm 走原生 API，带它必 404）
+            "base_url": resolve_base_url(llm_cfg.provider, llm_cfg.base_url),
             "timeout": 30,
             "stream": True,
         }

@@ -118,6 +118,9 @@ async def reason_node(
         response = await call_llm(
             state["messages"],
             tools=tool_schemas,
+            # 无工具时要求服务端返回合法 JSON（结构化输出）。
+            # 有工具时模型走 function calling，不再叠加 json 约束。
+            json_mode=not tool_schemas,
             usage=usage,
         )
     except LLMCallError as e:
