@@ -59,6 +59,15 @@
 - **坐席路由无鉴权**（挂载后才暴露）→ router 级依赖
 - **图谱双向遍历断裂**（`add_relation` 只登记 `_adj[source]`）→ 邻接表双向登记
 
+### 2026-10-14 打磨轮修掉的缺陷
+
+| # | 问题 | 现状 |
+|---|---|---|
+| 1 | **本地模型零配置路径实际不可用**：默认 `base_url` 带 `/v1`，而 litellm 的 ollama 走原生 API（`/api/chat`），每次调用 `404 page not found` —— README 承诺的"装好 Ollama 即用"是坏的（本地实测复现） | ✅ 归一化层按 provider 去 `/v1`（`llm.resolve_base_url`），用户已写好的 `/v1` 也一并纠正 |
+| 2 | 结构化输出缺失：无工具时靠手搓解析模型散文 | ✅ 接入 litellm 官方 `response_format={"type":"json_object"}`（`json_mode`），各 provider 声明支持；解析器降为兜底 |
+| 3 | `test_stream_errors_become_events` 是假测试：没真注入异常，靠上述 bug 触发 error | ✅ 改为真正 patch `acompletion` 抛错 |
+| 4 | 后端 4 组管理端点（审批/坐席/规则/工作流）控制台零消费 —— README 承诺"控制台 /api/approvals 看待审批清单"但无页面 | ✅ 新增审批 / 坐席 / 规则 / 工作流 4 页，导航补齐 |
+
 ### Agent 运行时能力（2026-10-12 第二轮补齐）
 
 工具调用链路接通后仍实测出 7 个缺口，全部已修并被 `tests/test_agent_runtime.py`（26 条）锁住：
