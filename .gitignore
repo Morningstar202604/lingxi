@@ -64,3 +64,7 @@ build/lingxi-server.spec
 
 # Screenshots (verification artifacts)
 screenshots/
+
+# litellm 官方响应缓存（diskcache 后端，本地产物不入库）
+.litellm_cache/
+.test_litellm_cache/

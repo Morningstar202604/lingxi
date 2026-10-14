@@ -131,6 +131,41 @@ class LLMConfig(BaseModel):
     ])
 
 
+class LLMCacheConfig(BaseModel):
+    """LLM 响应缓存（litellm 官方 cache）。
+
+    🔗 工程逻辑
+        相同 prompt 短时间内重复调用（重试、多用户问同样的问题、
+        开发期反复调试）直接命中缓存，省 token 也省延迟。
+        本地模型（ollama）收益最大：磁盘换 CPU。
+
+    默认 disk 后端（零外部依赖）；有 Redis 时切 redis（多进程共享）。
+    """
+
+    enabled: bool = False
+    backend: Literal["disk", "redis"] = "disk"
+    ttl_seconds: int = 3600
+    disk_dir: str = ".litellm_cache"
+    redis_host: str = "127.0.0.1"
+    redis_port: int = 6379
+
+
+class RateLimitConfig(BaseModel):
+    """HTTP 限流（slowapi 官方库）。
+
+    🔗 工程逻辑
+        只限制"重"端点（LLM 推理 / 知识库写入），读类轮询端点不限 ——
+        否则界面自己 3 秒一次的轮询就会把额度用光。
+
+    额度按"单人正常操作上限"给：heavy=30/分钟 意味着一个用户最快
+    30 次/分钟的推理请求也够用（真实对话远低于此），而脚本刷会被挡住。
+    """
+
+    enabled: bool = True
+    heavy: str = "30/minute"
+    light: str = "120/minute"
+
+
 class EmbeddingConfig(BaseModel):
     """Embedding 向量配置 (用于 RAG 知识库)。"""
 
@@ -364,6 +399,8 @@ class Settings(BaseSettings):
     onebot: OneBotConfig = Field(default_factory=OneBotConfig)
     gewechat: GewechatConfig = Field(default_factory=GewechatConfig)
     llm: LLMConfig = Field(default_factory=LLMConfig)
+    llm_cache: LLMCacheConfig = Field(default_factory=LLMCacheConfig)
+    ratelimit: RateLimitConfig = Field(default_factory=RateLimitConfig)
     memory: MemoryConfig = Field(default_factory=MemoryConfig)
     agent: AgentConfig = Field(default_factory=AgentConfig)
     security: SecurityConfig = Field(default_factory=SecurityConfig)

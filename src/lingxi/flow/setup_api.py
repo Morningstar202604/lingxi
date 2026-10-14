@@ -143,6 +143,16 @@ def register_setup_routes(
         ollama = _probe_cache["ollama"]
 
         ready = api_key_configured or (llm.provider == "ollama" and ollama["reachable"])
+        # 推荐策略：线上 API 优先（质量与稳定性都更好），本地模型作为可选。
+        # 前端据此决定引导文案；不替用户做决定，只标注推荐。
+        if api_key_configured and llm.provider != "ollama":
+            mode = "cloud"          # 已按推荐方式配置
+        elif llm.provider == "ollama" and ollama["reachable"]:
+            mode = "local_ready"    # 本地可用，但建议考虑云端
+        elif api_key_configured:
+            mode = "cloud"
+        else:
+            mode = "unconfigured"   # 什么都没配 → 首要引导配云端
         return {
             "llm": {
                 "provider": llm.provider,
@@ -150,6 +160,15 @@ def register_setup_routes(
                 "base_url": llm.base_url,
                 "api_key_configured": api_key_configured,
                 "ready": ready,
+                "mode": mode,
+            },
+            "recommendation": {
+                "primary": "cloud",
+                "text": (
+                    "推荐使用云端 API：回答质量更高、免下载、按量计费成本低。"
+                    "本地模型（Ollama）完全可选 —— 不安装不影响使用，"
+                    "需要离线/隐私场景时再装。"
+                ),
             },
             "ollama": {
                 **ollama,

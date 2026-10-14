@@ -116,6 +116,71 @@ class MetricsCollector:
             registry=self._registry,
         )
 
+        # ── LLM 调用指标（由 litellm 官方 callback 驱动，见 agent/llm_observability.py）──
+        self.llm_tokens_total = Counter(
+            "zhixi_llm_tokens_total",
+            "LLM token 消耗（按 provider/model/类型分类）",
+            ["provider", "model", "kind"],  # kind: prompt/completion
+            registry=self._registry,
+        )
+        self.llm_cost_usd_total = Counter(
+            "zhixi_llm_cost_usd_total",
+            "LLM 累计成本（美元，litellm 内置价格表推算）",
+            ["provider", "model"],
+            registry=self._registry,
+        )
+        self.llm_requests_total = Counter(
+            "zhixi_llm_requests_total",
+            "LLM 调用次数（success/failure）",
+            ["provider", "model", "status"],
+            registry=self._registry,
+        )
+        self.llm_latency_seconds = Histogram(
+            "zhixi_llm_latency_seconds",
+            "LLM 端到端延迟",
+            ["provider", "model"],
+            buckets=[0.2, 0.5, 1.0, 2.0, 5.0, 10.0, 20.0, 40.0],
+            registry=self._registry,
+        )
+        self.llm_cache_hits_total = Counter(
+            "zhixi_llm_cache_hits_total",
+            "LLM 缓存命中次数（litellm 官方 cache）",
+            ["provider", "model"],
+            registry=self._registry,
+        )
+
+    # ── LLM 记录入口（litellm callback / call_llm 共用）──
+
+    def record_llm_success(
+        self,
+        *,
+        provider: str,
+        model: str,
+        prompt_tokens: int = 0,
+        completion_tokens: int = 0,
+        cost_usd: float = 0.0,
+        duration: float = 0.0,
+        cache_hit: bool = False,
+    ) -> None:
+        if self._noop:
+            return
+        self.llm_requests_total.labels(provider=provider, model=model, status="success").inc()
+        if prompt_tokens:
+            self.llm_tokens_total.labels(provider=provider, model=model, kind="prompt").inc(prompt_tokens)
+        if completion_tokens:
+            self.llm_tokens_total.labels(provider=provider, model=model, kind="completion").inc(completion_tokens)
+        if cost_usd:
+            self.llm_cost_usd_total.labels(provider=provider, model=model).inc(cost_usd)
+        if duration:
+            self.llm_latency_seconds.labels(provider=provider, model=model).observe(duration)
+        if cache_hit:
+            self.llm_cache_hits_total.labels(provider=provider, model=model).inc()
+
+    def record_llm_failure(self, *, provider: str, model: str) -> None:
+        if self._noop:
+            return
+        self.llm_requests_total.labels(provider=provider, model=model, status="failure").inc()
+
     def record_http_request(self, method: str, endpoint: str, status: int, duration: float) -> None:
         """记录 HTTP 请求。"""
         if self._noop:

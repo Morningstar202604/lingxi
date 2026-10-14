@@ -40,11 +40,15 @@ dependencies = [
     # knowledge/vector_store.py:214 向量库；__main__.py:213 默认装配 KnowledgeService
     "chromadb>=0.5.0",
     # ── LLM 路由 ──
-    "litellm>=1.52.0",
+    # litellm[caching]：官方 disk/redis 缓存 extra（缺 diskcache 时
+    # litellm.cache 装配会被拒，见 llm_observability 的 warning）
+    "litellm[caching]>=1.52.0",
     # ── 日志 ──
     "structlog>=24.4.0",
     # ── 指标 ──
     "prometheus-client>=0.21.0",
+    # ── 限流（官方库，替代手搓的请求计数）──
+    "slowapi>=0.1.9",
 ]
 
 [project.optional-dependencies]

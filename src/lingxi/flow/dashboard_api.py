@@ -96,6 +96,55 @@ def _install_cors(app: FastAPI) -> None:
         log.info("cors_disabled")
 
 
+def _install_rate_limit(app: FastAPI) -> Any:
+    """限流（slowapi 官方库）。返回 limiter 实例（未启用/未安装时 None）。
+
+    🔗 工程逻辑
+        LLM 推理端点（/api/stream/chat、/api/persona/preview）与知识库写入
+        （upload/reset）是"重"端点：被脚本刷会烧 token / 占磁盘。
+        读类端点（界面每 3-5s 轮询）**不限制** —— 否则正常使用就会限住自己。
+
+        默认额度按"单人正常操作上限"给，可用环境变量覆盖：
+            LINGXI_RATELIMIT__ENABLED=false
+            LINGXI_RATELIMIT__HEAVY=30/minute
+
+    🤖 AI 避坑
+        slowapi 的 key 默认取 remote address：本机部署下所有请求同 IP，
+        额度要按"整机"估算，不能按"每用户"给太小。
+    """
+    settings = get_settings()
+    rl = getattr(settings, "ratelimit", None)
+    if rl is None or not getattr(rl, "enabled", False):
+        log.info("rate_limit_disabled")
+        return None
+    try:
+        from slowapi import Limiter, _rate_limit_exceeded_handler
+        from slowapi.errors import RateLimitExceeded
+        from slowapi.util import get_remote_address
+
+        limiter = Limiter(
+            key_func=get_remote_address,
+            default_limits=[],  # 不给全局限额：轮询端点必须畅通
+            # headers_enabled=False：slowapi 开启它后会要求被装饰端点返回
+            # Response 实例，而我们的端点返回 dict（FastAPI 自动序列化）——
+            # 开启即 500（实测：X-RateLimit-* 头把正常响应变成异常）。
+            # 限流本身不依赖响应头，关掉即可。
+            headers_enabled=False,
+        )
+        app.state.limiter = limiter
+        # slowapi 的 handler 签名是 (Request, RateLimitExceeded)，Starlette 声明的是
+        # (Request, Exception) —— 运行时完全兼容（slowapi 官方 README 就这么写），
+        # 只是类型标注窄了，故 ignore。
+        app.add_exception_handler(
+            RateLimitExceeded, _rate_limit_exceeded_handler  # type: ignore[arg-type]
+        )
+        log.info("rate_limit_installed", heavy=rl.heavy)
+        return limiter
+    except ImportError:
+        log.warning("rate_limit_unavailable", hint="pip install slowapi")
+        return None
+
+
 def create_dashboard_app(
     ticket_store: Any,  # TicketStore | PersistentTicketStore
     queue: Any,  # EscalationQueue | PersistentEscalationQueue
@@ -121,8 +170,20 @@ def create_dashboard_app(
 
     _install_cors(app)
 
-    # ── Prometheus 中间件 (自动记录所有 HTTP 请求) ──
+    # ── 限流（slowapi 官方库，替代手搓计数）──
+    # 只挂"重"端点：LLM 推理与知识库写入会被滥用者拿来烧 token/磁盘。
     settings = get_settings()
+    _limiter = _install_rate_limit(app)
+
+    def _heavy_limit(fn: Any) -> Any:
+        """给重端点加限流装饰器；未启用限流时原样返回。"""
+        if _limiter is None:
+            return fn
+        rl = getattr(settings, "ratelimit", None)
+        quota = str(getattr(rl, "heavy", "30/minute")) if rl else "30/minute"
+        return _limiter.limit(quota)(fn)
+
+    # ── Prometheus 中间件 (自动记录所有 HTTP 请求) ──
     if settings.metrics.enabled:
         from lingxi.metrics.middleware import PrometheusMiddleware
         app.add_middleware(PrometheusMiddleware)
@@ -443,7 +504,9 @@ def create_dashboard_app(
             return docs
 
         @app.post("/api/knowledge/upload")
+        @_heavy_limit
         async def upload_knowledge(
+            request: Request,
             body: dict[str, Any],
             x_admin_token: str | None = Header(None),
         ) -> dict[str, Any]:
@@ -479,7 +542,9 @@ def create_dashboard_app(
             return {"deleted_chunks": count, "doc_id": doc_id}
 
         @app.post("/api/knowledge/reset")
+        @_heavy_limit
         async def reset_knowledge(
+            request: Request,
             x_admin_token: str | None = Header(None),
         ) -> dict[str, str]:
             _check_admin(x_admin_token)
@@ -576,7 +641,9 @@ def create_dashboard_app(
         }
 
     @app.post("/api/persona/preview")
+    @_heavy_limit
     async def preview_persona(
+        request: Request,
         body: dict[str, Any],
         x_admin_token: str | None = Header(None),
     ) -> dict[str, Any]:
@@ -765,6 +832,7 @@ def create_dashboard_app(
         from lingxi.streaming import stream_agent_events
 
         @app.post("/api/stream/chat", response_class=EventSourceResponse)
+        @_heavy_limit
         async def stream_chat(
             request: Request,
             x_admin_token: str | None = Header(None),

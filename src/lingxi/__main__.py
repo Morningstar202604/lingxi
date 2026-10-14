@@ -790,6 +790,12 @@ def main(argv: list[str] | None = None) -> None:
     settings = get_settings()
     configure_logging("DEBUG" if settings.debug else settings.log_level)
 
+    # LLM 可观测性 + 缓存（litellm 官方 callback / Cache）：
+    # 放在建引擎之前，保证第一条消息就带 token/成本指标。
+    from lingxi.agent.llm_observability import setup_llm_observability
+
+    setup_llm_observability(settings)
+
     # ── 持久化判断: CLI 参数 > settings 默认值 ──
     persistent = settings.memory.persistent
     if args.persistent is True:
