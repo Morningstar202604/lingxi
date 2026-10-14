@@ -306,9 +306,9 @@ lingxi/
 ```
 Layer 0 ✅ 基础地基 (pyproject + 协议 + 日志 + 配置)          → 19 tests
 Layer 1 ✅ IM 桥接   (NapCat + Gewechat + 统一 IMEvent)      → 18 tests
-Layer 2 ✅ 人格引擎  (13 模块 + 注入管线 + 护栏 + 权限解析)    → 37 tests
+Layer 2 ✅ 人格引擎  (13 模块 + 注入管线 + 护栏 + 权限解析)    → 47 tests
 Layer 3 ✅ 记忆系统  (5 段式 + Lorebook + 实体图谱 + 混合召回) → 32 tests
-Layer 4 ✅ Agent 编排 (LangGraph ReAct + 工具调用 + 分级权限) → 66 tests
+Layer 4 ✅ Agent 编排 (LangGraph ReAct + 工具调用 + 分级权限) → 79 tests
 Layer 5 ✅ 业务管线  (工单/队列/规则/SLA/审计 + 坐席 + 工作流) → 37 tests
 Layer 6 ✅ 控制台    (Next.js 10 routes + echarts 可视化)     → 10 tests
 
@@ -327,12 +327,13 @@ v0.2.0 横切模块:
 
 | 门禁 | 命令 | 当前状态 |
 |---|---|---|
-| 测试 | `pytest tests/ -q` | ✅ **648 passed** |
+| 测试 | `pytest tests/ -q` | ✅ **750 passed** |
 | Lint | `ruff check src tests` | ✅ All checks passed |
-| 类型 | `mypy src`（strict） | ✅ no issues found in 76 source files |
+| 类型 | `mypy src`（strict） | ✅ no issues found in 81 source files |
 | 前端类型 | `cd web && npx tsc --noEmit` | ✅ exit 0 |
-| 前端构建 | `cd web && npm run build` | ✅ Compiled successfully，12 routes |
-| **真实启动** | `python -m lingxi` + 拉 `/openapi.json` | ✅ **挂载 50 条路由** |
+| 前端 Lint | `cd web && npx next lint` | ✅ No ESLint warnings or errors |
+| 前端构建 | `cd web && npm run build` | ✅ Compiled successfully，11 页面静态导出 |
+| **真实启动** | `python -m lingxi` + 拉 `/openapi.json` | ✅ **挂载 54 条路由**（端口被占自动顺延） |
 | **鉴权探测** | 无 token 打管理面 / 带 token 打管理面 | ✅ 前者 401/503，后者全 200 |
 | 强制点 | `pre-commit run --all-files` | ✅ hooks Passed |
 

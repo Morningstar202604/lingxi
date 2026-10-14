@@ -3,16 +3,27 @@
 > 智辨已知，犀照善为。二十四小时在线的数字员工，通心、知事、善为。
 
 > **⚠️ 本文档是设计蓝图，不是现状说明书。**
-> 下文「复用清单」「分层路线图」描述的是**目标态**。截至 2026-10-12 的实现状态见
-> `README.md` 的「实现状态」节与 `AUDIT-2026-10-12.md`，其中两点仍是规划项：
-> **Mem0 / Neo4j 零实现**（第 35、48、49 行为规划；当前记忆是内置 SQLite 管线 +
-> 字符级 n-gram + 实体图谱混合召回，图谱是 InMemoryGraphStore）；
-> **MCP 只实现 tools 一个原语**（第 46 行的「三原语」未达成）。
+> 下文「复用清单」「分层积木路线图」描述的是**目标态**；实现状态以
+> `README.md` 的「实现状态」节为准。
 >
-> 已达成（2026-10-12 一轮修复）：
-> **Agent 工具调用链路已接通**（第 47 行的 LangGraph ReAct 现在真实下发 `tools=`）；
-> **分级权限已按用户/会话给到**（`security.permission_rules` + `resolve_permission_level`）。
-> 请以 README 的实现状态为准判断"现在能跑什么"。
+> **2026-10-14 路线图对账**（全部 Node 已落地）：
+> - 蓝图列出的规划项已全部实现：**Mem0**（语义抽取+向量召回，`mem0.enabled`）、
+>   **Neo4j**（双向邻居图谱，`neo4j.enabled`）、**MCP 三原语**（tools/resources/prompts）、
+>   Agent 工具调用链路、按用户/会话的分级权限
+> - Node 3.1「mem0_pipeline」的实现落在 `memory/mem0_backend.py`（另有内置
+>   SQLite 管线作为零依赖默认后端，两者同一行为面，工厂切换）
+> - Node 3.3「graph_store」现有四套实现：InMemory / SQLite / Neo4j（+ Mem0 内置图谱）
+>
+> **偏差与决策**（有意的，不再列为"待办"）：
+> - **Redis → PostgreSQL**：BLUEPRINT 曾写"多进程前必须换 Redis"。现在
+>   `persistence.backend=postgresql` 提供同语义的原子认领
+>   （`FOR UPDATE SKIP LOCKED`）+ 连接池，多进程/多实例共享一个 PG 即可，
+>   **不引入 Redis**（少一个运维组件，队列规模也远未到需要专门 MQ）
+> - **NetworkX → 移除**：图查询由 SQLite/Neo4j 后端承担，networkx 全仓零引用，
+>   已从依赖中移除（需要图算法时再引入）
+> - **shadcn/ui → 自写 Tailwind 组件**：控制台 30 个源文件、样式约定统一，
+>   引入组件库的迁移成本大于收益
+> - **ngrok**：开发期隧道，非交付物，不实现
 
 ---
 
@@ -49,7 +60,7 @@
 | 工具协议 | **MCP** (Model Context Protocol) | 工具注册/调用/资源/提示词 三原语 |
 | Agent 编排 | **LangGraph** | 有向图状态机 + Checkpoint + 人工介入 |
 | 长期记忆 | **Mem0** | 编码→存储→检索→更新→遗忘 全流水线 |
-| 知识图谱 | **Neo4j** (或 NetworkX 起步) | 实体-关系-事实结构化存储 |
+| 知识图谱 | **Neo4j**（可选用；默认 SQLite 实现零运维） | 实体-关系-事实结构化存储 |
 | 多模型路由 | **LiteLLM** | OpenAI/Anthropic/DeepSeek/Ollama 一行切换 |
 | 角色卡标准 | **SillyTavern Character Card V3** | PNG 嵌入元数据、单文件携带人格 |
 | 人格引擎 | **Hermes Persona 13 模块** | 时间感知/对话阶段/关键词变体/情绪向量/固定信号... |
