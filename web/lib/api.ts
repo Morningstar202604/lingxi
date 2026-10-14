@@ -15,41 +15,64 @@ const ENV_ADMIN_TOKEN = process.env.NEXT_PUBLIC_ADMIN_TOKEN || "";
 //
 // 地址与凭据在**运行时**解析：
 // - 浏览器（dev/部署）：NEXT_PUBLIC_API_BASE / NEXT_PUBLIC_ADMIN_TOKEN 兜底
-// - Tauri 桌面版：后端端口是动态的（8080 被占会自动顺延），令牌是每次
-//   安装随机生成的 —— 通过 invoke("get_backend_port"/"get_admin_token")
-//   向壳进程要真实值；后端重启换端口后（网络层失败）会重新解析。
+// - Tauri 桌面版：后端作为 sidecar 自动拉起，端口动态（8080 被占会顺延）、
+//   令牌随机生成 —— 通过 invoke("get_engine_endpoint") 拿真实值
+// - Tauri 移动版（Android/iOS）：引擎不跑在手机上，端点由用户在
+//   「引擎设置」页填写（局域网/公网地址），同一命令返回同一结构
+//
+// 网络层失败时会 invalidate，下次请求重新解析（桌面后端重启换端口后自愈）。
 interface RuntimeInfo {
   base: string;
   token: string;
+  /** "local" = 桌面内置 sidecar；"remote" = 用户配置的远程引擎 */
+  mode: "local" | "remote" | "env";
+}
+
+interface EngineEndpointDto {
+  base_url: string;
+  token: string;
+  mode: string;
 }
 
 let runtimePromise: Promise<RuntimeInfo> | null = null;
 
-function isTauriRuntime(): boolean {
+/** 是否运行在 Tauri 壳内（桌面 App / 移动 App）。 */
+export function isTauriRuntime(): boolean {
   return (
     typeof window !== "undefined" && "__TAURI_INTERNALS__" in (window as object)
   );
+}
+
+/** 是否运行在移动端 App（需要用户填引擎地址）。 */
+export function isMobileApp(): boolean {
+  if (!isTauriRuntime()) return false;
+  // Tauri v2 在移动端注入的 UA 特征；也兼容 Capacitor 风格的 platform 标记
+  const ua = typeof navigator !== "undefined" ? navigator.userAgent : "";
+  return /Android|iPhone|iPad|iPod/i.test(ua);
 }
 
 async function resolveRuntime(): Promise<RuntimeInfo> {
   if (runtimePromise) return runtimePromise;
   runtimePromise = (async (): Promise<RuntimeInfo> => {
     if (!isTauriRuntime()) {
-      return { base: ENV_API_BASE, token: ENV_ADMIN_TOKEN };
+      return { base: ENV_API_BASE, token: ENV_ADMIN_TOKEN, mode: "env" };
     }
     try {
       const { invoke } = await import("@tauri-apps/api/core");
-      const [port, token] = await Promise.all([
-        invoke<number>("get_backend_port"),
-        invoke<string>("get_admin_token"),
-      ]);
-      if (typeof port === "number" && port > 0) {
-        return { base: `http://127.0.0.1:${port}`, token: token || "" };
+      const ep = await invoke<EngineEndpointDto | null>("get_engine_endpoint");
+      if (ep && ep.base_url) {
+        return {
+          base: ep.base_url.replace(/\/+$/, ""),
+          token: ep.token || "",
+          mode: ep.mode === "remote" ? "remote" : "local",
+        };
       }
-      return { base: ENV_API_BASE, token: ENV_ADMIN_TOKEN };
+      // 端点未配置：桌面端可能是 sidecar 还在启动中（等下一轮重试），
+      // 移动端是首启（设置页会引导填写）。两种都先退回环境变量兜底。
+      return { base: ENV_API_BASE, token: ENV_ADMIN_TOKEN, mode: "env" };
     } catch {
       // 壳命令不可用（例如纯浏览器访问 build 产物）→ 退回构建期配置
-      return { base: ENV_API_BASE, token: ENV_ADMIN_TOKEN };
+      return { base: ENV_API_BASE, token: ENV_ADMIN_TOKEN, mode: "env" };
     }
   })();
   return runtimePromise;
@@ -62,8 +85,44 @@ export function invalidateRuntime(): void {
 
 /** 是否已有管理凭据（仅用于界面提示，不阻断请求）。 */
 export function hasAdminToken(): boolean {
-  // 桌面版令牌由 Tauri 壳在运行时注入，必然存在
+  // Tauri 运行时凭据由壳注入（桌面 sidecar 令牌 / 移动端用户填写）
   return Boolean(ENV_ADMIN_TOKEN) || isTauriRuntime();
+}
+
+/** 当前引擎端点（设置页展示与修改用）。 */
+export async function getEngineEndpoint(): Promise<EngineEndpointDto | null> {
+  if (!isTauriRuntime()) return null;
+  try {
+    const { invoke } = await import("@tauri-apps/api/core");
+    return await invoke<EngineEndpointDto | null>("get_engine_endpoint");
+  } catch {
+    return null;
+  }
+}
+
+/** 保存引擎端点（移动端设置页；桌面端也可改指向远程）。 */
+export async function setEngineEndpoint(
+  baseUrl: string,
+  token: string,
+): Promise<void> {
+  if (!isTauriRuntime()) {
+    throw new Error("仅在桌面/移动 App 内可修改引擎地址");
+  }
+  const { invoke } = await import("@tauri-apps/api/core");
+  await invoke<boolean>("set_engine_endpoint", { baseUrl, token });
+  invalidateRuntime(); // 立即生效：下次请求用新地址
+}
+
+/** 测试引擎地址与凭据（设置页"测试连接"）。返回可读结果或抛错。 */
+export async function probeEngineEndpoint(
+  baseUrl: string,
+  token: string,
+): Promise<string> {
+  if (!isTauriRuntime()) {
+    throw new Error("仅在桌面/移动 App 内可测试连接");
+  }
+  const { invoke } = await import("@tauri-apps/api/core");
+  return await invoke<string>("probe_engine_endpoint", { baseUrl, token });
 }
 
 /** 真实探测后端健康（Sidebar 状态灯用；非 Tauri 与 Tauri 走同一解析）。 */

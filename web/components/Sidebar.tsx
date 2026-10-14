@@ -21,6 +21,7 @@ const NAV_LINKS = [
   { href: "/audit", label: "审计", icon: "🔏" },
   { href: "/logs", label: "日志", icon: "◫" },
   { href: "/setup", label: "模型", icon: "⚙" },
+  { href: "/engine", label: "连接", icon: "⇄" },
 ];
 
 /** 侧栏底部的引擎状态。此前这里写死"引擎在线"+绿点 —— 后端没起也照样显示在线，

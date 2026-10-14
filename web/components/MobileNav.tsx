@@ -35,6 +35,7 @@ const MORE = [
   { href: "/audit", label: "审计", icon: "🔏" },
   { href: "/logs", label: "日志", icon: "◫" },
   { href: "/setup", label: "模型", icon: "⚙" },
+  { href: "/engine", label: "连接", icon: "⇄" },
 ];
 
 function useEngineUp() {

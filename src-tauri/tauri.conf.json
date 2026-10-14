@@ -4,9 +4,9 @@
   "version": "0.2.0",
   "identifier": "com.zhixi.engine",
   "build": {
-    "beforeDevCommand": "cd ../web && npm run dev",
+    "beforeDevCommand": "cd web && npm run dev",
     "devUrl": "http://localhost:3000",
-    "beforeBuildCommand": "cd ../web && npm run build",
+    "beforeBuildCommand": "node src-tauri/tauri-web-build.mjs",
     "frontendDist": "../web/out"
   },
   "app": {

@@ -1,20 +1,21 @@
-//! Python sidecar（lingxi-server）生命周期管理。
+//! 桌面端 Python sidecar（lingxi-server）生命周期管理。
+//!
+//! **本模块只在桌面平台编译**（`#[cfg(desktop)]`，见 main.rs 的 mod 声明）：
+//! 它依赖 `tokio::process` 启动外部可执行文件，而 Android/iOS 上既没有
+//! 这个能力（移动 OS 禁止 fork/exec 任意二进制），也没有 Python 运行时。
+//!
+//! 移动端的后端获取方式不同（见 main.rs）：
+//! 用户在 App 内填「引擎地址」，直连自己部署的 lingxi 服务（或云端 API 网关）。
 //!
 //! 设计要点（修复审计发现的桌面端缺陷）：
 //! 1. **child 句柄长期持有**：此前 `start_standalone` 设了 `kill_on_drop(true)`
-//!    又在健康检查后 `drop(child)` —— 按 tokio 语义（ChildDropGuard::drop →
-//!    kill）这等于启动成功后立刻把后端 TerminateProcess 掉，桌面 App 的
-//!    Dashboard 活不过几秒。现在句柄存在 `PythonSidecar.child` 里，只有
-//!    显式 `stop_shared`（App 退出）才杀。
-//! 2. **动态端口**：不硬编码 8080。首选端口经环境变量传给 Python 侧，
-//!    Python 发现被占用会自动顺延并打印 `ZHIXI_DASHBOARD_PORT=<n>`，
-//!    本模块解析该行得到真实端口（唯一事实来源在 Python 侧）。
-//! 3. **死亡可诊断**：stderr 尾部 30 行留在环形缓冲里，进程退出时连同
-//!    退出码一起打印，能直接看到"为什么被杀"（端口冲突/依赖缺失/崩溃栈）。
-//! 4. **自动重启**：进程退出或连续健康探测失败 → 退避重启（最多 5 次），
-//!    重启也走同一条"重新选端口"的路径，端口被别的进程抢走也能自愈。
-//! 5. **每次安装独立令牌**：随机生成并持久化到数据目录，同时注入 sidecar
-//!    环境变量与前端（get_admin_token 命令），不再用公开的默认口令。
+//!    又在健康检查后 `drop(child)` —— 按 tokio 语义这等于启动成功后立刻把
+//!    后端 TerminateProcess 掉。现在句柄存在 `PythonSidecar.child` 里。
+//! 2. **动态端口**：首选端口经环境变量传给 Python，Python 发现被占自动顺延
+//!    并打印 `ZHIXI_DASHBOARD_PORT=<n>`，本模块解析该行得到真实端口。
+//! 3. **死亡可诊断**：stderr 尾部 30 行留在环形缓冲，进程退出时打印。
+//! 4. **自动重启**：进程退出或连续健康探测失败 → 退避重启（最多 5 次）。
+//! 5. **每次安装独立令牌**：随机生成并持久化，不用公开默认口令。
 use std::collections::VecDeque;
 use std::path::PathBuf;
 use std::process::Stdio;
@@ -49,7 +50,6 @@ fn describe_exit(stderr_tail: &Arc<Mutex<VecDeque<String>>>) -> String {
     if tail.is_empty() {
         return String::new();
     }
-    // 优先找异常栈/错误行；找不到就贴最后 5 行
     let interesting: Vec<&String> = tail
         .iter()
         .filter(|l| {
@@ -86,7 +86,6 @@ impl PythonSidecar {
             .with_extension(if cfg!(windows) { "exe" } else { "" });
 
         // 令牌优先级：显式环境变量 > 持久化文件 > 新生成并落盘。
-        // 生成 32 位十六进制随机串（uuid v4，底层 getrandom）。
         let data_dir = Self::data_dir()?;
         let admin_token = std::env::var("LINGXI_ADMIN_TOKEN")
             .or_else(|_| std::env::var("LINGXI_SECURITY__ADMIN_TOKEN"))
@@ -131,8 +130,6 @@ impl PythonSidecar {
     }
 
     /// 启动 sidecar 并等待它上报真实端口 + 通过健康检查。
-    ///
-    /// 成功后把 child 存回 `self.child`（长期持有），返回实际端口。
     pub async fn start(this: &Arc<Mutex<Self>>, _app_handle: &AppHandle) -> anyhow::Result<u16> {
         let (executable, token, preferred_port, stderr_tail) = {
             let guard = this.lock().unwrap();
@@ -155,11 +152,10 @@ impl PythonSidecar {
             .env("LINGXI_DATA_DIR", Self::data_dir()?)
             .stdout(Stdio::piped())
             .stderr(Stdio::piped());
-        // 刻意不设 kill_on_drop：句柄由 PythonSidecar.child 持有，
-        // 只有 App 退出（stop_shared）才允许杀进程。
+        // 刻意不设 kill_on_drop：句柄由 PythonSidecar.child 持有。
 
         #[cfg(windows)]
-        cmd.creation_flags(0x08000000); // CREATE_NO_WINDOW（tokio 原生支持，无需 CommandExt）
+        cmd.creation_flags(0x08000000); // CREATE_NO_WINDOW
 
         let mut child = cmd.spawn()?;
 
@@ -196,7 +192,7 @@ impl PythonSidecar {
             });
         }
 
-        // ── 等端口上报（启动慢的机器给足 60s；引擎构建约 1-3s，留大量余量）──
+        // ── 等端口上报（启动慢的机器给足 60s）──
         let port = match tokio::time::timeout(Duration::from_secs(60), port_rx.recv()).await {
             Ok(Some(p)) => p,
             Ok(None) => anyhow::bail!(
@@ -219,8 +215,6 @@ impl PythonSidecar {
     }
 
     /// 守护循环：进程退出或健康探测连续失败 → 记录死因并退避重启。
-    ///
-    /// 返回值只是"守护结束"（stopping 或达到重启上限），不是错误。
     pub async fn supervise(this: Arc<Mutex<Self>>, app_handle: AppHandle) {
         let mut health_fails: u32 = 0;
         loop {
@@ -243,10 +237,7 @@ impl PythonSidecar {
                 let mut guard = this.lock().unwrap();
                 match guard.child.as_mut() {
                     Some(c) => match c.try_wait() {
-                        Ok(Some(status)) => Some(format!(
-                            "退出码 {:?}",
-                            status.code()
-                        )),
+                        Ok(Some(status)) => Some(format!("退出码 {:?}", status.code())),
                         Ok(None) => None,
                         Err(e) => Some(format!("try_wait 失败: {}", e)),
                     },
@@ -278,10 +269,7 @@ impl PythonSidecar {
             // ── 触发重启 ──
             let reason = match &exited {
                 Some(s) => format!("后端进程已退出（{}）", s),
-                None => format!(
-                    "后端健康探测连续失败 {} 次（进程在但无响应）",
-                    health_fails
-                ),
+                None => format!("后端健康探测连续失败 {} 次（进程在但无响应）", health_fails),
             };
             let tail = {
                 let guard = this.lock().unwrap();
@@ -331,13 +319,12 @@ impl PythonSidecar {
                     guard.restarts += 1;
                     drop(guard);
                     eprintln!(">>> 自动重启失败：{:#}", e);
-                    // 失败也会回到循环，下次再试（受 MAX_RESTARTS 约束）
                 }
             }
         }
     }
 
-    /// App 退出时调用：置停止标志并杀掉子进程（进程可能已被守护杀过，幂等）。
+    /// App 退出时调用：置停止标志并杀掉子进程（幂等）。
     pub async fn stop_shared(this: &Arc<Mutex<Self>>) {
         let taken_child = {
             let mut guard = this.lock().unwrap();
