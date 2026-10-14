@@ -76,7 +76,8 @@ export default function TicketsPage() {
         <ApiErrorPanel error={error} onRetry={load} compact />
       ) : (
         <div className="card overflow-hidden p-0">
-          <table className="w-full text-xs">
+          {/* 桌面：表格（信息密度优先） */}
+          <table className="hidden md:table w-full text-xs">
             <thead>
               <tr className="text-left border-b border-white/5 text-lingxi-muted bg-white/[0.03]">
                 <th className="px-4 py-3 font-medium">工单 ID</th>
@@ -129,6 +130,44 @@ export default function TicketsPage() {
               )}
             </tbody>
           </table>
+
+          {/* 移动端：卡片列表（表格在窄屏会横向溢出，卡片是移动端标准形态） */}
+          <div className="md:hidden divide-y divide-white/5">
+            {loading && tickets.length === 0 ? (
+              Array.from({ length: 4 }).map((_, i) => (
+                <div key={i} className="p-4 animate-pulse">
+                  <div className="h-4 bg-white/5 rounded w-1/2" />
+                </div>
+              ))
+            ) : tickets.length === 0 ? (
+              <div className="px-4 py-12 text-center text-xs text-lingxi-muted">
+                当前筛选条件下暂无工单
+              </div>
+            ) : (
+              tickets.map((t) => (
+                <div key={t.ticket_id} className="p-4 space-y-2">
+                  <div className="flex items-center justify-between gap-3">
+                    <span className="font-mono text-xs text-white/85 break-anywhere">
+                      {t.ticket_id.slice(0, 16)}
+                    </span>
+                    <span
+                      className={`shrink-0 px-2 py-1 rounded border text-[10px] ${
+                        statusColor[t.status] || statusColor.closed
+                      }`}
+                    >
+                      {statusLabel(t.status)}
+                    </span>
+                  </div>
+                  <div className="flex flex-wrap gap-x-4 gap-y-1 text-[11px] text-lingxi-muted">
+                    <span>{channelLabel(t.channel)}</span>
+                    <span>{categoryLabel(t.category)}</span>
+                    <span>{t.message_count} 条消息</span>
+                  </div>
+                </div>
+              ))
+            )}
+          </div>
+
           {!loading && tickets.length > 0 && (
             <div className="px-4 py-2 text-[10px] text-lingxi-muted border-t border-white/5">
               共 {tickets.length} 条 · 5 秒自动刷新

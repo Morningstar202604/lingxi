@@ -59,27 +59,8 @@ export default function Sidebar() {
 
   return (
     <>
-      {/* 移动端导航（<md）：顶部横向滚动条。此前小屏完全没有导航 —
-          页面能不能到达全靠手输 URL（Sidebar 整体 hidden md:flex）。 */}
-      <nav className="md:hidden sticky top-0 z-30 flex items-center gap-1 overflow-x-auto px-3 py-2 bg-lingxi-navy/95 border-b border-white/5 backdrop-blur-md">
-        <span className="shrink-0 w-6 h-6 mr-1 rounded-md bg-lingxi-orange/20 border border-lingxi-orange/40 flex items-center justify-center text-[10px] font-bold text-lingxi-orange">
-          LX
-        </span>
-        {NAV_LINKS.map((link) => (
-          <Link
-            key={link.href}
-            href={link.href}
-            className={`shrink-0 px-2.5 py-1.5 rounded-lg text-xs whitespace-nowrap transition-colors ${
-              isActive(link.href)
-                ? "bg-lingxi-orange/10 text-lingxi-orange"
-                : "text-white/60 hover:bg-white/5 hover:text-white/90"
-            }`}
-          >
-            {link.label}
-          </Link>
-        ))}
-        <span className={`ml-auto shrink-0 w-2 h-2 rounded-full ${dot} pulse-dot`} />
-      </nav>
+      {/* 移动端导航统一由 MobileNav（底部拇指区 + 更多抽屉）承担：
+          14 个页面横滚条太窄且需横向滑动才发现，底部栏是移动端标准。 */}
 
       <aside className="hidden md:flex w-56 flex-col bg-lingxi-navy/80 border-r border-white/5 p-4">
         <div className="flex items-center gap-3 px-3 py-4">

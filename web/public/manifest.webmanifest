@@ -1,0 +1,38 @@
+{
+  "name": "智犀 ZhiXi — 数字员工控制台",
+  "short_name": "智犀",
+  "description": "24h 全栈数字员工引擎 · 智辨已知，犀照善为",
+  "start_url": "/",
+  "scope": "/",
+  "display": "standalone",
+  "orientation": "portrait-primary",
+  "background_color": "#0f1729",
+  "theme_color": "#0f1729",
+  "lang": "zh-CN",
+  "categories": ["business", "productivity", "utilities"],
+  "icons": [
+    {
+      "src": "/icon.svg",
+      "sizes": "any",
+      "type": "image/svg+xml",
+      "purpose": "any"
+    },
+    {
+      "src": "/icon-192.png",
+      "sizes": "192x192",
+      "type": "image/png",
+      "purpose": "any maskable"
+    },
+    {
+      "src": "/icon-512.png",
+      "sizes": "512x512",
+      "type": "image/png",
+      "purpose": "any maskable"
+    }
+  ],
+  "shortcuts": [
+    { "name": "总览", "url": "/" },
+    { "name": "队列", "url": "/queue" },
+    { "name": "审批", "url": "/approvals" }
+  ]
+}

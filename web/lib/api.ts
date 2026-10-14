@@ -755,6 +755,11 @@ export interface SetupStatus {
     base_url: string | null;
     api_key_configured: boolean;
     ready: boolean;
+    mode: "cloud" | "local_ready" | "unconfigured";
+  };
+  recommendation: {
+    primary: string;
+    text: string;
   };
   ollama: {
     reachable: boolean;

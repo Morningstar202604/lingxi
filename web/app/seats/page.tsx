@@ -194,7 +194,8 @@ export default function SeatsPage() {
             尚无坐席。注册后工单升级时会自动尝试分派；也可用队列页手动认领。
           </div>
         ) : (
-          <table className="w-full text-xs">
+          <div className="table-scroll">
+          <table className="w-full text-xs min-w-[720px]">
             <thead>
               <tr className="text-lingxi-muted border-b border-white/5">
                 <th className="text-left py-2 pr-4 font-normal">坐席</th>
@@ -243,6 +244,7 @@ export default function SeatsPage() {
               ))}
             </tbody>
           </table>
+          </div>
         )}
       </div>
     </div>

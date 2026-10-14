@@ -1,0 +1,25 @@
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 512 512" width="512" height="512">
+  <defs>
+    <linearGradient id="bg" x1="0" y1="0" x2="1" y2="1">
+      <stop offset="0%" stop-color="#1B2A4A"/>
+      <stop offset="100%" stop-color="#0f1729"/>
+    </linearGradient>
+    <linearGradient id="horn" x1="0" y1="1" x2="1" y2="0">
+      <stop offset="0%" stop-color="#E8963E"/>
+      <stop offset="100%" stop-color="#f5c07a"/>
+    </linearGradient>
+  </defs>
+  <!-- 底：深靛青（品牌主色） -->
+  <rect width="512" height="512" rx="96" fill="url(#bg)"/>
+  <!-- 犀角（智照善行）+ 电路纹 -->
+  <path d="M256 96c34 44 52 92 52 148 0 52-22 96-52 124-30-28-52-72-52-124 0-56 18-104 52-148z"
+        fill="url(#horn)"/>
+  <!-- 电路节点 -->
+  <circle cx="256" cy="200" r="14" fill="#0f1729"/>
+  <path d="M256 214v96M232 250h-40M280 250h40M232 296h-40M280 296h40"
+        stroke="#0f1729" stroke-width="12" stroke-linecap="round"/>
+  <circle cx="188" cy="250" r="10" fill="#2ECC71"/>
+  <circle cx="324" cy="250" r="10" fill="#2ECC71"/>
+  <circle cx="188" cy="296" r="10" fill="#2ECC71"/>
+  <circle cx="324" cy="296" r="10" fill="#2ECC71"/>
+</svg>

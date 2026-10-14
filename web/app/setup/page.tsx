@@ -52,11 +52,27 @@ export default function SetupPage() {
     return <div className="card animate-pulse h-48" />;
   }
 
-  const { llm, ollama, cloud_presets, env_file_hint } = status;
+  const { llm, ollama, cloud_presets, env_file_hint, recommendation } = status;
   const ollamaReady = ollama.reachable && ollama.models.length > 0;
 
   return (
     <div className="space-y-6 max-w-4xl">
+      {/* ── 未配置时的首要引导：推荐云端 API ── */}
+      {llm.mode === "unconfigured" && (
+        <section className="card border-lingxi-orange/40 bg-lingxi-orange/[0.06]">
+          <div className="text-sm font-semibold text-lingxi-orange">
+            还没有可用的模型
+          </div>
+          <p className="text-xs text-white/75 mt-2 leading-relaxed">
+            {recommendation.text}
+          </p>
+          <p className="text-xs text-lingxi-muted mt-2">
+            最快的做法：选下面任一云端平台申请 Key → 复制变量到配置文件 →
+            重启后端。本地模型不装也能用。
+          </p>
+        </section>
+      )}
+
       {/* ── 当前状态 ── */}
       <section className="card">
         <div className="flex items-center justify-between">

@@ -71,3 +71,64 @@ body {
 .card {
   @apply bg-lingxi-slate/50 border border-white/5 rounded-xl p-4 backdrop-blur-sm;
 }
+
+/* ── 移动端（Android / 触屏）适配 ──
+   目标：手机浏览器与 PWA standalone 模式下都可正常操作。
+   以下规则只在触屏/窄屏下生效，不影响桌面浏览。 */
+
+/* 1) 安全区：PWA standalone 下避开状态栏与手势条（Android 刘海屏/手势导航） */
+body {
+  padding-top: env(safe-area-inset-top);
+  padding-left: env(safe-area-inset-left);
+  padding-right: env(safe-area-inset-right);
+}
+.safe-bottom {
+  padding-bottom: env(safe-area-inset-bottom);
+}
+
+/* 2) 消除移动端 300ms 点击延迟与双击缩放闪烁 */
+html {
+  touch-action: manipulation;
+}
+
+/* 3) 触屏下 hover 效果会"粘住"（点完仍保持 hover 态），窄屏禁用 hover 视觉 */
+@media (hover: none) {
+  .hover\:bg-white\/5:hover {
+    background-color: transparent;
+  }
+  .hover\:bg-white\/10:hover {
+    background-color: transparent;
+  }
+}
+
+/* 4) 表格在窄屏横向滚动而非撑破布局（配 .table-scroll 使用） */
+.table-scroll {
+  overflow-x: auto;
+  -webkit-overflow-scrolling: touch;
+}
+
+/* 5) 长文本（工单消息、日志、JSON）在窄屏强制换行，避免横向溢出整页 */
+.break-anywhere {
+  overflow-wrap: anywhere;
+  word-break: break-word;
+}
+
+/* 6) 触控目标最小高度：iOS/Android 人机指南均建议 ≥44px；
+      仅在小屏生效，桌面保持紧凑密度 */
+@media (max-width: 767px) {
+  button,
+  a[role="button"],
+  .touch-target {
+    min-height: 44px;
+    display: inline-flex;
+    align-items: center;
+    justify-content: center;
+  }
+  /* 输入框同样加高，避免 Android 自动放大字号 */
+  input,
+  select,
+  textarea {
+    font-size: 16px;
+  }
+}
+
