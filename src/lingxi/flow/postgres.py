@@ -626,6 +626,39 @@ class PostgresEscalationQueue:
             "SELECT COUNT(*) FROM queue_entries WHERE claimed_by IS NULL"
         ) or 0
 
+    async def snapshot(self) -> dict[str, Any]:
+        """真实队列快照：等待时长来自 enqueued_at（不再恒 0）。
+
+        dashboard 的 /api/queue 顶部卡片直接展示这些字段 —— 恒 0 会让
+        "最长等待"看起来永远健康，掩盖真实积压。
+        """
+        pending_rows = await self.writer.fetch(
+            """SELECT ticket_id, chat_id, category, reason,
+                      EXTRACT(EPOCH FROM (NOW() - enqueued_at)) AS wait_seconds
+               FROM queue_entries
+               WHERE claimed_by IS NULL
+               ORDER BY enqueued_at""",
+        )
+        claimed_count = await self.writer.fetchval(
+            "SELECT COUNT(*) FROM queue_entries WHERE claimed_by IS NOT NULL"
+        ) or 0
+        pending = [
+            {
+                "ticket_id": r["ticket_id"],
+                "chat_id": r["chat_id"],
+                "category": r["category"],
+                "reason": r["reason"],
+                "wait_seconds": round(float(r["wait_seconds"] or 0)),
+            }
+            for r in pending_rows
+        ]
+        return {
+            "pending_count": len(pending),
+            "claimed_count": int(claimed_count),
+            "longest_wait": max((p["wait_seconds"] for p in pending), default=0),
+            "top_5_pending": pending[:5],
+        }
+
     # -- Sync compatibility stubs (EscalationQueue Protocol) --------------
 
     def size(self) -> int:
@@ -887,22 +920,7 @@ class SyncPostgresEscalationQueue:
 
     def snapshot(self) -> dict[str, Any]:
         """Dashboard /api/queue 与 /api/dashboard/summary 依赖此方法。"""
-        pending = [
-            {
-                "ticket_id": t,
-                "category": "",
-                "reason": "",
-                "wait_seconds": 0,
-            }
-            for t in self.list_pending()
-        ]
-        claimed = self.list_claimed()
-        return {
-            "pending_count": len(pending),
-            "claimed_count": len(claimed),
-            "longest_wait": 0,
-            "top_5_pending": pending[:5],
-        }
+        return self._runner.run(self._async.snapshot())  # type: ignore[no-any-return]
 
     def close(self) -> None:
         """关闭底层连接池（进程退出时调用，多 store 共享同一池时幂等）。"""
@@ -976,10 +994,18 @@ class SyncPostgresMemoryPipeline:
     def graph(self) -> Any:
         return self._graph
 
+    async def _count_memories(self) -> int:
+        """活跃记忆条数（真实查询，不再返回 0 占位）。"""
+        return int(
+            await self.writer.fetchval(
+                "SELECT COUNT(*) FROM memories WHERE status = 'active'"
+            )
+            or 0
+        )
+
     @property
     def total_memories(self) -> int:
-        # 无法同步获取，返回 0 占位
-        return 0
+        return self._runner.run(self._count_memories())  # type: ignore[no-any-return]
 
 
 # ── 导出 ────────────────────────────────────────────────────────────────

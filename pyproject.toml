@@ -52,8 +52,9 @@ dependencies = [
 #   pip install lingxi[mem0]
 #   pip install lingxi[neo4j]
 mem0 = ["mem0ai>=0.1.0"]
-neo4j = ["neo4j>=5.24.0", "networkx>=3.4.0"]
-graph = ["networkx>=3.4.0"]
+# networkx 曾随 neo4j extra 一起声明但全仓零引用（图查询由
+# SQLite/Neo4j 后端承担）——2026-10-14 移除，需要图算法时再引入
+neo4j = ["neo4j>=5.24.0"]
 # flow/postgres.py 的 PostgreSQL 后端（persistence.backend=postgresql 启用）
 postgres = ["asyncpg>=0.30.0"]
 dev = [

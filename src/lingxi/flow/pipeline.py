@@ -21,7 +21,6 @@ from collections.abc import Callable, Coroutine
 from dataclasses import dataclass
 from typing import TYPE_CHECKING, Any
 
-from lingxi.agent.tools import register_tool_bridge
 from lingxi.config import get_settings
 from lingxi.core import get_logger
 from lingxi.core.protocol import ChannelType, IMEvent, OutboundMessage
@@ -76,6 +75,7 @@ class CustomerServicePipeline:
         rule_engine: Any = None,  # RuleEngine | None
         pii_guard: Any = None,  # PIIGuard | None
         audit_log: Any = None,  # AuditLog | None
+        tool_registry: Any = None,  # ToolRegistry | None — 桥梁按实例注册
     ) -> None:
         self._agent = agent
         self._tickets = ticket_store
@@ -99,8 +99,10 @@ class CustomerServicePipeline:
         # （AUDIT-2026-10-10 #15）——用事件里带进来的真实 channel 兜底。
         self._chat_channels: dict[str, Any] = {}
 
-        # 注册工具桥梁（让 Agent 内的 send_message / knowledge_search 真正生效）
-        if send_message_func is not None:
+        # 注册工具桥梁（让 Agent 内的 send_message / knowledge_search 真正生效）。
+        # 桥梁注册到**传入的 registry 实例**上，同进程多引擎互不干扰
+        # （AUDIT-2026-10-10 第四章 4.3 的全局 dict 隐患已修）。
+        if tool_registry is not None and send_message_func is not None:
             async def _bridge_send(chat_id: str, content: str) -> bool:
                 try:
                     channel = self._chat_channels.get(chat_id) or self._detect_channel(chat_id)
@@ -112,13 +114,13 @@ class CustomerServicePipeline:
                     return True
                 except Exception:
                     return False
-            register_tool_bridge("send_message", _bridge_send)
+            tool_registry.register_bridge("send_message", _bridge_send)
 
-        if memory_pipeline is not None:
+        if tool_registry is not None and memory_pipeline is not None:
             async def _bridge_search(user_id: str, query: str) -> str:
                 result = memory_pipeline.recall(user_id=user_id, query=query, top_k=5)
                 return str(result.render_for_prompt())
-            register_tool_bridge("knowledge_search", _bridge_search)
+            tool_registry.register_bridge("knowledge_search", _bridge_search)
 
     @staticmethod
     def _build_conversation_messages(

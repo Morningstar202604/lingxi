@@ -419,6 +419,7 @@ def build_default_engine(
         rule_engine=rule_engine,
         pii_guard=pii_guard,
         audit_log=audit_log,
+        tool_registry=registry,
     )
 
     async def _on_event(event: IMEvent) -> None:

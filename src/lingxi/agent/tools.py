@@ -8,7 +8,7 @@
     - 纯本地执行（sync handler）：如 shell、calculator
     - 需要 pipeline 能力的异步工具：send_message（需要 IM adapter）、knowledge_search（需要 MemoryPipeline）
 
-    异步工具通过 TOOL_BRIDGE 与 pipeline 通信，延迟绑定避免循环依赖。
+    异步工具通过 ToolRegistry.bridges 与 pipeline 通信，延迟绑定避免循环依赖。
 
 🤖 AI 避坑
     - 不要让 LLM 自己判断权限 → 由 check_permission 硬检查
@@ -34,22 +34,9 @@ if TYPE_CHECKING:
 log = get_logger(__name__)
 
 # ── 工具桥梁：允许 pipeline 延迟绑定 IM adapter / memory backend ──
-# 避免 tools.py 反向依赖 pipeline.py（循环导入）
-TOOL_BRIDGE: dict[str, Any] = {
-    "send_message": None,        # Callable[[str, str], Awaitable[bool]] | None
-    "knowledge_search": None,    # Callable[[str, str], Awaitable[str]] | None (user_id, query) -> result_text
-}
-
-
-def register_tool_bridge(name: str, handler: Any) -> None:
-    """注册工具桥梁（由 pipeline 调用）。
-
-    Args:
-        name: 工具名 ("send_message" 或 "knowledge_search")
-        handler: 异步回调函数
-    """
-    TOOL_BRIDGE[name] = handler
-    log.info("tool_bridge_registered", tool=name)
+# 桥梁挂在 **ToolRegistry 实例**上而不是模块全局 dict：
+# 同进程跑多个引擎（测试/多租户）时，后建引擎不会静默抢走前者的
+# adapter/memory 后端（AUDIT-2026-10-10 第四章 4.3 的隐患）。
 
 
 # ── 工具定义 ──
@@ -100,6 +87,19 @@ class ToolRegistry:
     def __init__(self, blocked_commands: list[str] | None = None) -> None:
         self._tools: dict[str, ToolDefinition] = {}
         self._blocked_commands: list[str] = blocked_commands or []
+        # 工具桥梁（send_message / knowledge_search 的延迟绑定后端），
+        # 按实例隔离 —— 见文件头部说明。
+        self.bridges: dict[str, Any] = {}
+
+    def register_bridge(self, name: str, handler: Any) -> None:
+        """注册工具桥梁（由 pipeline 在装配时调用）。
+
+        Args:
+            name: 工具名 ("send_message" 或 "knowledge_search")
+            handler: 异步回调函数
+        """
+        self.bridges[name] = handler
+        log.info("tool_bridge_registered", tool=name)
 
     @property
     def blocked_commands(self) -> list[str]:
@@ -251,51 +251,61 @@ async def execute_tool(
         return {"success": False, "observation": f"工具 '{tool_name}' 执行出错：{e}"}
 
 
-# ── 异步工具 handlers（通过 TOOL_BRIDGE 与 pipeline 通信）──
+# ── 异步工具 handlers（通过 registry.bridges 与 pipeline 通信）──
 
 
-async def _send_message_handler(
-    content: str,
-    chat_id: str = "",
-    *,
-    current_chat_id: str = "",
-) -> str:
-    """通过 TOOL_BRIDGE 发送消息到 IM 渠道。
+def _make_send_message_handler(registry: ToolRegistry) -> Any:
+    """构造绑定到具体 registry 的 send_message 处理器（桥梁按实例隔离）。"""
 
-    安全：目标会话由 execute_tool_node 从 AgentState 注入（current_chat_id），
-    模型既看不到该参数也无法覆盖 —— 对应 Semantic Kernel CVE-2026-25592
-    的根治方式 "Removed AI access"（详见 docs/AUDIT-2026-10-10.md #5）。
-    """
-    target = current_chat_id or chat_id
-    if not target:
-        return "（无法确定目标会话，消息未发送）"
-    bridge = TOOL_BRIDGE.get("send_message")
-    if bridge is None:
-        return f"（消息发送器尚未配置，消息未实际发送）\n目标: {target}\n内容: {content[:200]}"
-    try:
-        ok = await bridge(chat_id=target, content=content)
-        return f"消息已发送到 {target}" if ok else f"发送到 {target} 失败"
-    except Exception as e:
-        return f"发送异常: {e}"
+    async def _send_message_handler(
+        content: str,
+        chat_id: str = "",
+        *,
+        current_chat_id: str = "",
+    ) -> str:
+        """通过 bridges 发送消息到 IM 渠道。
+
+        安全：目标会话由 execute_tool_node 从 AgentState 注入（current_chat_id），
+        模型既看不到该参数也无法覆盖 —— 对应 Semantic Kernel CVE-2026-25592
+        的根治方式 "Removed AI access"（详见 docs/AUDIT-2026-10-10.md #5）。
+        """
+        target = current_chat_id or chat_id
+        if not target:
+            return "（无法确定目标会话，消息未发送）"
+        bridge = registry.bridges.get("send_message")
+        if bridge is None:
+            return f"（消息发送器尚未配置，消息未实际发送）\n目标: {target}\n内容: {content[:200]}"
+        try:
+            ok = await bridge(chat_id=target, content=content)
+            return f"消息已发送到 {target}" if ok else f"发送到 {target} 失败"
+        except Exception as e:
+            return f"发送异常: {e}"
+
+    return _send_message_handler
 
 
-async def _knowledge_search_handler(
-    query: str,
-    *,
-    current_user_id: str = "",
-) -> str:
-    """通过 TOOL_BRIDGE 查询当前用户的记忆。
+def _make_knowledge_search_handler(registry: ToolRegistry) -> Any:
+    """构造绑定到具体 registry 的 knowledge_search 处理器。"""
 
-    安全：user_id 由 execute_tool_node 从 AgentState 注入，模型不可指定，
-    避免跨用户读取他人记忆（见 docs/AUDIT-2026-10-10.md #5）。
-    """
-    bridge = TOOL_BRIDGE.get("knowledge_search")
-    if bridge is None:
-        return "（知识库未配置，无法执行搜索）"
-    try:
-        return str(await bridge(user_id=current_user_id, query=query))
-    except Exception as e:
-        return f"知识库查询异常: {e}"
+    async def _knowledge_search_handler(
+        query: str,
+        *,
+        current_user_id: str = "",
+    ) -> str:
+        """通过 bridges 查询当前用户的记忆。
+
+        安全：user_id 由 execute_tool_node 从 AgentState 注入，模型不可指定，
+        避免跨用户读取他人记忆（见 docs/AUDIT-2026-10-10.md #5）。
+        """
+        bridge = registry.bridges.get("knowledge_search")
+        if bridge is None:
+            return "（知识库未配置，无法执行搜索）"
+        try:
+            return str(await bridge(user_id=current_user_id, query=query))
+        except Exception as e:
+            return f"知识库查询异常: {e}"
+
+    return _knowledge_search_handler
 
 
 async def _shell_handler(command: str) -> str:
@@ -342,7 +352,7 @@ def _create_default_registry(blocked_commands: list[str] | None = None) -> ToolR
             "required": ["content"],
         },
         required_permission=1,  # 写操作至少 LOW_RISK
-        handler=_send_message_handler,
+        handler=_make_send_message_handler(registry),
     ))
 
     registry.register(ToolDefinition(
@@ -359,7 +369,7 @@ def _create_default_registry(blocked_commands: list[str] | None = None) -> ToolR
             "required": ["query"],
         },
         required_permission=0,
-        handler=_knowledge_search_handler,
+        handler=_make_knowledge_search_handler(registry),
     ))
 
     return registry
@@ -370,8 +380,6 @@ __all__ = [
     "ToolRegistry",
     "execute_tool",
     "needs_approval",
-    "register_tool_bridge",
     "resolve_required_level",
-    "TOOL_BRIDGE",
     "truncate_observation",
 ]

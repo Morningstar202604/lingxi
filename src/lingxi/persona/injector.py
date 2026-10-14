@@ -20,12 +20,21 @@
 from __future__ import annotations
 
 import contextlib
+import hashlib
 from datetime import datetime
 
 from lingxi.core import get_logger
 from lingxi.persona.schema import EmotionLevel, KeywordRule, PersonaConfig, TurnStage
 
 log = get_logger(__name__)
+
+# 措辞风格池（variance 模块）：同一输入固定选同一种 → 行为可复现、测试可断言
+_STYLE_POOL = [
+    "简洁直接，先给结论",
+    "温和耐心，先共情再处理",
+    "干脆利落，用短句",
+    "条理清晰，分点说明",
+]
 
 
 class PersonaInjector:
@@ -77,8 +86,18 @@ class PersonaInjector:
         if m.memory_injection and memory_block:
             parts.append(f"[用户记忆]\n{memory_block}")
 
-        # 世界观块（Lorebook 关键词触发）：仅在有时注入，避免空块撑大 prompt
-        if lorebook_block:
+        # 措辞方差（variance 模块）：每轮提示一种表达风格，避免"一个模子"。
+        # 按输入内容哈希选择 → 同输入同结果（幂等，见模块头部约束）。
+        if m.variance:
+            parts.append(f"[本轮措辞风格: {self._pick_style(user_message)}]")
+
+        # 语言跟随（translate 模块）：用户用外语时跟随其语言
+        if m.translate:
+            parts.append("[语言] 用户使用外语时，用与用户相同的语言回复；中英混用时默认中文。")
+
+        # 世界观块（Lorebook 关键词触发）：模块开关关闭时不注入
+        # （此前 lorebook_injection 是死配置，配了也静默失效）
+        if m.lorebook_injection and lorebook_block:
             parts.append(f"[世界观 / 业务规则]\n{lorebook_block}")
 
         # ── 自定义注入 ──
@@ -106,6 +125,12 @@ class PersonaInjector:
             )
 
         return self._fit_budget(parts)
+
+    @staticmethod
+    def _pick_style(seed_text: str) -> str:
+        """按输入哈希从风格池选择（同输入同结果，保持注入幂等）。"""
+        h = int(hashlib.md5((seed_text or "default").encode("utf-8")).hexdigest(), 16)
+        return _STYLE_POOL[h % len(_STYLE_POOL)]
 
     def _fit_budget(self, parts: list[str]) -> str:
         """把各段压进预算，但**永不裁剪硬约束段**（身份锚 / 安全护栏）。

@@ -158,8 +158,8 @@ class TestToolResultWiring:
             pending_tool_calls=[{"tool_name": "knowledge_search", "arguments": {"query": "x"}, "id": "call_x"}],
             next_step="tool",
         )
-        with patch("lingxi.agent.tools.TOOL_BRIDGE", {"knowledge_search": None, "send_message": None}):
-            out = await execute_tool_node(state, registry, 1)
+        # 新 registry 默认无桥梁 → knowledge_search 返回"未配置"，无需 mock
+        out = await execute_tool_node(state, registry, 1)
 
         tool_msg = out["messages"][-1]
         assert tool_msg["role"] == "tool"
@@ -175,8 +175,7 @@ class TestToolResultWiring:
             {"tool_name": "knowledge_search", "arguments": {"query": "b"}, "id": "c2"},
         ]
         state = _state(pending_tool_calls=calls, next_step="tool")
-        with patch("lingxi.agent.tools.TOOL_BRIDGE", {"knowledge_search": None, "send_message": None}):
-            out = await execute_tool_node(state, registry, 1)
+        out = await execute_tool_node(state, registry, 1)
 
         assert len(out["tool_results"]) == 2
         ids = [m.get("tool_call_id") for m in out["messages"][-2:]]

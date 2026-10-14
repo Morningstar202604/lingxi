@@ -28,7 +28,6 @@ from __future__ import annotations
 import asyncio
 import contextlib
 import json
-import time
 from typing import Any
 
 from fastapi import FastAPI, Header, HTTPException, Request, Response
@@ -51,68 +50,6 @@ log = get_logger(__name__)
 # 不用 `allow_origins=["*"]`：那等于对全网开放管理面。
 _LOOPBACK_ORIGIN_RE = r"^https?://(localhost|127\.0\.0\.1|\[::1\])(:\d+)?$"
 
-_CLOUD_PRESETS: list[dict[str, Any]] = [
-    {
-        "id": "deepseek",
-        "label": "DeepSeek",
-        "tag": "国内推荐 · 便宜",
-        "provider": "deepseek",
-        "model": "deepseek-chat",
-        "base_url": "https://api.deepseek.com",
-        "env": {
-            "LINGXI_LLM__PROVIDER": "deepseek",
-            "LINGXI_LLM__MODEL": "deepseek-chat",
-            "LINGXI_LLM__API_KEY": "<到官网申请你的 Key>",
-            "LINGXI_LLM__BASE_URL": "https://api.deepseek.com",
-        },
-        "key_page": "https://platform.deepseek.com/api_keys",
-    },
-    {
-        "id": "qwen",
-        "label": "通义千问（DashScope）",
-        "tag": "OpenAI 兼容端点",
-        "provider": "openai",
-        "model": "qwen-plus",
-        "base_url": "https://dashscope.aliyuncs.com/compatible-mode/v1",
-        "env": {
-            "LINGXI_LLM__PROVIDER": "openai",
-            "LINGXI_LLM__MODEL": "qwen-plus",
-            "LINGXI_LLM__API_KEY": "<DashScope API Key>",
-            "LINGXI_LLM__BASE_URL": "https://dashscope.aliyuncs.com/compatible-mode/v1",
-        },
-        "key_page": "https://bailian.console.aliyun.com/",
-    },
-    {
-        "id": "zhipu",
-        "label": "智谱 GLM",
-        "tag": "有免费档位",
-        "provider": "openai",
-        "model": "glm-4-flash",
-        "base_url": "https://open.bigmodel.cn/api/paas/v4",
-        "env": {
-            "LINGXI_LLM__PROVIDER": "openai",
-            "LINGXI_LLM__MODEL": "glm-4-flash",
-            "LINGXI_LLM__API_KEY": "<到开放平台申请>",
-            "LINGXI_LLM__BASE_URL": "https://open.bigmodel.cn/api/paas/v4",
-        },
-        "key_page": "https://open.bigmodel.cn/usercenter/apikeys",
-    },
-    {
-        "id": "openai",
-        "label": "OpenAI",
-        "tag": "国际通用",
-        "provider": "openai",
-        "model": "gpt-4o-mini",
-        "base_url": "",
-        "env": {
-            "LINGXI_LLM__PROVIDER": "openai",
-            "LINGXI_LLM__MODEL": "gpt-4o-mini",
-            "LINGXI_LLM__API_KEY": "<sk-...>",
-            "LINGXI_LLM__BASE_URL": "",
-        },
-        "key_page": "https://platform.openai.com/api-keys",
-    },
-]
 
 
 
@@ -453,75 +390,10 @@ def create_dashboard_app(
 
         log.info("inbound_webhook_endpoint_mounted")
 
-    # ── 模型接入状态（供前端「模型设置」页引导配置）──
-    # 云端 API 优先：给可复制的环境变量片段；本地 Ollama 作为可选定装项
-    # （给下载链接 + 拉模型命令）。探测结果做 10s TTL 缓存，页面轮询不空跑。
-    _setup_probe_cache: dict[str, Any] = {"at": 0.0, "ollama": None}
+    # ── 模型接入状态（独立子模块：flow/setup_api.py）──
+    from lingxi.flow.setup_api import register_setup_routes
 
-
-    async def _probe_ollama(native_base: str) -> dict[str, Any]:
-        """探测本地 Ollama（stdlib，不新增依赖；1.5s 超时，失败即不可达）。"""
-        import urllib.request
-
-        def _sync() -> dict[str, Any]:
-            req = urllib.request.Request(f"{native_base}/api/tags", method="GET")
-            with urllib.request.urlopen(req, timeout=1.5) as resp:  # noqa: S310
-                body = json.loads(resp.read().decode("utf-8"))
-            models = [
-                str(m.get("name", ""))
-                for m in body.get("models", [])
-                if isinstance(m, dict)
-            ]
-            return {"reachable": True, "base_url": native_base, "models": models[:20]}
-
-        return await asyncio.to_thread(_sync)
-
-    @app.get("/api/setup/status")
-    async def setup_status(x_admin_token: str | None = Header(None)) -> dict[str, Any]:
-        """模型接入现状：当前 LLM 配置、Ollama 可达性、云端预设片段。"""
-        _check_admin(x_admin_token)
-        s = get_settings()
-        llm = s.llm
-        api_key_configured = bool(
-            llm.api_key and llm.api_key.get_secret_value().strip()
-        )
-
-        native_base = "http://127.0.0.1:11434"
-        if llm.base_url and "11434" in llm.base_url:
-            native_base = llm.base_url.rstrip("/")
-            if native_base.endswith("/v1"):
-                native_base = native_base[:-3]
-
-        now = time.monotonic()
-        if _setup_probe_cache["ollama"] is None or now - _setup_probe_cache["at"] > 10.0:
-            try:
-                probed = await _probe_ollama(native_base)
-            except Exception:
-                probed = {"reachable": False, "base_url": native_base, "models": []}
-            _setup_probe_cache["ollama"] = probed
-            _setup_probe_cache["at"] = now
-        ollama = _setup_probe_cache["ollama"]
-
-        ready = api_key_configured or (llm.provider == "ollama" and ollama["reachable"])
-        return {
-            "llm": {
-                "provider": llm.provider,
-                "model": llm.model,
-                "base_url": llm.base_url,
-                "api_key_configured": api_key_configured,
-                "ready": ready,
-            },
-            "ollama": {
-                **ollama,
-                "install_url": "https://ollama.com/download",
-                "pull_hint": f"ollama pull {s.mem0.embed_model} && ollama pull {llm.model}",
-            },
-            "cloud_presets": _CLOUD_PRESETS,
-            "env_file_hint": (
-                "把环境变量写进项目根目录 .env（已支持），改完重启后端生效；"
-                "桌面版可写进 %APPDATA%\\lingxi\\lingxi.env"
-            ),
-        }
+    register_setup_routes(app, _check_admin)
 
     @app.get("/api/sessions")
     async def list_sessions(

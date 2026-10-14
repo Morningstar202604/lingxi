@@ -126,6 +126,18 @@ class TestSyncPostgresContract:
         q.enqueue(ticket, reason="contract-test")
         assert q.pending_count() >= 1
 
+        # snapshot 必须带真实等待时长与原因（此前 hardcode 0/空串）
+        snap_before = q.snapshot()
+        mine = [
+            e for e in snap_before["top_5_pending"]
+            if e["ticket_id"] == ticket.ticket_id
+        ]
+        assert mine, "新入队工单应出现在 top_5_pending"
+        assert mine[0]["reason"] == "contract-test"
+        assert isinstance(mine[0]["wait_seconds"], int)
+        assert mine[0]["wait_seconds"] >= 0
+        assert snap_before["longest_wait"] >= mine[0]["wait_seconds"]
+
         entry = await q.dequeue("agent-x")
         assert entry is not None
         # 认领后不再 pending
@@ -137,6 +149,31 @@ class TestSyncPostgresContract:
         # close 幂等：多 store 共享同一池时连续 close 不报错
         q.close()
         q.close()
+
+    @pytest.mark.asyncio
+    async def test_memory_total_is_real_count(self, pg_writer) -> None:
+        """SyncPostgresMemoryPipeline.total_memories 必须是真实计数（非 0 占位）。"""
+        import uuid
+
+        from lingxi.flow.postgres import (
+            PostgresMemoryPipeline,
+            SyncPostgresMemoryPipeline,
+        )
+        from lingxi.memory.pipeline import MemoryItem
+
+        pipe = SyncPostgresMemoryPipeline(PostgresMemoryPipeline(pg_writer))
+        before = pipe.total_memories
+        uid = f"{_prefix()}-u"
+        pipe.store(uid, [
+            MemoryItem(
+                memory_id=uuid.uuid4().hex,
+                user_id=uid,
+                fact="契约测试记忆",
+                confidence=0.9,
+                source="contract",
+            )
+        ])
+        assert pipe.total_memories == before + 1
 
     @pytest.mark.asyncio
     async def test_dequeue_returns_ticket_for_dashboard_claim(self, pg_writer) -> None:

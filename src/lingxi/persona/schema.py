@@ -12,9 +12,9 @@
 from __future__ import annotations
 
 from enum import StrEnum
-from typing import Literal
+from typing import Any, Literal
 
-from pydantic import BaseModel, Field
+from pydantic import BaseModel, Field, field_validator
 
 
 class EmotionLevel(StrEnum):
@@ -50,7 +50,9 @@ class Identity(BaseModel):
 class BehaviorRules(BaseModel):
     """行为规则 — 回复的形式约束。"""
 
-    max_reply_chars: int = 500
+    # ge=1：负数/0 会渲染出"单次回复不超过 -5 字"这种荒谬约束
+    # （AUDIT-2026-10-10 第四章 4.6）
+    max_reply_chars: int = Field(default=500, ge=1, le=10000)
     prefer_short: bool = True
     one_question_at_a_time: bool = True
     no_unsolicited_menu: bool = True
@@ -92,6 +94,15 @@ class PersonaConfig(BaseModel):
     modules: ContextModule = Field(default_factory=ContextModule)
     custom_prompts: dict[str, str] = Field(default_factory=dict)
     keyword_rules: list[KeywordRule] = Field(default_factory=list)
+
+    @field_validator("version", mode="before")
+    @classmethod
+    def _coerce_version(cls, v: Any) -> Any:
+        """YAML 里 version: 1（未加引号）是 int，直接拒绝会吓到正常用户。
+
+        （AUDIT-2026-10-10 第四章 4.6：`Literal["1"]` 拒收整数 1）
+        """
+        return str(v) if isinstance(v, int) else v
 
 
 __all__ = [

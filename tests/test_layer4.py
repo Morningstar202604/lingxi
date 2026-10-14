@@ -570,16 +570,15 @@ class TestToolParamsNotModelControlled:
     @pytest.mark.asyncio
     async def test_send_message_uses_current_conversation(self) -> None:
         """LLM 试图指定别的会话时，实际仍发往当前会话。"""
-        from lingxi.agent.tools import TOOL_BRIDGE, register_tool_bridge
-
         delivered: list[tuple[str, str]] = []
 
         async def _bridge(chat_id: str, content: str) -> bool:
             delivered.append((chat_id, content))
             return True
 
-        register_tool_bridge("send_message", _bridge)
+        # 桥梁按 registry 实例注册（不再有模块全局 TOOL_BRIDGE）
         reg = _create_default_registry()
+        reg.register_bridge("send_message", _bridge)
         state: AgentState = {
             "user_id": "u1", "chat_id": "CURRENT_CHAT", "channel": "qq_private",
             "raw_message": "x", "system_prompt": "", "memory_block": "",
@@ -594,7 +593,6 @@ class TestToolParamsNotModelControlled:
         }
 
         await execute_tool_node(state, reg, 1)
-        TOOL_BRIDGE["send_message"] = None
 
         assert delivered, "消息未被投递"
         assert delivered[0][0] == "CURRENT_CHAT", f"消息发往了模型指定的会话: {delivered[0]}"
