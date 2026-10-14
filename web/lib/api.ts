@@ -166,12 +166,16 @@ async function api<T>(
   return unwrap<T>(res);
 }
 
-/** 拿原始 Response（下载类接口），失败同样转 ApiError。 */
-async function apiRaw(path: string): Promise<Response> {
+/** 拿原始 Response（下载 / text/plain 接口），失败同样转 ApiError。 */
+async function apiRaw(path: string, init: RequestInit = {}): Promise<Response> {
   const rt = await resolveRuntime();
   try {
     const res = await fetch(`${rt.base}${path}`, {
-      headers: rt.token ? { "x-admin-token": rt.token } : {},
+      ...init,
+      headers: {
+        ...(rt.token ? { "x-admin-token": rt.token } : {}),
+        ...(init.headers as Record<string, string> | undefined),
+      },
       cache: "no-store",
     });
     if (!res.ok) await unwrap(res);
@@ -765,4 +769,203 @@ export interface SetupStatus {
 
 export async function fetchSetupStatus(): Promise<SetupStatus> {
   return api<SetupStatus>("/api/setup/status");
+}
+
+// ── 人工审批（L2/L3 高风险操作，agent/approval.py）──
+
+export interface ApprovalItem {
+  approval_id: string;
+  tool_name: string;
+  arguments: Record<string, unknown>;
+  required_level: number;
+  requester_level: number;
+  chat_id: string;
+  user_id: string;
+  channel: string;
+  created_at: number;
+  status: string;
+  approver: string;
+  decided_at: number;
+  note: string;
+}
+
+export interface ApprovalDecision {
+  approval_id: string;
+  status: string;
+  approver: string;
+  resumed: boolean;
+  final_reply: string;
+  escalate_reason: string;
+}
+
+export async function fetchApprovals(status = "pending"): Promise<ApprovalItem[]> {
+  return api<ApprovalItem[]>(`/api/approvals?status=${encodeURIComponent(status)}`);
+}
+
+export async function decideApproval(
+  approvalId: string,
+  action: "approve" | "reject",
+  approver = "",
+  note = "",
+): Promise<ApprovalDecision> {
+  return api<ApprovalDecision>(`/api/approvals/${approvalId}/${action}`, {
+    method: "POST",
+    json: { approver, note },
+  });
+}
+
+// ── 坐席管理（seat/router.py）──
+
+export interface Seat {
+  username: string;
+  display_name: string;
+  status: string;
+  max_concurrent: number;
+  current_ticket_count: number;
+  total_handled: number;
+  avg_response_seconds: number;
+  has_capacity: boolean;
+}
+
+export interface SeatMetrics {
+  total_seats: number;
+  online_seats: number;
+  busy_seats: number;
+  idle_seats: number;
+  total_capacity: number;
+  used_capacity: number;
+  utilization_rate: number;
+  total_handled: number;
+}
+
+export async function fetchSeats(): Promise<Seat[]> {
+  return api<Seat[]>("/api/seats");
+}
+
+export async function fetchSeatMetrics(): Promise<SeatMetrics> {
+  return api<SeatMetrics>("/api/seats/metrics");
+}
+
+export async function registerSeat(
+  username: string,
+  displayName = "",
+  maxConcurrent = 3,
+): Promise<Seat> {
+  return api<Seat>("/api/seats", {
+    method: "POST",
+    json: {
+      username,
+      display_name: displayName,
+      max_concurrent: maxConcurrent,
+    },
+  });
+}
+
+export async function updateSeatStatus(
+  username: string,
+  status: string,
+): Promise<Seat> {
+  return api<Seat>(`/api/seats/${encodeURIComponent(username)}/status`, {
+    method: "PUT",
+    json: { status },
+  });
+}
+
+// ── 规则引擎（flow/rules.py）──
+
+export interface RuleCondition {
+  field: string;
+  operator: string;
+  value: unknown;
+}
+
+export interface RuleAction {
+  action: string;
+  params: Record<string, unknown>;
+}
+
+export interface AutomationRule {
+  name: string;
+  enabled?: boolean;
+  conditions?: RuleCondition[];
+  actions?: RuleAction[];
+  priority?: number;
+}
+
+export async function fetchRules(): Promise<AutomationRule[]> {
+  return api<AutomationRule[]>("/api/rules");
+}
+
+/** 注意：后端用 Rule(**body) 严格校验，body 必须是完整 Rule 形状。 */
+export async function addRule(rule: AutomationRule): Promise<unknown> {
+  return api("/api/rules", { method: "POST", json: rule });
+}
+
+export async function deleteRule(name: string): Promise<unknown> {
+  return api(`/api/rules/${encodeURIComponent(name)}`, { method: "DELETE" });
+}
+
+export async function evaluateRules(
+  event: Record<string, unknown>,
+): Promise<{ matched_actions: RuleAction[] }> {
+  return api<{ matched_actions: RuleAction[] }>("/api/rules/evaluate", {
+    method: "POST",
+    json: { event },
+  });
+}
+
+// ── SLA 监控 ──
+
+export interface SlaStatus {
+  summary: {
+    total: number;
+    breached: number;
+    compliant: number;
+    breach_rate: number;
+  };
+  breaches: unknown[];
+  sla_config: Record<string, unknown>;
+}
+
+export async function fetchSlaStatus(): Promise<SlaStatus> {
+  return api<SlaStatus>("/api/sla/status");
+}
+
+// ── 工作流 DAG（workflow/router.py）──
+// /graph 与 /graph/preview 返回 text/plain（Mermaid 源码），走 apiRaw 拿原文。
+
+export async function fetchWorkflowGraph(): Promise<string> {
+  const res = await apiRaw("/api/workflow/graph");
+  return res.text();
+}
+
+export async function fetchWorkflowYaml(): Promise<string> {
+  const res = await apiRaw("/api/workflow/graph/yaml");
+  return res.text();
+}
+
+export async function previewWorkflowGraph(yamlText: string): Promise<string> {
+  const res = await apiRaw("/api/workflow/graph/preview", {
+    method: "POST",
+    headers: { "Content-Type": "application/json" },
+    body: JSON.stringify({ yaml: yamlText }),
+  });
+  return res.text();
+}
+
+export async function validateWorkflow(body: Record<string, unknown>): Promise<{
+  valid: boolean;
+  errors: string[];
+  node_count: number;
+  edge_count: number;
+  entry_nodes: string[];
+  exit_nodes: string[];
+}> {
+  return api("/api/workflow/graph/validate", { method: "POST", json: body });
+}
+
+export async function executeWorkflow(body: Record<string, unknown>): Promise<{
+  [key: string]: unknown;
+}> {
+  return api("/api/workflow/execute", { method: "POST", json: body });
 }
