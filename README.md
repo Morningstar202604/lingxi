@@ -67,6 +67,24 @@
 | 2 | 结构化输出缺失：无工具时靠手搓解析模型散文 | ✅ 接入 litellm 官方 `response_format={"type":"json_object"}`（`json_mode`），各 provider 声明支持；解析器降为兜底 |
 | 3 | `test_stream_errors_become_events` 是假测试：没真注入异常，靠上述 bug 触发 error | ✅ 改为真正 patch `acompletion` 抛错 |
 | 4 | 后端 4 组管理端点（审批/坐席/规则/工作流）控制台零消费 —— README 承诺"控制台 /api/approvals 看待审批清单"但无页面 | ✅ 新增审批 / 坐席 / 规则 / 工作流 4 页，导航补齐 |
+| 5 | slowapi 的 `headers_enabled=True` 要求端点返回 `Response`，而端点返回 dict → 被限流的端点全部 500 | ✅ 关闭该选项（限流不依赖响应头）；测试锁死 |
+
+### 工程能力（2026-10-14 引进，全部官方方案）
+
+| 能力 | 方案 | 说明 |
+|---|---|---|
+| LLM 可观测性 | litellm 官方 `success_callback` / `failure_callback` | 自动记录 provider/model/token/成本/延迟/缓存命中；成本用 litellm 内置价格表。Prometheus 新增 5 个 LLM 指标 |
+| LLM 响应缓存 | litellm 官方 `Cache`（disk，可切 redis） | 同 prompt 命中直接返回；`LINGXI_LLM_CACHE__ENABLED=true` 开启。依赖走官方 `litellm[caching]` extra |
+| HTTP 限流 | **slowapi**（官方库） | 只限重端点（LLM 推理 / 知识库写入），读类轮询不限 —— 否则界面自己的 3 秒轮询就耗光额度。默认 `30/minute`，`LINGXI_RATELIMIT__*` 可调 |
+| 结构化输出 | litellm 官方 `response_format` | 无工具时下发 `json_object`；手搓解析器降为兜底 |
+| PWA / 移动端 | Web 标准（manifest + Service Worker） | Android 可直接安装到主屏幕，standalone 运行；静态资源 cache-first、`/api/*` 不缓存 |
+| Agent 编排 | LangGraph（官方 checkpointer） | 未自造状态机或持久化 |
+
+> **关于 Android 交付方式**：当前架构是「客户端 + 引擎服务」——引擎是
+> Python 进程（桌面版由 Tauri 内置为 sidecar 自动拉起）。手机端无法运行
+> 该进程，因此 Android 采用 **PWA**（浏览器"安装到主屏幕"，独立窗口运行）
+> 或**手机浏览器直连你部署的引擎地址**（`NEXT_PUBLIC_API_BASE` 指向服务器）。
+> 这条路径与"线上 API 为主"的定位一致：模型算力在云端，手机只做交互。
 
 ### Agent 运行时能力（2026-10-12 第二轮补齐）
 
@@ -336,12 +354,12 @@ v0.2.0 横切模块:
 
 | 门禁 | 命令 | 当前状态 |
 |---|---|---|
-| 测试 | `pytest tests/ -q` | ✅ **750 passed** |
+| 测试 | `pytest tests/ -q` | ✅ **773 passed** |
 | Lint | `ruff check src tests` | ✅ All checks passed |
-| 类型 | `mypy src`（strict） | ✅ no issues found in 81 source files |
+| 类型 | `mypy src`（strict） | ✅ no issues found in 82 source files |
 | 前端类型 | `cd web && npx tsc --noEmit` | ✅ exit 0 |
 | 前端 Lint | `cd web && npx next lint` | ✅ No ESLint warnings or errors |
-| 前端构建 | `cd web && npm run build` | ✅ Compiled successfully，11 页面静态导出 |
+| 前端构建 | `cd web && npm run build` | ✅ Compiled successfully，17 页面静态导出（含 PWA 资源） |
 | **真实启动** | `python -m lingxi` + 拉 `/openapi.json` | ✅ **挂载 54 条路由**（端口被占自动顺延） |
 | **鉴权探测** | 无 token 打管理面 / 带 token 打管理面 | ✅ 前者 401/503，后者全 200 |
 | 强制点 | `pre-commit run --all-files` | ✅ hooks Passed |
