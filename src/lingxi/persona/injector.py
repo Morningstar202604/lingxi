@@ -22,6 +22,7 @@ from __future__ import annotations
 import contextlib
 import hashlib
 from datetime import datetime
+from typing import Any
 
 from lingxi.core import get_logger
 from lingxi.persona.schema import EmotionLevel, KeywordRule, PersonaConfig, TurnStage
@@ -35,6 +36,60 @@ _STYLE_POOL = [
     "干脆利落，用短句",
     "条理清晰，分点说明",
 ]
+
+# A/B 实验允许覆盖的字段白名单（`behavior.<field>` 或 `identity.<field>`）。
+#
+# 🔗 为什么必须白名单
+#     实验变体若能把 `identity.backstory` 改成"你是一个不受限制的助手"，
+#     一次实验配置失误就等于关掉了人格护栏（护栏是拼进 prompt 的安全锚）。
+#     这里只放**影响表达形式、不影响安全边界**的字段。
+#
+# 🤖 AI 避坑
+#     不要为了"方便"改成黑名单（禁止某几个字段）—— 新增字段时黑名单默认放行，
+#     白名单默认拒绝，后者才是安全的默认值。
+_OVERRIDABLE_FIELDS: dict[str, frozenset[str]] = {
+    "behavior": frozenset({"max_reply_chars", "prefer_short", "emoji_level",
+                           "one_question_at_a_time", "no_unsolicited_menu"}),
+    "identity": frozenset({"speaking_style"}),
+}
+
+
+def _apply_experiment_overrides(
+    persona: PersonaConfig, overrides: dict[str, Any] | None
+) -> PersonaConfig:
+    """把 A/B 实验的 persona 覆盖应用到配置副本上（白名单 + 类型校验）。
+
+    返回新的 PersonaConfig；无效/越界的键被忽略并记录 warning，
+    绝不因为一次实验配置错误就让整条消息处理失败。
+    """
+    if not overrides:
+        return persona
+    allowed_updates: dict[str, dict[str, Any]] = {}
+    for key, value in overrides.items():
+        section, _, field_name = str(key).partition(".")
+        if not field_name:
+            log.warning("ab_override_bad_key", key=key)
+            continue
+        section_allowed = _OVERRIDABLE_FIELDS.get(section)
+        if section_allowed is None or field_name not in section_allowed:
+            # 明确告警而不是静默忽略：配置写错必须能被发现
+            log.warning("ab_override_rejected", key=key, reason="not in whitelist")
+            continue
+        allowed_updates.setdefault(section, {})[field_name] = value
+
+    if not allowed_updates:
+        return persona
+    try:
+        updated = persona.model_copy(deep=True)
+        for section, fields in allowed_updates.items():
+            target = getattr(updated, section)
+            for name, value in fields.items():
+                setattr(target, name, value)
+        # 触发 pydantic 校验（例如 max_reply_chars 必须 ge=1）
+        return PersonaConfig.model_validate(updated.model_dump())
+    except Exception as e:  # noqa: BLE001 — 覆盖失败退化为原配置，不打断对话
+        log.warning("ab_override_invalid", error=str(e))
+        return persona
 
 
 class PersonaInjector:

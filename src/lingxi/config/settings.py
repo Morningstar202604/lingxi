@@ -167,14 +167,63 @@ class RateLimitConfig(BaseModel):
 
 
 class EmbeddingConfig(BaseModel):
-    """Embedding 向量配置 (用于 RAG 知识库)。"""
+    """Embedding 向量配置 (用于 RAG 知识库)。
 
-    model: str = "text-embedding-3-small"
+    🔗 工程逻辑
+        默认**跟随主 LLM 的 provider**（`model` 留空表示"自动"）：
+        - provider=ollama（零配置默认）→ 用本地 `nomic-embed-text`，
+          与主模型同一服务、同一个 host，无需任何额外配置
+        - provider=云端（openai/deepseek/...）→ 用该家的 embedding 端点
+
+        此前默认写死 `text-embedding-3-small`（OpenAI 云端）：本地部署
+        或未配 OpenAI key 时，embedding 调用失败并被静默降级成零向量 ——
+        RAG 看起来"能用"，实际召回全是噪声（AUDIT 已知限制之一）。
+
+    🤖 AI 避坑
+        - `model` 空串 ≠ 配错：它是"自动推导"的显式信号。
+        - 自动推导只在构造时发生一次；运行期改 settings 不生效（保持可预测）。
+    """
+
+    # 空 = 跟随 llm.provider 自动选择；显式填写则优先
+    model: str = ""
     base_url: str | None = None
     api_key: SecretStr | None = None
     dimensions: int = 1536  # 首次 embedding 后自动覆盖
     chunk_size: int = 500  # token
     chunk_overlap: float = 0.1  # 10%
+
+    # 各 provider 的默认 embedding 模型（自动推导用）
+    _PROVIDER_DEFAULTS: ClassVar[dict[str, str]] = {
+        "ollama": "ollama/nomic-embed-text",
+        "openai": "openai/text-embedding-3-small",
+        "deepseek": "openai/text-embedding-3-small",  # DeepSeek 无自有 embedding，走兼容端点
+        "litellm": "openai/text-embedding-3-small",
+        "anthropic": "openai/text-embedding-3-small",  # Anthropic 无 embedding API
+    }
+
+    def resolved_model(self, llm_provider: str) -> str:
+        """解析出实际使用的 embedding 模型（含 litellm 前缀）。"""
+        if self.model:
+            return self.model
+        return self._PROVIDER_DEFAULTS.get(
+            llm_provider, "openai/text-embedding-3-small"
+        )
+
+    def resolved_base_url(self, llm_provider: str, llm_base_url: str | None) -> str:
+        """解析 base_url：显式配置优先；否则跟随主 LLM。
+
+        实测（2026-10-15，本地 Ollama 0.40.3）：litellm 的 ollama embedding
+        走**原生 API**（/api/embed），带 `/v1` 的 URL 一律 404
+        ——与 chat 同一个坑（见 agent/llm.resolve_base_url）。
+        """
+        if self.base_url:
+            return self.base_url
+        if llm_provider == "ollama":
+            base = (llm_base_url or "http://127.0.0.1:11434").rstrip("/")
+            if base.endswith("/v1"):
+                base = base[:-3]
+            return base
+        return llm_base_url or ""
 
 
 class KnowledgeConfig(BaseModel):

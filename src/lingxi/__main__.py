@@ -219,10 +219,19 @@ class Engine:
     async def run(self, dashboard_host: str | None = None,
                   dashboard_port: int = 8080) -> None:
         """并发运行 IM 适配器与 Dashboard HTTP 服务，直到 Ctrl+C / stop。"""
+        # 自动关单时释放坐席槽位（否则坐席 current_ticket_count 只增不减，
+        # 满载后永远不再接单）。
+        closer = getattr(self, "assigner", None)
         # 启动后台自动关闭协程 (每 60s 扫描 idle tickets)
         auto_close_task = asyncio.create_task(
-            _auto_close_idle_tickets(self.tickets, interval=60.0),
+            _auto_close_idle_tickets(self.tickets, interval=60.0, assigner=closer),
             name="auto_close",
+        )
+        # 业务 Gauge 刷新（活跃工单分布 / 队列深度）——
+        # update_business_metrics 此前全仓零调用，Gauge 永远是 0。
+        metrics_task = asyncio.create_task(
+            _refresh_business_metrics(self.tickets, self.queue, interval=30.0),
+            name="business_metrics",
         )
         try:
             # 收集所有 adapter.run() 协程
@@ -243,6 +252,7 @@ class Engine:
             await asyncio.gather(*adapter_runs, self.serve_dashboard(dashboard_host, dashboard_port))
         finally:
             auto_close_task.cancel()
+            metrics_task.cancel()
             aclose = getattr(self.agent, "aclose", None)
             if callable(aclose):
                 await aclose()
@@ -407,6 +417,12 @@ def build_default_engine(
     sla_monitor = SLAMonitor(SLADefinition())
     rule_engine = RuleEngine()
 
+    # A/B 实验引擎：必须在 pipeline 之前构造 —— 分流要真正参与消息链路
+    # （此前它只挂管理 API，实验能建、指标看得到，但对话不受影响 = 空转）。
+    from lingxi.experiment import ExperimentEngine
+
+    experiment_engine = ExperimentEngine()
+
     pipeline = CustomerServicePipeline(
         agent=agent,
         ticket_store=tickets,
@@ -420,6 +436,8 @@ def build_default_engine(
         pii_guard=pii_guard,
         audit_log=audit_log,
         tool_registry=registry,
+        experiment_engine=experiment_engine,
+        persona_injector=injector,
     )
 
     async def _on_event(event: IMEvent) -> None:
@@ -440,7 +458,18 @@ def build_default_engine(
                 keyword_escalate_reason = kw_result[1]
         # 记忆与世界观必须由 injector 拼进 system prompt：reason 节点不读 state 中的块，
         # 只写进 state 等于凭空消失（见 docs/AUDIT-2026-10-10.md #17）
-        system_prompt = injector.build_system_prompt(
+        #
+        # A/B 实验：命中的变体通过白名单覆盖 persona（措辞风格/回复长度上限等），
+        # 不影响身份锚与护栏 —— 那些字段不在 injector 的 _OVERRIDABLE_FIELDS 里。
+        active_injector = injector
+        ab_overrides = pipeline.experiment_overrides_for(event.user_id)
+        if ab_overrides:
+            from lingxi.persona.injector import PersonaInjector, _apply_experiment_overrides
+
+            active_injector = PersonaInjector(
+                _apply_experiment_overrides(injector._persona, ab_overrides)
+            )
+        system_prompt = active_injector.build_system_prompt(
             memory_block=memory_block,
             lorebook_block=lorebook_block,
             user_message=event.text,
@@ -481,16 +510,22 @@ def build_default_engine(
     for _adapter in adapters:
         _adapter._on_event = _on_event
 
-    # A/B 实验引擎：挂到 Dashboard 后 /api/experiments* 才存在（此前从未构造 → 404）
-    from lingxi.experiment import ExperimentEngine
-
-    experiment_engine = ExperimentEngine()
-
-    # 坐席管理：注册/状态/分配/利用率，供 dashboard 的 /api/seats* 使用
+    # 坐席管理：注册/状态/分配/利用率，供 dashboard 的 /api/seats* 使用。
+    # 持久化模式接 SQLite（与 tickets/queue 同一个 DB 文件）：
+    # 此前 SeatStore 是纯内存，进程重启后坐席与负载计数全部归零。
     from lingxi.seat.assignment import TicketAssigner
     from lingxi.seat.models import SeatStore
 
-    seat_store = SeatStore()
+    if settings.memory.persistent:
+        try:
+            seat_store = SeatStore.with_sqlite(
+                str(settings.data_dir / settings.memory.db_path),
+            )
+        except Exception as e:  # noqa: BLE001 — 坐席持久化失败不阻断引擎启动
+            log.warning("seat_store_persistent_failed_fallback_memory", error=str(e))
+            seat_store = SeatStore()
+    else:
+        seat_store = SeatStore()
     assigner = TicketAssigner(seat_store)
 
     log.info("engine_built", channels=im_channels, adapters=len(adapters),
@@ -689,11 +724,16 @@ async def _auto_close_idle_tickets(
     ticket_store: Any,
     interval: float = 60.0,
     idle_seconds: float = 1800.0,
+    assigner: Any = None,
 ) -> None:
     """后台协程：定期扫描 idle tickets 并自动关闭。
 
     复用 Ticket.can_auto_close() 判断逻辑。每 interval 秒扫描一次。
     被取消 (Engine.run 退出) 时优雅退出。
+
+    assigner 非空时，关单同时释放该工单占用的坐席槽位 —— 否则坐席
+    current_ticket_count 只增不减，满载后永远不再接单
+    （坐席分配此前只有"占用"没有"归还"的配对路径）。
     """
     from lingxi.flow.ticket import TicketStatus
 
@@ -708,7 +748,58 @@ async def _auto_close_idle_tickets(
                 ticket.transition(TicketStatus.CLOSED)
                 log.info("ticket_auto_closed", ticket_id=ticket.ticket_id, idle=idle_seconds)
             except ValueError:
-                pass
+                continue
+            # 释放坐席容量（含应答时长结算），失败不影响关单结果
+            if assigner is not None:
+                try:
+                    assigner.release(ticket)
+                except Exception as e:  # noqa: BLE001
+                    log.warning(
+                        "seat_release_on_auto_close_failed",
+                        ticket_id=ticket.ticket_id,
+                        error=str(e),
+                    )
+
+
+async def _refresh_business_metrics(
+    ticket_store: Any,
+    queue: Any,
+    interval: float = 30.0,
+) -> None:
+    """后台协程：定期把工单状态分布与队列深度写进 Prometheus Gauge。
+
+    🔗 工程逻辑
+        `update_business_metrics` 此前只有定义、全仓零调用 —— 面板上
+        "活跃工单 / 队列深度" 永远是 0，等于没有业务可观测性。
+        与 auto_close 同一模式：低频扫描，被取消时优雅退出。
+
+    🤖 AI 避坑
+        指标刷新失败绝不能杀死协程（存储后端可能是 PG，偶发超时很正常），
+        单次失败只记 warning，下一轮继续。
+    """
+    while True:
+        try:
+            await asyncio.sleep(interval)
+        except asyncio.CancelledError:
+            return
+        try:
+            from lingxi.metrics import get_metrics_collector
+
+            collector = get_metrics_collector()
+            active = ticket_store.list_active()
+            by_status: dict[str, int] = {}
+            for t in active:
+                status = getattr(getattr(t, "status", None), "value", None)
+                key = str(status or "unknown")
+                by_status[key] = by_status.get(key, 0) + 1
+            depth = queue.pending_count
+            if callable(depth):
+                depth = depth()
+            collector.update_business_metrics(by_status, int(depth or 0))
+        except asyncio.CancelledError:
+            raise
+        except Exception as e:  # noqa: BLE001 — 指标不允许打断引擎
+            log.warning("business_metrics_refresh_failed", error=str(e))
 
 
 def _load_yaml_lorebooks() -> Lorebook:

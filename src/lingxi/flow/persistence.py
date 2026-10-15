@@ -133,8 +133,16 @@ class _SqliteWriter:
         async with db.execute("SELECT * FROM memories") as cur:
             async for row in cur:
                 mems.append(dict(row))
+        seats: list[dict[str, Any]] = []
+        try:
+            async with db.execute("SELECT * FROM seats") as cur:
+                async for row in cur:
+                    seats.append(dict(row))
+        except Exception:
+            # 老库没有 seats 表（在加入该表之前创建）→ 视为空，不报错
+            seats = []
         db.row_factory = orig_factory
-        return {"tickets": tickets, "queue": entries, "memories": mems}
+        return {"tickets": tickets, "queue": entries, "memories": mems, "seats": seats}
 
     @staticmethod
     async def _init_schema(db: Any) -> None:
@@ -180,6 +188,21 @@ class _SqliteWriter:
             );
             CREATE INDEX IF NOT EXISTS idx_memories_user ON memories(user_id);
             CREATE INDEX IF NOT EXISTS idx_memories_status ON memories(status);
+
+            -- 坐席（seat/models.py SeatStore）：此前只存内存，重启后
+            -- 坐席与负载计数全部归零。
+            CREATE TABLE IF NOT EXISTS seats (
+                username             TEXT PRIMARY KEY,
+                display_name         TEXT NOT NULL DEFAULT '',
+                status               TEXT NOT NULL DEFAULT 'offline',
+                max_concurrent       INTEGER NOT NULL DEFAULT 3,
+                current_ticket_count INTEGER NOT NULL DEFAULT 0,
+                total_handled        INTEGER NOT NULL DEFAULT 0,
+                avg_response_seconds REAL NOT NULL DEFAULT 0,
+                response_total_seconds REAL NOT NULL DEFAULT 0,
+                last_active_at       TEXT NOT NULL DEFAULT '',
+                created_at           TEXT NOT NULL DEFAULT ''
+            );
             """
         )
         await db.commit()
@@ -230,6 +253,18 @@ class _SqliteWriter:
             await db.execute("DELETE FROM memories WHERE memory_id=?", (op["memory_id"],))
             await db.commit()
 
+        elif kind == "upsert_seat":
+            d = op["data"]
+            await db.execute(
+                "INSERT OR REPLACE INTO seats VALUES (?,?,?,?,?,?,?,?,?,?)",
+                (d["username"], d["display_name"], d["status"],
+                 d["max_concurrent"], d["current_ticket_count"],
+                 d["total_handled"], d["avg_response_seconds"],
+                 d.get("response_total_seconds", 0.0),
+                 d.get("last_active_at", ""), d.get("created_at", "")),
+            )
+            await db.commit()
+
     def submit(self, op: dict[str, Any]) -> None:
         """提交写入操作 (非阻塞, 队列满则丢弃 + 告警)。"""
         if not self._running:
@@ -254,14 +289,16 @@ class _SqliteWriter:
             self._queue.put_nowait("barrier")
         except queue.Full:
             log.warning("sqlite_barrier_queue_full", db=self._db_path)
-            return {"tickets": [], "queue": [], "memories": []}
+            return {"tickets": [], "queue": [], "memories": [], "seats": []}
 
         if not barrier_event.wait(timeout=5.0):
             log.warning("sqlite_barrier_timeout", db=self._db_path)
-            return {"tickets": [], "queue": [], "memories": []}
+            return {"tickets": [], "queue": [], "memories": [], "seats": []}
 
         result = self._barrier_holder
-        return result if result is not None else {"tickets": [], "queue": [], "memories": []}
+        return result if result is not None else {
+            "tickets": [], "queue": [], "memories": [], "seats": []
+        }
 
     def close(self) -> None:
         self._running = False
@@ -681,17 +718,35 @@ class PersistentMemoryPipeline:
         return self._inner.recall_hybrid(user_id, query, top_k, min_confidence)
 
 
-# ── 全局单例 writer (三表共用一个 sqlite 文件) ───────────────────
-
-_default_writer: _SqliteWriter | None = None
+# ── writer 缓存：**按 db_path 分别缓存** ─────────────────────────
+#
+# 旧实现是单个全局 `_default_writer`，无视传入的 db_path —— 第二次用不同
+# 路径调用时静默复用第一个 writer，于是"写 A 库"实际写进了 B 库。
+# 测试隔离被破坏只是表象；生产里同一进程接两个数据目录（或测试与引擎
+# 共用进程）就会串库。改为按路径缓存各一个实例。
+_writers: dict[str, _SqliteWriter] = {}
+_writers_lock = threading.Lock()
 
 
 def get_or_create_writer(db_path: str) -> _SqliteWriter:
-    """获取或创建全局 SQLite writer 实例。"""
-    global _default_writer
-    if _default_writer is None:
-        _default_writer = _SqliteWriter(db_path)
-    return _default_writer
+    """获取或创建该 db_path 对应的 SQLite writer 实例（按路径隔离）。"""
+    key = str(db_path)
+    with _writers_lock:
+        writer = _writers.get(key)
+        if writer is None:
+            writer = _SqliteWriter(key)
+            _writers[key] = writer
+        return writer
+
+
+def reset_writers_for_tests() -> None:
+    """关闭并清空 writer 缓存（测试隔离用）。"""
+    global _writers
+    with _writers_lock:
+        for w in _writers.values():
+            with contextlib.suppress(Exception):
+                w.close()
+        _writers = {}
 
 
 async def create_persistent_stores(

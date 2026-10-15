@@ -407,6 +407,11 @@ def create_dashboard_app(
         # 同步更新 ticket 状态为 CLOSED
         with contextlib.suppress(ValueError):
             ticket.transition(TicketStatus.CLOSED)
+        # 关单即释放坐席槽位（含应答时长结算）——坐席认领过但从不归还会
+        # 让 current_ticket_count 只增不减，满载后再也不接单。
+        if assigner is not None:
+            with contextlib.suppress(Exception):
+                assigner.release(ticket)
         return {"ticket_id": ticket_id, "status": "completed"}
 
     # ── 入站 Webhook（HMAC-SHA256 验签）──

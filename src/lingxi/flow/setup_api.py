@@ -111,6 +111,26 @@ async def _probe_ollama(native_base: str) -> dict[str, Any]:
     return await asyncio.to_thread(_sync)
 
 
+def _embedding_status(s: Any) -> dict[str, Any]:
+    """embedding（RAG 检索）状态：跟随 LLM provider 自动推导的模型与降级情况。"""
+    ec = s.embedding
+    status: dict[str, Any] = {
+        "model": ec.resolved_model(s.llm.provider),
+        "base_url": ec.resolved_base_url(s.llm.provider, s.llm.base_url),
+        "degraded": False,
+        "degraded_reason": "",
+    }
+    # 若单例已构造过，读它真实的降级状态（调用失败过就会置位）
+    try:
+        from lingxi.knowledge.embedder import _default_embedder
+
+        if _default_embedder is not None:
+            status.update(_default_embedder.health())
+    except Exception:  # noqa: BLE001
+        pass
+    return status
+
+
 def register_setup_routes(
     app: FastAPI, check_admin: Callable[[str | None], None]
 ) -> None:
@@ -162,6 +182,9 @@ def register_setup_routes(
                 "ready": ready,
                 "mode": mode,
             },
+            # 知识库检索（RAG）依赖 embedding；降级成零向量时这里能看见，
+            # 不再"界面看起来正常、召回全是噪声"。
+            "embedding": _embedding_status(s),
             "recommendation": {
                 "primary": "cloud",
                 "text": (
