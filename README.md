@@ -127,10 +127,17 @@ L4 红线无论谁批都不放行。审批记录按 (工具, 参数, 会话) 指
 
 | 项 | 原因 |
 |---|---|
-| 向量检索降级零向量 | 未配 embedding key 时的既有降级策略，需配 `LINGXI_EMBEDDING__API_KEY` 才生效 |
 | 趋势图只画本次会话采样 | 后端不存时序历史，页面不伪造数据 |
 | Mem0 全局记忆计数为估算 | mem0 2.x 的 `get_all` 必须带 entity filter；总数退化为查询底层向量库（chroma）计数 |
-| A/B 分流不参与消息链路 | 实验引擎的管理/分配/指标 API 已就绪（`/api/experiments*`），但"哪个实验驱动人格覆盖"属产品定义，未硬编码进消息流 |
+
+> 下列三项曾列为"已知限制"，2026-10-15 已收口：
+> **向量检索降级零向量** → embedding 现在跟随主 LLM provider 自动推导
+> （ollama → 本地 `nomic-embed-text`，实测 768 维非零），降级状态在
+> `/api/setup/status` 的 `embedding` 段可见；
+> **A/B 分流不参与消息链路** → 实验变体通过白名单覆盖真正影响每轮 persona
+> （措辞风格/回复长度等，身份锚与护栏不可覆盖）；
+> **坐席数据** → SeatStore 接入 SQLite（与工单同库），重启保留坐席与
+> 累计处理数，且关单会归还容量、应答时长有真实来源。
 
 ## 开源复用
 
@@ -357,7 +364,7 @@ v0.2.0 横切模块:
 
 | 门禁 | 命令 | 当前状态 |
 |---|---|---|
-| 测试 | `pytest tests/ -q` | ✅ **773 passed** |
+| 测试 | `pytest tests/ -q` | ✅ **809 passed** |
 | Lint | `ruff check src tests` | ✅ All checks passed |
 | 类型 | `mypy src`（strict） | ✅ no issues found in 82 source files |
 | 前端类型 | `cd web && npx tsc --noEmit` | ✅ exit 0 |
