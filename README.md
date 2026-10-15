@@ -145,11 +145,18 @@ L4 红线无论谁批都不放行。审批记录按 (工具, 参数, 会话) 指
 |---|---|
 | QQ 桥 | NapCat (OneBot v11) |
 | 微信桥 | Gewechat (OneBot 兼容) |
-| 工具协议 | MCP (Model Context Protocol) |
+| 工具协议 | **官方 `mcp` SDK**（协议层由其承担，我们只提供工具来源与数据源） |
 | Agent 编排 | LangGraph |
 | 长期记忆 | 内置管线（可升级 Mem0） |
 | 知识图谱 | 内置图谱（可升级 Neo4j） |
-| 多模型路由 | LiteLLM |
+| 多模型路由 | LiteLLM（含官方 **Router**：多凭据轮转 / 熔断 / 成本预算） |
+| 重试退避 | **tenacity** |
+| 关键词召回 | **rank_bm25** |
+| 检索重排 | **flashrank**（本地 cross-encoder，无 API key） |
+| 工具入参校验 | **jsonschema**（Draft 2020-12） |
+| PII 脱敏 | **Microsoft Presidio**（框架 + 中文识别器插件 + 正则兜底） |
+| Shell 隔离 | **Docker**（只读挂载 / 禁网 / cap-drop ALL / 资源上限） |
+| LLM 追踪 | litellm 官方集成 → **LangSmith / OpenTelemetry**（按需启用） |
 | 角色卡标准 | SillyTavern Character Card V3 |
 | 人格引擎参考 | Hermes Persona 13 模块 |
 | JWT 鉴权 | PyJWT |
@@ -158,6 +165,30 @@ L4 红线无论谁批都不放行。审批记录按 (工具, 参数, 会话) 指
 | PostgreSQL 驱动 | asyncpg |
 
 > 不重复造轮子。仅针对 IM 桥接、人格护栏、记忆管线、分级权限等核心差异化部件自研。
+
+### 官方生态使用清单（2026-10-15 全面对齐）
+
+**原则：能用的官方/成熟方案直接用，不手搓。** 本轮把此前手搓或
+"装了没用"的部分换成官方实现，并记录取舍：
+
+| 领域 | 采用 | 取舍说明 |
+|---|---|---|
+| MCP 协议 | 官方 `mcp` SDK | JSON-RPC 编解码/握手/三原语 schema 属"细节多、版本快"，手搓必漂移（迁移时实测出 2 处响应形状错误） |
+| 重试退避 | tenacity | 指数退避+抖动+停止条件是标准能力，只需提供"哪些异常可重试"的领域知识 |
+| BM25 | rank_bm25 | IDF 平滑 / k1b 调参 / 长度归一化交给官方，我们只保留中文分词器 |
+| 工具入参校验 | jsonschema | 直接用工具已声明的 schema，报错可读、模型能自我修复 |
+| 检索重排 | flashrank | 本地 ONNX（无 API key、可离线）；失败自动降级原序 |
+| PII | Presidio + 中文插件 | 框架/置信度/匿名化算子用官方；**中文证件识别器必须自写** —— Presidio 预置识别器对中文手机号/身份证完全识别不到（实测），那是领域知识不是协议 |
+| 注入检测 | 自研规则 + **评估集** | 试过 llm-guard：装不上（需 C++ 工具链）且依赖运行时下载数百 MB 模型，与离线前提冲突；改为用评估集（31 条攻击 + 10 条良性）量化驱动 —— 当前拦截率 100% / 误伤 0% |
+| Shell 隔离 | Docker | 权限分级管"要不要批准"，容器管"执行时能碰到什么"，两者互补 |
+| 多 key / 熔断 / 预算 | litellm Router | 自研熔断几乎必错（时间窗 / 半开状态 / 并发计数竞争） |
+| LLM 追踪 | litellm 官方集成 | span 结构与 token/成本属性已归一化；默认关闭（离线部署是常态） |
+| 结构化输出 | 官方 `response_format` + function calling | 未引入 instructor/outlines：两条官方路径已覆盖，再加库属重复 |
+
+> 可选依赖按需安装：`pip install 'lingxi[rerank]'`（检索重排）、
+> `'lingxi[pii]'`（Presidio 脱敏），以及 `'lingxi[mem0]'` /
+> `'lingxi[neo4j]'` / `'lingxi[postgres]'`。全部**优雅降级**：缺失时
+> 退化为内置实现并告警，不会因选装依赖缺失而启动失败。
 
 ## 快速开始
 
@@ -364,9 +395,9 @@ v0.2.0 横切模块:
 
 | 门禁 | 命令 | 当前状态 |
 |---|---|---|
-| 测试 | `pytest tests/ -q` | ✅ **809 passed** |
+| 测试 | `pytest tests/ -q` | ✅ **909 passed** |
 | Lint | `ruff check src tests` | ✅ All checks passed |
-| 类型 | `mypy src`（strict） | ✅ no issues found in 82 source files |
+| 类型 | `mypy src`（strict） | ✅ no issues found in 85 source files |
 | 前端类型 | `cd web && npx tsc --noEmit` | ✅ exit 0 |
 | 前端 Lint | `cd web && npx next lint` | ✅ No ESLint warnings or errors |
 | 前端构建 | `cd web && npm run build` | ✅ Compiled successfully，17 页面静态导出（含 PWA 资源） |
