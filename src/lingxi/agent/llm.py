@@ -283,6 +283,40 @@ async def call_llm(
     ]
     wire_models = [resolve_model_name(llm_cfg.provider, m) for m in models_to_try]
 
+    # ── Router 路径（多 key 轮转 / 熔断 / 预算）──
+    # 只在配了多凭据或显式开启时启用；单 key 场景保持下面的直连路径
+    # （Router 会多包一层，对零配置本地模型是负收益）。
+    try:
+        from lingxi.agent.llm_router import build_router
+
+        router = build_router(settings)
+    except Exception as e:  # noqa: BLE001 — Router 不可用不影响直连
+        log.warning("llm_router_unavailable", error=str(e))
+        router = None
+
+    if router is not None:
+        router_kwargs: dict[str, Any] = {
+            "messages": messages,
+            "temperature": llm_cfg.temperature,
+            "max_tokens": llm_cfg.max_tokens,
+            "timeout": 30,
+        }
+        if tools:
+            router_kwargs["tools"] = tools
+            router_kwargs["tool_choice"] = "auto"
+        elif json_mode:
+            router_kwargs["response_format"] = {"type": "json_object"}
+        try:
+            response = await router.acompletion(**router_kwargs)
+            if usage is not None:
+                usage.add(response)
+            extract_content(response)
+            return response
+        except Exception as e:  # noqa: BLE001
+            # Router 内部已做过重试/轮转/冷却；这里再失败说明整组不可用，
+            # 落到下面的直连路径做最后尝试（例如 Router 配置有误）
+            log.warning("llm_router_call_failed_fallback_direct", error=str(e)[:200])
+
     for model_idx, (model, wire_model) in enumerate(
         zip(models_to_try, wire_models, strict=True),
     ):

@@ -130,6 +130,23 @@ class LLMConfig(BaseModel):
         "qwen2.5:7b", "llama3.1:8b", "mistral:7b"
     ])
 
+    # ── 多凭据轮转（litellm 官方 Router）──
+    # 配了额外 keys（或显式开启 router_enabled）才构建 Router：
+    # 同组多个部署按 routing_strategy 挑选，失败达 allowed_fails 次自动
+    # 冷却（熔断）cooldown_time 秒。单 key 场景不启用（避免多余包装）。
+    api_keys: list[SecretStr] = Field(default_factory=list)
+    router_enabled: bool = False
+    routing_strategy: Literal[
+        "simple-shuffle", "least-busy", "usage-based-routing", "latency-based-routing"
+    ] = "simple-shuffle"
+    allowed_fails: int = Field(default=3, ge=1, le=20)
+    cooldown_time: float = Field(default=60.0, gt=0, le=3600)
+    # 成本预算（美元/周期）。超限后 litellm 阻断调用（官方 provider_budget_config）。
+    # 注意：litellm 用内置价格表估算成本；未收录的自建端点记 0，预算对其无效 ——
+    # 不要以为"设了预算就万无一失"。
+    max_budget_usd: float | None = Field(default=None, gt=0)
+    budget_duration: str = "30d"
+
 
 class LLMCacheConfig(BaseModel):
     """LLM 响应缓存（litellm 官方 cache）。

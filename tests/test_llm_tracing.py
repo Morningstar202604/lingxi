@@ -33,9 +33,15 @@ class TestDefaultOff:
         assert result == {"langsmith": False, "otel": False}
 
     def test_status_reports_no_external(self) -> None:
+        """st 里不该出现我们挂的外部追踪后端。
+
+        注意：litellm 自己会挂 `LeastBusyLoggingHandler` 等内部 handler，
+        所以断言的是"没有 otel/langsmith"，不是"callbacks 全空"。
+        """
         setup_tracing(Settings())
         st = tracing_status()
-        assert st["external_tracing"] is False or st["callbacks"] == []
+        external = [c for c in st["callbacks"] if c in ("otel", "LangsmithLogger")]
+        assert external == [], f"未配置时不该挂外部追踪: {external}"
 
 
 class TestOtelEnabled:
