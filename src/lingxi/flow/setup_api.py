@@ -131,6 +131,34 @@ def _embedding_status(s: Any) -> dict[str, Any]:
     return status
 
 
+def _rerank_status(s: Any) -> dict[str, Any]:
+    """rerank 状态：是否启用、模型是否已加载。"""
+    kcfg = s.knowledge
+    status: dict[str, Any] = {
+        "enabled": bool(getattr(kcfg, "rerank_enabled", True)),
+        "model": str(getattr(kcfg, "rerank_model", "")),
+        "loaded": False,
+        "load_failed_reason": "",
+    }
+    try:
+        from lingxi.knowledge.rerank import rerank_status
+
+        status.update(rerank_status())
+    except Exception:  # noqa: BLE001
+        pass
+    return status
+
+
+def _tracing_status() -> dict[str, Any]:
+    """外部追踪（LangSmith / OTLP）状态。"""
+    try:
+        from lingxi.agent.llm_observability import tracing_status
+
+        return tracing_status()
+    except Exception:  # noqa: BLE001
+        return {"callbacks": [], "external_tracing": False}
+
+
 def register_setup_routes(
     app: FastAPI, check_admin: Callable[[str | None], None]
 ) -> None:
@@ -185,6 +213,9 @@ def register_setup_routes(
             # 知识库检索（RAG）依赖 embedding；降级成零向量时这里能看见，
             # 不再"界面看起来正常、召回全是噪声"。
             "embedding": _embedding_status(s),
+            # 检索重排与外部追踪状态（"接了更好"，没接也要能看见）
+            "rerank": _rerank_status(s),
+            "tracing": _tracing_status(),
             "recommendation": {
                 "primary": "cloud",
                 "text": (

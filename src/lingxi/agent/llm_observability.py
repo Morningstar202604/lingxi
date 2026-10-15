@@ -148,8 +148,128 @@ def setup_llm_observability(settings: Any = None) -> None:
         except Exception as e:  # noqa: BLE001 — 缓存失败不该阻断启动
             log.warning("llm_cache_setup_failed", error=str(e))
 
+    # ── 3. 全链路追踪（可选）：litellm 内置的 LangSmith / OpenTelemetry 集成 ──
+    # 默认关闭（零配置可用）；配置了对应环境变量才接外部追踪后端。
+    setup_tracing(settings)
+
     _configured = True
     log.info("llm_observability_enabled")
+
+
+def setup_tracing(settings: Any = None) -> dict[str, Any]:
+    """接 litellm 内置的分布式追踪（LangSmith / OpenTelemetry）。
+
+    🔗 工程逻辑
+        "预测"式的自研追踪毫无意义 —— litellm 官方已经把各家 LLM 调用
+        的 span 结构、父子关系、token/成本属性都归一化好了。我们只需要
+        按环境变量决定挂哪个后端：
+
+        - `LANGCHAIN_TRACING_V2=true` + `LANGCHAIN_API_KEY` → LangSmith
+          （LLM 应用最常见的追踪平台，支持 dataset/评估流水线）
+        - `OTEL_EXPORTER_OTLP_ENDPOINT` → 任意 OTLP 后端
+          （Jaeger / Tempo / Grafana / Datadog 都收）
+
+        **默认不接**：离线部署（本项目常态）不该因为缺少追踪后端
+        而报错或拖慢启动。Prometheus 指标（上面的 callback）已经提供
+        基础可观测性，全链路 trace 是"接了更好"而不是"不接就瞎"。
+
+    Returns:
+        {"langsmith": bool, "otel": bool} —— 实际挂上的后端。
+    """
+    if settings is None:
+        from lingxi.config import get_settings
+
+        settings = get_settings()
+
+    result = {"langsmith": False, "otel": False}
+    try:
+        import litellm
+    except ImportError:  # pragma: no cover
+        return result
+
+    import os
+
+    # ── LangSmith（litellm 官方集成）──
+    if os.environ.get("LANGCHAIN_TRACING_V2", "").lower() in ("1", "true", "yes"):
+        try:
+            from litellm.integrations.langsmith import LangsmithLogger
+
+            litellm.callbacks = list(getattr(litellm, "callbacks", None) or [])
+            litellm.callbacks.append(LangsmithLogger())
+            result["langsmith"] = True
+            log.info("tracing_langsmith_enabled")
+        except Exception as e:  # noqa: BLE001 — 追踪失败不影响业务
+            log.warning("tracing_langsmith_failed", error=str(e))
+
+    # ── OpenTelemetry（任意 OTLP 后端）──
+    #
+    # ⚠️ 实测上游兼容问题（2026-10-15）：litellm 1.83 的
+    # `litellm.integrations.opentelemetry.OpenTelemetry` 会 import 它自带的
+    # experimental_mcp_client，而那段按 **mcp<2** 的 API 写
+    # （期望 `mcp.server.Server.list_tools`）；环境里是 mcp 2.3（API 已变），
+    # 挂载时报 `'Server' object has no attribute 'list_tools'`。
+    # 这是 litellm 与 mcp 2.x 的版本冲突，非本项目可修。
+    #
+    # 解法：初始化**独立 OTel SDK**（opentelemetry-sdk 已在依赖里），
+    # 再给 litellm 挂字符串 callback 名 "otel" —— litellm 内部按名解析，
+    # 绕开它会 import MCP 分支的那条路径。
+    if os.environ.get("OTEL_EXPORTER_OTLP_ENDPOINT"):
+        try:
+            from opentelemetry import trace
+            from opentelemetry.sdk.resources import Resource
+            from opentelemetry.sdk.trace import TracerProvider
+
+            provider = TracerProvider(
+                resource=Resource.create({"service.name": "zhixi-engine"})
+            )
+            try:
+                from opentelemetry.exporter.otlp.proto.grpc.trace_exporter import (
+                    OTLPSpanExporter,
+                )
+                from opentelemetry.sdk.trace.export import BatchSpanProcessor
+
+                provider.add_span_processor(BatchSpanProcessor(OTLPSpanExporter()))
+            except ImportError:
+                # 只装了 sdk 没装 exporter：仍可本地 span（供测试/调试）
+                log.warning("tracing_otel_exporter_missing", hint="pip install opentelemetry-exporter-otlp")
+            trace.set_tracer_provider(provider)
+
+            litellm.callbacks = list(getattr(litellm, "callbacks", None) or [])
+            litellm.callbacks.append("otel")
+            result["otel"] = True
+            log.info(
+                "tracing_otel_enabled",
+                endpoint=os.environ["OTEL_EXPORTER_OTLP_ENDPOINT"],
+                note="standalone OTel SDK（绕开 litellm 的 mcp<2 兼容问题）",
+            )
+        except Exception as e:  # noqa: BLE001
+            log.warning("tracing_otel_failed", error=str(e))
+
+    if not any(result.values()):
+        log.info(
+            "tracing_external_disabled",
+            hint=(
+                "未配置外部追踪（Prometheus 指标仍在采集）。"
+                "接 LangSmith: LANGCHAIN_TRACING_V2=true + LANGCHAIN_API_KEY；"
+                "接 OTLP: OTEL_EXPORTER_OTLP_ENDPOINT=http://..."
+            ),
+        )
+    return result
+
+
+def tracing_status() -> dict[str, Any]:
+    """当前追踪后端状态（健康检查/排障）。"""
+    try:
+        import litellm
+
+        # callback 可以是实例，也可以是字符串名（litellm 内部按名解析）
+        names = [
+            c if isinstance(c, str) else type(c).__name__
+            for c in (getattr(litellm, "callbacks", None) or [])
+        ]
+    except ImportError:  # pragma: no cover
+        names = []
+    return {"callbacks": names, "external_tracing": len(names) > 0}
 
 
 def reset_for_tests() -> None:
@@ -158,4 +278,9 @@ def reset_for_tests() -> None:
     _configured = False
 
 
-__all__ = ["setup_llm_observability", "reset_for_tests"]
+__all__ = [
+    "setup_llm_observability",
+    "setup_tracing",
+    "tracing_status",
+    "reset_for_tests",
+]
