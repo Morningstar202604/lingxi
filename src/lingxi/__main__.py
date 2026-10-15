@@ -374,12 +374,13 @@ def build_default_engine(
 
     # MCP 服务端：把同一份 ToolRegistry 暴露为 MCP / OpenAI 兼容协议，
     # 供外部客户端（Cursor / Claude Desktop 等）复用引擎能力。
-    # resources/prompts 两个原语接的是真实数据源：知识库、人格配置、实体图谱。
+    # 协议实现是**官方 mcp SDK**（不再手搓 JSON-RPC）；我们只提供工具来源
+    # （带权限门控）与 resources/prompts 的真实数据源。
     from lingxi.mcp.primitives import build_default_registry as build_mcp_registry
     from lingxi.mcp.primitives import set_resource_registry
-    from lingxi.mcp.server import init_mcp_server
+    from lingxi.mcp.server import build_mcp_server
 
-    init_mcp_server(registry, min_permission=permission_level)
+    build_mcp_server(registry, min_permission=permission_level)
     set_resource_registry(build_mcp_registry(
         knowledge=knowledge,
         persona=injector._persona,

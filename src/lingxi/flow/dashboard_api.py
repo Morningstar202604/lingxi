@@ -255,10 +255,17 @@ def create_dashboard_app(
         )
 
     # ── MCP / OpenAI 兼容工具路由（内部需 admin token）──
-    from lingxi.mcp.router import create_mcp_router, create_openai_tools_router
+    from lingxi.mcp.router import (
+        create_mcp_router,
+        create_openai_tools_router,
+        mount_mcp_transport,
+    )
 
     app.include_router(create_mcp_router())
     app.include_router(create_openai_tools_router())
+    # 官方 MCP SDK 的标准传输（streamable-http）：Cursor/Claude Desktop 等
+    # 标准客户端直连 /mcp；失败只告警（HTTP 兼容端点仍可用）。
+    mount_mcp_transport(app)
 
     def _check_admin(x_admin_token: str | None = Header(None)) -> None:
         require_admin(

@@ -1,34 +1,33 @@
-"""MCP JSON-RPC 路由 + OpenAI 兼容工具路由。
+"""MCP 路由：官方 SDK transport + 轻量 HTTP 兼容端点。
 
 🔗 工程逻辑
-    两类客户端接入：
+    **协议层交给官方 SDK**（`mcp.server.mcpserver.MCPServer`）：
+    - `/mcp` → 官方 `streamable_http_app()`（MCP 标准传输，Cursor/Claude
+      Desktop/VS Code 等客户端直接对接）
+    - `/mcp/sse` → 官方 SSE 传输（旧客户端）
 
-    1. MCP 原生客户端 (Cursor / Claude Desktop / VS Code Copilot)
-       → POST /mcp/rpc  通用 JSON-RPC 端点
-       → GET  /mcp/tools/list  直接返回工具列表
-       → POST /mcp/tools/call  JSON-RPC style 调用工具
+    **HTTP 兼容端点保留**（我们自己的客户端契约，已有测试与前端依赖）：
+    - `GET  /mcp/tools/list`、`POST /mcp/tools/call`、`POST /mcp/rpc`
+    - `GET  /v1/tools`、`POST /v1/tools/call`（OpenAI function-calling 风格）
 
-    2. OpenAI Function Calling 兼容客户端
-       → GET  /v1/tools       工具列表 (OpenAI style)
-       → POST /v1/tools/call  工具调用 (OpenAI style)
-
-    安全: 读取 X-Miner-Permission header 作为权限上下文；
-    未传则默认 L0 (只读)，遵循最小特权原则。
+    两条路径最终都汇到 `execute_tool`，权限检查语义完全一致。
 
 🤖 AI 避坑
-    - /mcp/rpc 是通用端点，不要在里面硬编码方法 — 委托给 MCPToolServer
-    - permission header 解析失败 → 默认降级到 L0，不是 403
-    - OpenAI style 的 tool call 格式与 MCP 不同，注意参数映射
+    - `/mcp/rpc` 是通用 JSON-RPC 入口，不要再手写方法分发表 ——
+      按官方 method 命名（tools/list、tools/call、resources/list、
+      prompts/list）转发到我们的注册表/资源注册表即可。
+    - 权限头解析失败一律降级 L0（最小特权），不要 403 也不要放行。
+    - 官方 transport 用 app.mount() 挂载；它自带路由，不要再套 APIRouter。
 """
 from __future__ import annotations
 
 from typing import Any
 
 from fastapi import APIRouter, Header, HTTPException
+from fastapi.responses import JSONResponse
 
 from lingxi.core import get_logger
 from lingxi.core.admin_auth import require_admin
-from lingxi.mcp.models import JSONRPCRequest, JSONRPCResponse, MCPErrorCode
 
 log = get_logger(__name__)
 
@@ -37,204 +36,237 @@ def _require_admin(x_admin_token: str | None) -> None:
     """管理凭据校验（委托 core.admin_auth —— 全项目唯一实现）。
 
     🔗 安全
-        此前这些端点**只看 X-Miner-Permission 头就放行** —— 那是一个权限等级，
-        不是凭据，等于任何人都能声称自己是 L4 并直接调 shell。把接口挂上
-        FastAPI 之前必须先补这一层，否则挂载本身就是在开后门。
-
-    ⚠️ 本文件曾各自复制一份判定逻辑，与 dashboard_api / seat / workflow 漂移；
-    现统一走 core.admin_auth，暴露面（loopback）也由那里单点登记。
+        这些端点此前只看 X-Miner-Permission 头就放行 —— 那是权限等级，
+        不是凭据，等于任何人都能声称 L4 直接调 shell。挂载前必须有这一层。
     """
     require_admin(x_admin_token)
 
 
-def create_mcp_router() -> APIRouter:
-    """工厂函数：创建 MCP JSON-RPC 路由。
+def _resolve_permission(x_permission: int | None) -> int:
+    """解析权限头（失败/缺省 → L0 最小特权）。"""
+    if x_permission is None:
+        return 0
+    try:
+        return max(0, min(4, int(x_permission)))
+    except (TypeError, ValueError):
+        return 0
 
-    Returns:
-        prefix="/mcp" 的 APIRouter
-    """
+
+def _rpc_ok(req_id: Any, result: Any) -> JSONResponse:
+    return JSONResponse({"jsonrpc": "2.0", "id": req_id, "result": result})
+
+
+def _rpc_err(req_id: Any, code: int, message: str, data: Any = None) -> JSONResponse:
+    err: dict[str, Any] = {"code": code, "message": message}
+    if data is not None:
+        err["data"] = data
+    return JSONResponse({"jsonrpc": "2.0", "id": req_id, "error": err})
+
+
+def create_mcp_router() -> APIRouter:
+    """MCP HTTP 兼容路由（prefix=/mcp）。官方 transport 在 mount_mcp_transport 挂。"""
     router = APIRouter(prefix="/mcp", tags=["mcp"])
 
     @router.get("/tools/list")
     async def mcp_list_tools(
-        x_permission: int = Header(default=0, alias="X-Miner-Permission"),
         x_admin_token: str | None = Header(None),
-    ) -> JSONRPCResponse:
-        """返回可用工具列表 (MCP 风格)。"""
+    ) -> dict[str, Any]:
+        """工具清单（MCP tools/list 结果形状）。"""
         _require_admin(x_admin_token)
-        from lingxi.mcp.server import get_mcp_server
+        from lingxi.mcp.server import mcp_tools_list
 
-        server = get_mcp_server()
-        if server is None:
-            return JSONRPCResponse.failure(
-                id="1",
-                code=MCPErrorCode.TOOL_EXECUTION_ERROR,
-                message="MCP 服务尚未初始化",
-            )
-
-        try:
-            tools = await server.list_tools()
-            return JSONRPCResponse.success(id="1", result=tools)
-        except Exception as e:
-            log.exception("mcp_list_tools_endpoint_error")
-            return JSONRPCResponse.failure(
-                id="1",
-                code=MCPErrorCode.TOOL_EXECUTION_ERROR,
-                message=f"列出工具失败: {e}",
-            )
+        return {"tools": mcp_tools_list()}
 
     @router.post("/tools/call")
     async def mcp_call_tool(
-        body: JSONRPCRequest,
-        x_permission: int = Header(default=0, alias="X-Miner-Permission"),
+        body: dict[str, Any],
+        x_permission: int | None = Header(default=None, alias="X-Miner-Permission"),
         x_admin_token: str | None = Header(None),
-    ) -> JSONRPCResponse:
-        """MCP 风格调用一个工具: {...method:"tools/call", params:{name, arguments}}。"""
+    ) -> JSONResponse:
+        """MCP 风格调用：{name, arguments}。"""
         _require_admin(x_admin_token)
-        from lingxi.mcp.server import get_mcp_server
+        from lingxi.mcp.server import call_tool_via_registry
 
-        server = get_mcp_server()
-        if server is None:
-            return JSONRPCResponse.failure(
-                id=body.id,
-                code=MCPErrorCode.TOOL_EXECUTION_ERROR,
-                message="MCP 服务尚未初始化",
-            )
-
-        # 临时覆盖权限 (header 传入或默认 L0)
-        original_perm = server._min_permission
-        server._min_permission = x_permission
-        try:
-            return await server.handle_request(body)
-        finally:
-            server._min_permission = original_perm
+        name = body.get("name")
+        arguments = body.get("arguments") or {}
+        if not name:
+            return _rpc_err(body.get("id"), -32602, "缺少工具名称 (name)")
+        if not isinstance(arguments, dict):
+            return _rpc_err(body.get("id"), -32602, "arguments 必须是对象")
+        result = await call_tool_via_registry(
+            name, arguments, permission=_resolve_permission(x_permission)
+        )
+        return _rpc_ok(body.get("id"), result)
 
     @router.post("/rpc")
     async def mcp_rpc(
-        body: JSONRPCRequest,
-        x_permission: int = Header(default=0, alias="X-Miner-Permission"),
+        body: dict[str, Any],
+        x_permission: int | None = Header(default=None, alias="X-Miner-Permission"),
         x_admin_token: str | None = Header(None),
-    ) -> JSONRPCResponse:
-        """通用 JSON-RPC 端点: 根据 method 字段分发。"""
+    ) -> JSONResponse:
+        """通用 JSON-RPC 入口（方法名遵循 MCP 规范）。
+
+        支持：initialize / tools/list / tools/call / resources/list /
+        resources/read / prompts/list / prompts/get / ping
+        """
         _require_admin(x_admin_token)
-        from lingxi.mcp.server import get_mcp_server
+        from lingxi.mcp import primitives
+        from lingxi.mcp.server import call_tool_via_registry, mcp_tools_list
 
-        server = get_mcp_server()
-        if server is None:
-            return JSONRPCResponse.failure(
-                id=body.id,
-                code=MCPErrorCode.TOOL_EXECUTION_ERROR,
-                message="MCP 服务尚未初始化",
+        req_id = body.get("id")
+        method = str(body.get("method") or "")
+        params = body.get("params") or {}
+        perm = _resolve_permission(x_permission)
+
+        if method == "initialize":
+            return _rpc_ok(req_id, {
+                "protocolVersion": "2024-11-05",
+                "serverInfo": {"name": "zhixi", "version": "0.2.0"},
+                "capabilities": {"tools": {}, "resources": {}, "prompts": {}},
+            })
+        if method == "ping":
+            return _rpc_ok(req_id, {})
+        if method == "tools/list":
+            return _rpc_ok(req_id, {"tools": mcp_tools_list()})
+        if method == "tools/call":
+            name = params.get("name")
+            if not name:
+                return _rpc_err(req_id, -32602, "缺少参数 params.name")
+            result = await call_tool_via_registry(
+                str(name), params.get("arguments") or {}, permission=perm
             )
+            if result.get("isError"):
+                text = result["content"][0].get("text", "") if result.get("content") else ""
+                return _rpc_err(req_id, -32603, text, {"tool": name})
+            return _rpc_ok(req_id, result)
+        if method == "resources/list":
+            reg = primitives.get_resource_registry()
+            if reg is None:
+                # 未装配 ≠ "确实没有资源"：返回空列表会让 MCP 客户端
+                # 直接放弃该能力且不重试，必须用错误码表达"服务未就绪"
+                return _rpc_err(req_id, -32601, "资源注册表未初始化")
+            return _rpc_ok(req_id, {"resources": reg.list_resources()})
+        if method == "resources/read":
+            uri = str(params.get("uri") or "")
+            if not uri:
+                # 参数缺失（-32602）与资源不存在（-32601）是两种错，别混
+                return _rpc_err(req_id, -32602, "缺少参数 params.uri")
+            reg = primitives.get_resource_registry()
+            if reg is None:
+                return _rpc_err(req_id, -32601, "资源注册表未初始化")
+            try:
+                # read_resource 已返回 MCP 规范的 {"contents": [{uri, mimeType, text}]}
+                content = await reg.read_resource(uri)
+            except KeyError:
+                # 不存在的 URI → 结构化错误，而不是 500
+                return _rpc_err(req_id, -32601, f"资源不存在: {uri}", {"uri": uri})
+            except Exception as e:  # noqa: BLE001
+                return _rpc_err(req_id, -32603, f"读取资源失败: {e}", {"uri": uri})
+            return _rpc_ok(req_id, content)
+        if method == "prompts/list":
+            reg = primitives.get_resource_registry()
+            if reg is None:
+                return _rpc_err(req_id, -32601, "资源注册表未初始化")
+            return _rpc_ok(req_id, {"prompts": reg.list_prompts()})
+        if method == "prompts/get":
+            name = str(params.get("name") or "")
+            reg = primitives.get_resource_registry()
+            if reg is None:
+                return _rpc_err(req_id, -32601, "资源注册表未初始化")
+            prompt = reg.get_prompt(name)
+            if prompt is None:
+                return _rpc_err(req_id, -32601, f"提示词不存在: {name}", {"name": name})
+            return _rpc_ok(req_id, prompt.to_get_result(params.get("arguments") or {}))
 
-        original_perm = server._min_permission
-        server._min_permission = x_permission
-        try:
-            return await server.handle_request(body)
-        finally:
-            server._min_permission = original_perm
+        return _rpc_err(req_id, -32601, f"未知方法: '{method}'", {"method": method})
 
     return router
 
 
 def create_openai_tools_router() -> APIRouter:
-    """工厂函数: 创建 OpenAI 兼容工具路由。
-
-    Returns:
-        prefix="/v1" 的 APIRouter
-    """
+    """OpenAI function-calling 兼容路由（prefix=/v1）。"""
     router = APIRouter(prefix="/v1", tags=["openai-tools"])
 
     @router.get("/tools")
     async def openai_list_tools(
-        x_permission: int = Header(default=0, alias="X-Miner-Permission"),
         x_admin_token: str | None = Header(None),
     ) -> dict[str, Any]:
-        """OpenAI 风格工具列表。
-
-        把 MCP tools/list 的结果包装成 OpenAI function calling 格式:
-        {"object": "list", "data": [{"type": "function", "function": {"name": ..., "description": ..., "parameters": {...}}}]}
-        """
+        """OpenAI 风格工具列表。"""
         _require_admin(x_admin_token)
-        from lingxi.mcp.server import get_mcp_server
+        from lingxi.mcp.server import mcp_tools_list
 
-        server = get_mcp_server()
-        if server is None:
-            raise HTTPException(status_code=503, detail="MCP 服务尚未初始化")
+        tools = mcp_tools_list()
+        if not tools:
+            # 未初始化与"初始化了但没工具"语义不同，前者 503 更准确
+            from lingxi.mcp.server import get_mcp_server
 
-        tools = await server.list_tools()
-        mcp_tools = tools.get("tools", [])
+            if get_mcp_server() is None:
+                raise HTTPException(status_code=503, detail="MCP 服务尚未初始化")
 
-        openai_tools = [
-            {
-                "type": "function",
-                "function": {
-                    "name": t["name"],
-                    "description": t["description"],
-                    "parameters": t["inputSchema"],
-                },
-            }
-            for t in mcp_tools
-        ]
-
-        return {"object": "list", "data": openai_tools}
+        return {
+            "object": "list",
+            "data": [
+                {
+                    "type": "function",
+                    "function": {
+                        "name": t["name"],
+                        "description": t["description"],
+                        "parameters": t["inputSchema"],
+                    },
+                }
+                for t in tools
+            ],
+        }
 
     @router.post("/tools/call")
     async def openai_call_tool(
         body: dict[str, Any],
-        x_permission: int = Header(default=0, alias="X-Miner-Permission"),
+        x_permission: int | None = Header(default=None, alias="X-Miner-Permission"),
         x_admin_token: str | None = Header(None),
     ) -> dict[str, Any]:
-        """OpenAI 风格工具调用。
-
-        请求格式:
-        {
-            "name": "shell",
-            "arguments": {"command": "echo hello"}
-        }
-
-        响应格式:
-        {
-            "content": "echo 输出内容",
-            "isError": false
-        }
-        """
+        """OpenAI 风格调用：{name, arguments} → {content, isError}。"""
         _require_admin(x_admin_token)
-        from lingxi.mcp.server import get_mcp_server
-
-        server = get_mcp_server()
-        if server is None:
-            raise HTTPException(status_code=503, detail="MCP 服务尚未初始化")
+        from lingxi.mcp.server import call_tool_via_registry
 
         name = body.get("name")
-        arguments = body.get("arguments", {})
-
         if not name:
-            raise HTTPException(
-                status_code=400,
-                detail="缺少工具名称 (name)",
-            )
-
-        original_perm = server._min_permission
-        server._min_permission = x_permission
-        try:
-            result = await server.call_tool(name=name, arguments=arguments)
-        finally:
-            server._min_permission = original_perm
-
-        # 映射 MCP content 格式 → 简化文本
-        content_blocks = result.get("content", [])
-        text = content_blocks[0].get("text", "") if content_blocks else ""
-
+            raise HTTPException(status_code=400, detail="缺少工具名称 (name)")
+        result = await call_tool_via_registry(
+            str(name),
+            body.get("arguments") or {},
+            permission=_resolve_permission(x_permission),
+        )
+        blocks = result.get("content", [])
         return {
-            "content": text,
+            "content": blocks[0].get("text", "") if blocks else "",
             "isError": result.get("isError", False),
         }
 
     return router
 
 
+def mount_mcp_transport(app: Any) -> bool:
+    """把官方 SDK 的标准 MCP 传输挂到 FastAPI（/mcp）。
+
+    挂载失败不阻断启动（返回 False，健康检查会显示 mcp 未初始化）。
+    """
+    from lingxi.mcp.server import streamable_http_app
+
+    sub = streamable_http_app()
+    if sub is None:
+        return False
+    try:
+        # 官方 app 自带 /mcp 前缀处理；挂到根路径，避免双重前缀
+        app.mount("/mcp", sub)
+        log.info("mcp_official_transport_mounted", path="/mcp")
+        return True
+    except Exception as e:  # noqa: BLE001
+        log.warning("mcp_transport_mount_failed", error=str(e))
+        return False
+
+
 __all__ = [
     "create_mcp_router",
     "create_openai_tools_router",
+    "mount_mcp_transport",
 ]

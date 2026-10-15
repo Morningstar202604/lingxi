@@ -19,12 +19,11 @@
 from __future__ import annotations
 
 import json
-from typing import TYPE_CHECKING, Any
+from typing import Any
 
 import pytest
 
 from lingxi.agent.tools import _create_default_registry
-from lingxi.mcp.models import JSONRPCRequest, MCPErrorCode
 from lingxi.mcp.primitives import (
     Prompt,
     Resource,
@@ -32,11 +31,8 @@ from lingxi.mcp.primitives import (
     build_default_registry,
     set_resource_registry,
 )
-from lingxi.mcp.server import get_mcp_server, init_mcp_server
+from lingxi.mcp.server import build_mcp_server, get_mcp_server
 from lingxi.memory.graph_store import Entity, InMemoryGraphStore
-
-if TYPE_CHECKING:
-    from lingxi.mcp.server import MCPToolServer
 
 
 @pytest.fixture
@@ -55,8 +51,11 @@ def registry(graph: InMemoryGraphStore) -> ResourceRegistry:
 
 
 @pytest.fixture
-def server(registry: ResourceRegistry) -> MCPToolServer:
-    return init_mcp_server(_create_default_registry())
+def server(registry: ResourceRegistry) -> Any:
+    """按官方 mcp SDK 构建服务端（协议层归 SDK，我们只提供工具来源）。"""
+    built = build_mcp_server(_create_default_registry())
+    assert built is not None, "官方 mcp SDK 应可用"
+    return built
 
 
 @pytest.fixture(autouse=True)
@@ -65,10 +64,52 @@ def _reset() -> None:
     set_resource_registry(None)
 
 
-async def _call(server: MCPToolServer, method: str, **params: Any) -> Any:
-    return await server.handle_request(
-        JSONRPCRequest(id=1, method=method, params=params),
+_TEST_TOKEN = ""
+
+
+@pytest.fixture(autouse=True)
+def _with_admin_token(admin_token_env: str) -> None:
+    """所有用例都带有效管理凭据（管理面 fail-closed，未配即 503）。"""
+    global _TEST_TOKEN
+    _TEST_TOKEN = admin_token_env
+
+
+class _RPCResult:
+    """把 HTTP JSON-RPC 响应适配成旧断言用的 (result, error) 形状。"""
+
+    def __init__(self, payload: dict[str, Any]) -> None:
+        self._p = payload
+
+    @property
+    def result(self) -> Any:
+        return self._p.get("result")
+
+    @property
+    def error(self) -> Any:
+        err = self._p.get("error")
+        if err is None:
+            return None
+        return type("E", (), {"code": err.get("code"), "message": err.get("message")})()
+
+
+async def _call(server: Any, method: str, _token: str = "", **params: Any) -> _RPCResult:
+    """通过 HTTP JSON-RPC 端点调用（协议层现由官方 SDK 承担）。"""
+    from fastapi.testclient import TestClient
+
+    from lingxi.flow.dashboard_api import create_dashboard_app
+    from lingxi.flow.queue import EscalationQueue
+    from lingxi.flow.ticket import TicketStore
+
+    token = _token or _TEST_TOKEN
+    app = create_dashboard_app(TicketStore(), EscalationQueue())
+    client = TestClient(app)
+    resp = client.post(
+        "/mcp/rpc",
+        json={"jsonrpc": "2.0", "id": 1, "method": method, "params": params},
+        headers={"x-admin-token": token},
     )
+    assert resp.status_code == 200, resp.text
+    return _RPCResult(resp.json())
 
 
 class _FakeKnowledge:
@@ -146,16 +187,16 @@ class TestPromptRender:
 class TestMCPDispatch:
     @pytest.mark.asyncio
     async def test_initialize_declares_all_three_primitives(
-        self, server: MCPToolServer,
+        self, server: Any,
     ) -> None:
         res = await _call(server, "initialize")
         assert res.error is None
         caps = res.result["capabilities"]
         assert set(caps) >= {"tools", "resources", "prompts"}
-        assert res.result["serverInfo"]["name"] == "lingxi"
+        assert res.result["serverInfo"]["name"] == "zhixi"
 
     @pytest.mark.asyncio
-    async def test_tools_still_works(self, server: MCPToolServer) -> None:
+    async def test_tools_still_works(self, server: Any) -> None:
         """补 resources/prompts 不能把原有 tools 路径弄坏。"""
         res = await _call(server, "tools/list")
         assert res.error is None
@@ -163,7 +204,7 @@ class TestMCPDispatch:
 
     @pytest.mark.asyncio
     async def test_resources_list_and_read(
-        self, server: MCPToolServer, registry: ResourceRegistry,
+        self, server: Any, registry: ResourceRegistry,
     ) -> None:
         res = await _call(server, "resources/list")
         uris = [r["uri"] for r in res.result["resources"]]
@@ -176,23 +217,23 @@ class TestMCPDispatch:
 
     @pytest.mark.asyncio
     async def test_unknown_resource_is_error_not_empty(
-        self, server: MCPToolServer,
+        self, server: Any,
     ) -> None:
         res = await _call(server, "resources/read", uri="graph://ghost")
         assert res.error is not None
-        assert res.error.code == MCPErrorCode.TOOL_NOT_FOUND
+        assert res.error.code == -32601
 
     @pytest.mark.asyncio
     async def test_read_without_uri_is_invalid_params(
-        self, server: MCPToolServer,
+        self, server: Any,
     ) -> None:
         res = await _call(server, "resources/read")
         assert res.error is not None
-        assert res.error.code == MCPErrorCode.INVALID_PARAMS
+        assert res.error.code == -32602
 
     @pytest.mark.asyncio
     async def test_no_registry_at_all_is_error(
-        self, server: MCPToolServer,
+        self, server: Any,
     ) -> None:
         """注册表整体缺失时必须报错 —— 返回空列表会被调用方当成「确实没有」，
         MCP 客户端不会重试，会直接放弃这个能力。"""
@@ -212,7 +253,7 @@ class TestMCPDispatch:
 
     @pytest.mark.asyncio
     async def test_empty_prompt_list_is_valid_when_registry_loaded(
-        self, server: MCPToolServer, registry: ResourceRegistry,
+        self, server: Any, registry: ResourceRegistry,
     ) -> None:
         """反过来：注册表已装配但确实没有 prompts 时，返回空列表是正确的
         （数据源未注入 ≠ 装配失败）。"""
@@ -221,12 +262,12 @@ class TestMCPDispatch:
         assert res.result["prompts"] == []
 
     @pytest.mark.asyncio
-    async def test_unknown_prompt_is_error(self, server: MCPToolServer) -> None:
+    async def test_unknown_prompt_is_error(self, server: Any) -> None:
         res = await _call(server, "prompts/get", name="ghost")
         assert res.error is not None
 
     @pytest.mark.asyncio
-    async def test_ping(self, server: MCPToolServer) -> None:
+    async def test_ping(self, server: Any) -> None:
         res = await _call(server, "ping")
         assert res.error is None
         assert res.result == {}
@@ -247,7 +288,7 @@ class TestPersonaPrompts:
     async def test_prompts_listed_and_rendered(
         self, with_persona: ResourceRegistry,
     ) -> None:
-        server = init_mcp_server(_create_default_registry())
+        server = build_mcp_server(_create_default_registry())
         res = await _call(server, "prompts/list")
         names = [p["name"] for p in res.result["prompts"]]
         assert "zhixi_system_prompt" in names
@@ -265,7 +306,7 @@ class TestPersonaPrompts:
     async def test_persona_config_resource_readable(
         self, with_persona: ResourceRegistry,
     ) -> None:
-        server = init_mcp_server(_create_default_registry())
+        server = build_mcp_server(_create_default_registry())
         res = await _call(server, "resources/read", uri="persona://config")
         content = res.result["contents"][0]
         assert content["mimeType"] == "application/json"
@@ -283,7 +324,7 @@ class TestKnowledgeResources:
 
     @pytest.mark.asyncio
     async def test_doc_index_lists_docs(self, with_knowledge: ResourceRegistry) -> None:
-        server = init_mcp_server(_create_default_registry())
+        server = build_mcp_server(_create_default_registry())
         res = await _call(server, "resources/read", uri="knowledge://doc/index")
         text = res.result["contents"][0]["text"]
         assert "d1" in text and "faq.md" in text
@@ -291,7 +332,7 @@ class TestKnowledgeResources:
 
     @pytest.mark.asyncio
     async def test_doc_content_uses_recall(self, with_knowledge: ResourceRegistry) -> None:
-        server = init_mcp_server(_create_default_registry())
+        server = build_mcp_server(_create_default_registry())
         res = await _call(server, "resources/read", uri="knowledge://doc/refund")
         assert "退款政策" in res.result["contents"][0]["text"]
 

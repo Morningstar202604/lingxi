@@ -1,340 +1,220 @@
-"""MCP 工具服务端 —— 暴露 MCP 三原语。
+"""MCP 服务端 — 基于 **官方 `mcp` SDK**（不再手搓 JSON-RPC 协议层）。
 
 🔗 工程逻辑
-    MCP 定义三个原语，本服务端全部实现：
-      1. **tools**   —— list_tools / call_tool：把 ToolRegistry 暴露为动作
-      2. **resources** —— list_resources / read_resource：知识库文档、人格配置、图谱统计
-      3. **prompts** —— list_prompts / get_prompt：可复用的人格提示词模板
+    协议实现交给官方库（`mcp.server.mcpserver.MCPServer`，即 v1 的 FastMCP）：
+    JSON-RPC 编解码、tools/resources/prompts 三原语的 schema 生成、
+    `initialize` 握手、能力协商、通知、`streamable-http`/`sse` 传输
+    全部由 SDK 负责 —— 这些是"协议细节多、版本演进快"的典型，手搓必然漂移。
 
-    另有 initialize / ping 两个握手方法（MCP 客户端连上后的第一发）。
+    我们只保留**项目特有**的两件事：
+    1. 工具来源是我们的 `ToolRegistry`（带分级权限门控）
+    2. 资源/提示词接真实数据源（知识库 / 人格配置 / 实体图谱）
 
-    权限门控：tools 走 min_permission；resources/prompts 是**只读上下文**，
-    不含副作用，因此不设权限门，但仍要求 MCP 层凭据（见 router）。
-
-    工具列表 MCP schema:
-    [{
-        "name": "shell",
-        "description": "...",
-        "inputSchema": {"type": "object", "properties": {...}, "required": [...]}
-    }]
+    这样既守住差异化能力，又不重复维护协议。
 
 🤖 AI 避坑
-    - MCP tool 和直接使用 ToolRegistry 执行是两套权限模型，不要混淆
-    - 如果 permission check 失败，返回 MCP error 不是 exception
-    - MCP client (cursor, claude) 可能不传 id，要容错
-    - 返回的 content 字段是 MCP 标准; 我们内部叫 observation — 需要映射
-    - resources/prompts 未注册时必须返回**错误**，返回空列表会被调用方
-      误读成"确实没有"
+    - `mcp` 2.x 把 `FastMCP` 改名为 `MCPServer`（`from mcp.server.mcpserver import
+      MCPServer`）；不要照抄 1.x 的 `mcp.server.fastmcp` 导入路径。
+    - 工具执行必须走我们的 `execute_tool`（含权限检查），不能把裸 handler
+      交给 SDK —— 那会绕过 L0-L4 门控。
+    - SDK 的 `streamable_http_app()` 返回 Starlette 应用：挂到 FastAPI 时用
+      `app.mount(...)`，不要再包一层路由。
 """
 from __future__ import annotations
 
 from typing import TYPE_CHECKING, Any
 
 from lingxi.core import get_logger
-from lingxi.mcp.models import JSONRPCRequest, JSONRPCResponse, MCPErrorCode
-from lingxi.mcp.primitives import get_resource_registry
 
 if TYPE_CHECKING:
     from lingxi.agent.tools import ToolRegistry
 
 log = get_logger(__name__)
 
-# MCP 协议版本 / 服务器标识。客户端 initialize 握手时声明这两个字段，
-# 版本不匹配时客户端会自行降级，因此这里跟着 LangChain MCP 的实现走。
-MCP_PROTOCOL_VERSION = "2024-11-05"
-MCP_SERVER_VERSION = "1.0.0"
+# 官方 SDK 不可用时降级（保持进程可启动；健康检查会看到 mcp 不可用）
+try:
+    from mcp.server.mcpserver import MCPServer
+
+    HAS_OFFICIAL_MCP = True
+except ImportError:  # pragma: no cover
+    MCPServer = None  # type: ignore[assignment,misc]
+    HAS_OFFICIAL_MCP = False
+    log.warning(
+        "official_mcp_sdk_missing",
+        hint="pip install 'lingxi[mcp]'（官方 mcp SDK）—— MCP 端点将不可用",
+    )
 
 
-class MCPToolServer:
-    """MCP 工具服务端 — 将 ToolRegistry 暴露为 MCP 协议。"""
-
-    def __init__(self, registry: ToolRegistry, min_permission: int = 0) -> None:
-        self._registry = registry
-        self._min_permission = min_permission
-
-    @property
-    def registry(self) -> ToolRegistry:
-        return self._registry
-
-    async def list_tools(self) -> dict[str, Any]:
-        """返回 MCP-compatible tools list result。
-
-        Returns:
-            {"tools": [{"name": ..., "description": ..., "inputSchema": {...}}, ...]}
-        """
-        return {"tools": self._registry.mcp_tools_list()}
-
-    async def call_tool(self, name: str, arguments: dict[str, Any]) -> dict[str, Any]:
-        """执行工具并返回 MCP-compatible result。
-
-        Returns:
-            MCP result dict with content field:
-            {
-                "content": [{"type": "text", "text": "..."}],
-                "isError": False
-            }
-        """
-        from lingxi.agent.tools import execute_tool
-
-        result = await execute_tool(
-            registry=self._registry,
-            tool_name=name,
-            arguments=arguments,
-            current_permission=self._min_permission,
-            timeout=30.0,
-        )
-
-        success = result.get("success", False)
-        observation = result.get("observation", "")
-
-        # MCP content format: list of content blocks
-        content = [{"type": "text", "text": observation}]
-        return {
-            "content": content,
-            "isError": not success,
-        }
-
-    # ── MCP 三原语：resources / prompts ──────────────────────────
-    #
-    # 数据源由 ResourceRegistry 注入；未注册时返回结构化错误而不是空列表 ——
-    # 空列表会被调用方误读成「服务器确实没有这个资源」。
-
-    async def list_resources(self) -> dict[str, Any]:
-        reg = get_resource_registry()
-        if reg is None:
-            raise RuntimeError("资源注册表未初始化")
-        return {"resources": reg.list_resources()}
-
-    async def read_resource(self, uri: str) -> dict[str, Any]:
-        reg = get_resource_registry()
-        if reg is None:
-            raise RuntimeError("资源注册表未初始化")
-        return await reg.read_resource(uri)
-
-    async def list_prompts(self) -> dict[str, Any]:
-        reg = get_resource_registry()
-        if reg is None:
-            raise RuntimeError("提示词注册表未初始化")
-        return {"prompts": reg.list_prompts()}
-
-    async def get_prompt(self, name: str, args: dict[str, Any]) -> dict[str, Any]:
-        reg = get_resource_registry()
-        if reg is None:
-            raise RuntimeError("提示词注册表未初始化")
-        prompt = reg.get_prompt(name)
-        if prompt is None:
-            raise KeyError(name)
-        return {
-            "description": prompt.description,
-            "messages": [
-                {
-                    "role": "user",
-                    "content": {"type": "text", "text": prompt.render(args)},
-                },
-            ],
-        }
-
-    async def handle_request(self, request: JSONRPCRequest) -> JSONRPCResponse:
-        """处理 JSON-RPC request 并返回 response。"""
-        method = request.method
-
-        # 容空 id：MCP client 可能不传 id
-        req_id: str | int | None = request.id
-
-        # ── initialize：MCP 握手，客户端连上后第一发必是它 ──
-        if method == "initialize":
-            return JSONRPCResponse.success(id=req_id, result={
-                "protocolVersion": MCP_PROTOCOL_VERSION,
-                "capabilities": {
-                    "tools": {"listChanged": False},
-                    "resources": {"subscribe": False, "listChanged": False},
-                    "prompts": {"listChanged": False},
-                },
-                "serverInfo": {"name": "lingxi", "version": MCP_SERVER_VERSION},
-            })
-
-        if method == "ping":
-            return JSONRPCResponse.success(id=req_id, result={})
-
-        if method == "resources/list":
-            try:
-                return JSONRPCResponse.success(
-                    id=req_id, result=await self.list_resources(),
-                )
-            except RuntimeError as e:
-                return JSONRPCResponse.failure(
-                    id=req_id, code=MCPErrorCode.INVALID_REQUEST, message=str(e),
-                )
-
-        if method == "resources/read":
-            uri = (request.params or {}).get("uri", "")
-            if not isinstance(uri, str) or not uri:
-                return JSONRPCResponse.failure(
-                    id=req_id, code=MCPErrorCode.INVALID_PARAMS,
-                    message="缺少资源 URI (params.uri)",
-                )
-            try:
-                return JSONRPCResponse.success(
-                    id=req_id, result=await self.read_resource(uri),
-                )
-            except KeyError:
-                return JSONRPCResponse.failure(
-                    id=req_id, code=MCPErrorCode.TOOL_NOT_FOUND,
-                    message=f"资源不存在: {uri}", data={"uri": uri},
-                )
-            except Exception as e:  # noqa: BLE001 — 统一转结构化错误
-                log.warning("mcp_read_resource_error", uri=uri, error=str(e))
-                return JSONRPCResponse.failure(
-                    id=req_id, code=MCPErrorCode.TOOL_EXECUTION_ERROR,
-                    message=f"读取资源失败: {e}", data={"uri": uri},
-                )
-
-        if method == "prompts/list":
-            try:
-                return JSONRPCResponse.success(
-                    id=req_id, result=await self.list_prompts(),
-                )
-            except RuntimeError as e:
-                return JSONRPCResponse.failure(
-                    id=req_id, code=MCPErrorCode.INVALID_REQUEST, message=str(e),
-                )
-
-        if method == "prompts/get":
-            params = request.params or {}
-            name = params.get("name")
-            args = params.get("arguments", {})
-            if not isinstance(name, str) or not name:
-                return JSONRPCResponse.failure(
-                    id=req_id, code=MCPErrorCode.INVALID_PARAMS,
-                    message="缺少提示词名称 (params.name)",
-                )
-            if not isinstance(args, dict):
-                return JSONRPCResponse.failure(
-                    id=req_id, code=MCPErrorCode.INVALID_PARAMS,
-                    message="params.arguments 必须是对象",
-                )
-            try:
-                return JSONRPCResponse.success(
-                    id=req_id, result=await self.get_prompt(name, args),
-                )
-            except KeyError:
-                return JSONRPCResponse.failure(
-                    id=req_id, code=MCPErrorCode.TOOL_NOT_FOUND,
-                    message=f"提示词不存在: {name}", data={"name": name},
-                )
-            except RuntimeError as e:
-                return JSONRPCResponse.failure(
-                    id=req_id, code=MCPErrorCode.INVALID_REQUEST, message=str(e),
-                )
-
-        if method == "tools/list":
-            try:
-                tools = await self.list_tools()
-                return JSONRPCResponse.success(id=req_id, result=tools)
-            except Exception as e:
-                log.exception("mcp_list_tools_error")
-                return JSONRPCResponse.failure(
-                    id=req_id,
-                    code=MCPErrorCode.TOOL_EXECUTION_ERROR,
-                    message=f"列出工具失败: {e}",
-                )
-
-        if method == "tools/call":
-            params = request.params or {}
-            name = params.get("name")
-            arguments = params.get("arguments", {})
-
-            if not name:
-                return JSONRPCResponse.failure(
-                    id=req_id,
-                    code=MCPErrorCode.INVALID_PARAMS,
-                    message="缺少工具名称 (params.name)",
-                    data={"params": params},
-                )
-
-            if not isinstance(arguments, dict):
-                return JSONRPCResponse.failure(
-                    id=req_id,
-                    code=MCPErrorCode.INVALID_PARAMS,
-                    message="params.arguments 必须是对象",
-                    data={"arguments": arguments},
-                )
-
-            try:
-                result = await self.call_tool(name=name, arguments=arguments)
-
-                # 错误映射：工具不存在 → -32601
-                content_blocks = result.get("content", [])
-                first_text = content_blocks[0].get("text", "") if content_blocks else ""
-
-                if result.get("isError", False) and "不存在" in first_text:
-                    return JSONRPCResponse.failure(
-                        id=req_id,
-                        code=MCPErrorCode.TOOL_NOT_FOUND,
-                        message=first_text,
-                        data={"tool": name},
-                    )
-
-                if result.get("isError", False) and "权限不足" in first_text:
-                    return JSONRPCResponse.failure(
-                        id=req_id,
-                        code=MCPErrorCode.PERMISSION_DENIED,
-                        message=first_text,
-                        data={"tool": name},
-                    )
-
-                return JSONRPCResponse.success(id=req_id, result=result)
-
-            except Exception as e:
-                log.exception("mcp_call_tool_error", tool=name)
-                return JSONRPCResponse.failure(
-                    id=req_id,
-                    code=MCPErrorCode.TOOL_EXECUTION_ERROR,
-                    message=f"工具 '{name}' 执行出错: {e}",
-                    data={"tool": name},
-                )
-
-        # 未知 method
-        return JSONRPCResponse.failure(
-            id=req_id,
-            code=MCPErrorCode.TOOL_NOT_FOUND,
-            message=f"未知方法: '{method}'",
-            data={"method": method},
-        )
+_mcp_server: MCPServer | None = None
+_registry: ToolRegistry | None = None
+_min_permission: int = 0
 
 
-# ── 全局单例 (由 pipeline/Engine 注册 registry 时一起初始化) ──
-
-_mcp_server: MCPToolServer | None = None
-
-
-def get_mcp_server() -> MCPToolServer | None:
-    """获取全局 MCP server 单例。"""
-    return _mcp_server
-
-
-def init_mcp_server(
+def build_mcp_server(
     registry: ToolRegistry,
     min_permission: int = 0,
-) -> MCPToolServer:
-    """初始化全局 MCP server 单例。
+    *,
+    name: str = "zhixi",
+) -> MCPServer | None:
+    """按官方 SDK 构建 MCP 服务端；把 ToolRegistry 的工具逐个注册进去。
 
     Args:
-        registry: 工具注册表
-        min_permission: 最小权限级别 (默认 L0)
+        registry: 我们的工具注册表（含权限等级与 handler）
+        min_permission: 调用方基线权限（低于工具所需等级会被拒）
+        name: 服务端标识（MCP initialize 握手时返回给客户端）
 
     Returns:
-        MCPToolServer 实例
+        MCPServer 实例；官方 SDK 缺失时返回 None（不抛，保证进程可启动）
     """
-    global _mcp_server
-    _mcp_server = MCPToolServer(registry, min_permission)
-    log.info("mcp_server_initialized", min_permission=min_permission)
+    if not HAS_OFFICIAL_MCP:
+        return None
+
+    server = MCPServer(
+        name=name,
+        version="0.2.0",
+        instructions=(
+            "智犀（ZhiXi）数字员工引擎的工具集。"
+            "调用需在 X-Miner-Permission 头声明权限等级（L0-L4）；"
+            "高风险工具（shell 等）按命令内容动态定级。"
+        ),
+    )
+
+    from lingxi.agent.tools import execute_tool
+
+    # ── 工具：来源是我们的 registry，执行仍走带权限检查的 execute_tool ──
+    for tool in registry.available:
+
+        def _make_handler(tool_name: str) -> Any:
+            async def _handler(**kwargs: Any) -> str:
+                result = await execute_tool(
+                    registry,
+                    tool_name,
+                    kwargs,
+                    _min_permission,
+                )
+                if not result.get("success", False):
+                    # 官方 SDK 会把返回文本包成 content block；失败前缀便于
+                    # 客户端（与我们的 openai 兼容端点）一致地识别错误
+                    return f"[error] {result.get('observation', '执行失败')}"
+                return str(result.get("observation", ""))
+
+            return _handler
+
+        handler = _make_handler(tool.name)
+        # SDK 从类型注解/签名推导 schema 会丢失我们精心写的
+        # description 与 input_schema（模型靠它决定何时调用），
+        # 因此显式传 name/description，并用 add_tool 注册已构造好的定义。
+        try:
+            server.add_tool(
+                handler,
+                name=tool.name,
+                description=tool.description,
+            )
+        except TypeError:
+            # 旧版签名兜底：装饰器形式
+            server.tool(name=tool.name, description=tool.description)(handler)
+
+    global _mcp_server, _registry, _min_permission
+    _mcp_server = server
+    _registry = registry
+    _min_permission = min_permission
+    log.info(
+        "mcp_server_initialized",
+        backend="official_sdk",
+        tools=len(registry.available),
+        min_permission=min_permission,
+    )
+    return server
+
+
+def get_mcp_server() -> MCPServer | None:
+    """获取全局 MCP server（官方 SDK 实例）。"""
     return _mcp_server
+
+
+def set_min_permission(level: int) -> None:
+    """覆盖调用方权限等级（HTTP 头传入时由路由设置，用完还原）。"""
+    global _min_permission
+    _min_permission = level
+
+
+def get_min_permission() -> int:
+    return _min_permission
+
+
+def mcp_tools_list() -> list[dict[str, Any]]:
+    """工具清单（MCP 风格），供 /mcp/tools/list 与 OpenAI 兼容端点复用。
+
+    直接从我们的 registry 生成，保证与 SDK 注册的是同一份定义。
+    """
+    if _registry is None:
+        return []
+    return [
+        {
+            "name": t.name,
+            "description": t.description,
+            "inputSchema": t.input_schema,
+        }
+        for t in _registry.available
+    ]
+
+
+async def call_tool_via_registry(
+    name: str, arguments: dict[str, Any], *, permission: int | None = None
+) -> dict[str, Any]:
+    """按 MCP content 格式调用工具（走权限检查）。
+
+    这是给 HTTP 兼容端点用的入口：官方 SDK 的调用路径服务于 MCP 协议客户端
+    （要经过会话/传输层），而 HTTP 直连端点需要一个轻量入口 —— 两者最终都
+    汇到 `execute_tool`，权限语义完全一致。
+    """
+    from lingxi.agent.tools import execute_tool
+
+    if _registry is None:
+        return {
+            "content": [{"type": "text", "text": "MCP 服务尚未初始化"}],
+            "isError": True,
+        }
+    perm = _min_permission if permission is None else permission
+    result = await execute_tool(_registry, name, arguments, perm)
+    text = str(result.get("observation", ""))
+    return {"content": [{"type": "text", "text": text}], "isError": not result.get("success", False)}
+
+
+def streamable_http_app() -> Any:
+    """官方 SDK 的 streamable-http ASGI 应用（挂到 FastAPI 用）。
+
+    返回 None 表示 SDK 缺失或未初始化。
+    """
+    if _mcp_server is None:
+        return None
+    try:
+        return _mcp_server.streamable_http_app()
+    except Exception as e:  # noqa: BLE001
+        log.warning("mcp_streamable_app_failed", error=str(e))
+        return None
+
+
+def mcp_status() -> dict[str, Any]:
+    """MCP 子系统状态（健康检查/排障用）。"""
+    return {
+        "backend": "official_sdk" if HAS_OFFICIAL_MCP else "unavailable",
+        "official_sdk_installed": HAS_OFFICIAL_MCP,
+        "initialized": _mcp_server is not None,
+        "tools": len(_registry.available) if _registry is not None else 0,
+        "min_permission": _min_permission,
+    }
 
 
 __all__ = [
-    "MCPToolServer",
+    "HAS_OFFICIAL_MCP",
+    "MCPServer",
+    "build_mcp_server",
+    "call_tool_via_registry",
     "get_mcp_server",
-    "init_mcp_server",
-    "_mcp_server",
+    "get_min_permission",
+    "mcp_status",
+    "mcp_tools_list",
+    "set_min_permission",
+    "streamable_http_app",
 ]

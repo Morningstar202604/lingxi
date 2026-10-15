@@ -57,10 +57,27 @@ class Prompt:
     template: str = ""
 
     def to_mcp_dict(self) -> dict[str, Any]:
+        """prompts/list 的声明形状（name/description/arguments）。"""
         return {
             "name": self.name,
             "description": self.description,
             "arguments": self.arguments,
+        }
+
+    def to_get_result(self, args: dict[str, Any] | None = None) -> dict[str, Any]:
+        """prompts/get 的结果形状（MCP 规范要求 messages 数组）。
+
+        与 to_mcp_dict 的区别：list 返回**声明**，get 返回**渲染后的内容**。
+        此前 get 复用了声明形状，客户端拿不到 messages（实测 KeyError）。
+        """
+        return {
+            "description": self.description,
+            "messages": [
+                {
+                    "role": "user",
+                    "content": {"type": "text", "text": self.render(args or {})},
+                }
+            ],
         }
 
     def render(self, args: dict[str, Any]) -> str:
