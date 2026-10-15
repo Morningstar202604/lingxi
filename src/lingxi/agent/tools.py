@@ -364,6 +364,31 @@ def _make_knowledge_search_handler(registry: ToolRegistry) -> Any:
 
 
 async def _shell_handler(command: str) -> str:
+    """执行 shell 命令。
+
+    🔒 执行隔离：默认尝试在 Docker 沙箱内运行（只读挂载 + 禁网 +
+    cap-drop ALL + 资源上限）。Docker 不可用或显式关闭时**降级为宿主执行**
+    —— 降级会打 warning 且可通过 sandbox_status() 观测，不静默。
+    """
+    from lingxi.config import get_settings
+
+    sb = getattr(get_settings(), "sandbox", None)
+    if sb is not None and getattr(sb, "enabled", True):
+        from lingxi.security.sandbox import run_in_sandbox
+
+        out, used = await run_in_sandbox(
+            command,
+            enabled=True,
+            image=str(getattr(sb, "image", "alpine:3.20")),
+            mount_dir=str(getattr(sb, "mount_dir", "") or ""),
+            writable=bool(getattr(sb, "writable", False)),
+            network=str(getattr(sb, "network", "none")),
+            timeout=float(getattr(sb, "timeout_seconds", 30.0)),
+        )
+        if used:
+            return out
+        # 未走沙箱 → 落到宿主执行（warning 已在 sandbox 模块里打过）
+
     proc = await asyncio.create_subprocess_shell(
         command,
         stdout=subprocess.PIPE,

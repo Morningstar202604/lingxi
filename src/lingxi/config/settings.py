@@ -341,6 +341,36 @@ class SecurityConfig(BaseModel):
     permission_rules: dict[str, int] = Field(default_factory=dict)
 
 
+class SandboxConfig(BaseModel):
+    """Shell 执行沙箱配置（Docker 隔离）。
+
+    🔗 工程逻辑
+        权限分级决定"要不要批准执行"，沙箱决定"执行时能碰到什么"。
+        默认启用（Docker 不可用时自动降级为宿主执行并告警）。
+
+        - mount_dir: 挂载进沙箱的宿主目录（默认挂 data_dir，且**只读**）。
+          不要挂宿主根：`/` 挂进去等于没有隔离。
+        - network=none: 默认禁网。需要联网的命令（pip/curl）显式开 `bridge`，
+          但要清楚这会削弱隔离。
+        - 资源上限（memory/cpus/pids）防单条命令把宿主拖垮。
+
+    🤖 AI 避坑
+        - writable=False 是默认：agent 需要写文件时应显式开启并限定目录，
+          不要图省事给可写挂载。
+        - enabled=False 只用于"明确知道自己在干什么"的场景（如沙箱环境本身）。
+    """
+
+    enabled: bool = True
+    image: str = "alpine:3.20"
+    mount_dir: str = ""  # 空 = 不挂载宿主目录
+    writable: bool = False
+    network: Literal["none", "bridge"] = "none"
+    memory: str = "512m"
+    cpus: str = "1"
+    pids_limit: int = Field(default=128, ge=16, le=1024)
+    timeout_seconds: float = Field(default=30.0, gt=0, le=600)
+
+
 class AuthConfig(BaseModel):
     """JWT RBAC 鉴权配置。
 
@@ -460,6 +490,7 @@ class Settings(BaseSettings):
     memory: MemoryConfig = Field(default_factory=MemoryConfig)
     agent: AgentConfig = Field(default_factory=AgentConfig)
     security: SecurityConfig = Field(default_factory=SecurityConfig)
+    sandbox: SandboxConfig = Field(default_factory=SandboxConfig)
     auth: AuthConfig = Field(default_factory=AuthConfig)
     embedding: EmbeddingConfig = Field(default_factory=EmbeddingConfig)
     knowledge: KnowledgeConfig = Field(default_factory=KnowledgeConfig)
