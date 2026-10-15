@@ -236,6 +236,13 @@ class KnowledgeConfig(BaseModel):
     score_threshold: float = 0.3
     max_context_chars: int = 2000
 
+    # ── rerank（召回后 cross-encoder 重排）──
+    # RAG 质量最高性价比的单点提升：向量召回是双塔（丢交互信息），
+    # cross-encoder 让 query/doc 逐 token 交互。用本地 flashrank（无 API key）。
+    # 依赖缺失/模型下载失败自动降级为原序，不影响检索可用性。
+    rerank_enabled: bool = True
+    rerank_model: str = "ms-marco-MiniLM-L-12-v2"
+
 
 class MemoryConfig(BaseModel):
     """记忆系统配置。

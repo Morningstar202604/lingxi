@@ -68,3 +68,6 @@ screenshots/
 # litellm 官方响应缓存（diskcache 后端，本地产物不入库）
 .litellm_cache/
 .test_litellm_cache/
+
+# rerank 模型（flashrank 预置，几十 MB 二进制不入库；运行时自动下载或手动预置）
+data/rerank_models/

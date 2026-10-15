@@ -65,6 +65,8 @@ mem0 = ["mem0ai>=0.1.0"]
 neo4j = ["neo4j>=5.24.0"]
 # flow/postgres.py 的 PostgreSQL 后端（persistence.backend=postgresql 启用）
 postgres = ["asyncpg>=0.30.0"]
+# 检索重排（本地 cross-encoder，无 API key）
+rerank = ["flashrank>=0.2"]
 dev = [
     "pytest>=8.3.0",
     "pytest-asyncio>=0.24.0",
@@ -157,5 +159,5 @@ ignore_missing_imports = true
 # jsonschema / rank_bm25 官方库不带 py.typed；两者都是运行时必需依赖，
 # 这里只豁免 stub 检查，不豁免任何行为。
 [[tool.mypy.overrides]]
-module = ["jsonschema", "jsonschema.*", "rank_bm25", "rank_bm25.*"]
+module = ["jsonschema", "jsonschema.*", "rank_bm25", "rank_bm25.*", "flashrank", "flashrank.*"]
 ignore_missing_imports = true

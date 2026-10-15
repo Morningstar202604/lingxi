@@ -25,8 +25,10 @@ import re
 import uuid
 from typing import Any
 
+from lingxi.config import get_settings
 from lingxi.core import get_logger
 from lingxi.knowledge.embedder import Embedder, get_default_embedder
+from lingxi.knowledge.rerank import rerank as rerank_hits
 
 log = get_logger(__name__)
 
@@ -364,9 +366,11 @@ class VectorStore:
         # 3. RRF 融合 (纯 rank-based, 不需要归一化分)
         fused = reciprocal_rank_fusion([vector_ranked, bm25_ranked])
 
-        # 4. 组装结果 (优先从 ChromaDB metadata, 否则从 chunk_map)
+        # 4. 组装候选（多取一些给 rerank 用：cross-encoder 重排需要比
+        #    top_k 更宽的池子，否则"召回错了 → 重排也只能在错的里面排"）
+        recall_pool = max(top_k * 2, top_k + 5)
         hits: list[dict[str, Any]] = []
-        for chunk_id, rrf_score in fused[:top_k]:
+        for chunk_id, rrf_score in fused[:recall_pool]:
             info = vec_meta.get(chunk_id) or self._chunk_map.get(chunk_id)
             if info is None:
                 continue
@@ -378,7 +382,17 @@ class VectorStore:
                 "score": round(rrf_score, 4),
                 "recall_mode": "hybrid",
             })
-        return hits
+
+        # 5. rerank（cross-encoder）：RAG 质量最高性价比的单点提升；
+        #    依赖缺失/推理失败自动降级为融合原序（可用性优先于排序质量）。
+        kcfg = get_settings().knowledge
+        return await rerank_hits(
+            query,
+            hits,
+            top_k=top_k,
+            enabled=bool(getattr(kcfg, "rerank_enabled", True)),
+            model_name=str(getattr(kcfg, "rerank_model", "ms-marco-MiniLM-L-12-v2")),
+        )
 
     def delete_doc(self, doc_id: str) -> int:
         """删除指定 doc_id 的所有 chunks (同步 BM25)。"""
