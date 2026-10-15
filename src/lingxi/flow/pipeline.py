@@ -17,6 +17,7 @@ from __future__ import annotations
 
 import asyncio
 import contextlib
+import time
 from collections.abc import Callable, Coroutine
 from dataclasses import dataclass
 from typing import TYPE_CHECKING, Any
@@ -42,6 +43,35 @@ log = get_logger(__name__)
 
 # 类型别名
 SendFunc = Callable[[OutboundMessage], Coroutine[Any, Any, None]]
+
+
+def _metrics() -> Any:
+    """取指标收集器（未装 prometheus_client 时是 noop 实现，调用安全）。
+
+    延迟导入：pipeline 被大量单测直接构造，模块顶层导入会把 metrics 的
+    可选依赖链拖进所有测试。
+    """
+    try:
+        from lingxi.metrics import get_metrics_collector
+
+        return get_metrics_collector()
+    except Exception:  # noqa: BLE001 — 指标永远不该影响业务主链路
+        return None
+
+
+def _record_agent_metric(channel: str, outcome: str, started_at: float) -> None:
+    """记录一次 Agent 调用（channel/outcome/duration）。失败只记 debug，不抛。"""
+    collector = _metrics()
+    if collector is None:
+        return
+    try:
+        collector.record_agent_invocation(
+            channel=channel or "unknown",
+            outcome=outcome,
+            duration=time.monotonic() - started_at,
+        )
+    except Exception as e:  # noqa: BLE001
+        log.debug("agent_metric_failed", error=str(e))
 
 
 @dataclass
@@ -76,6 +106,8 @@ class CustomerServicePipeline:
         pii_guard: Any = None,  # PIIGuard | None
         audit_log: Any = None,  # AuditLog | None
         tool_registry: Any = None,  # ToolRegistry | None — 桥梁按实例注册
+        experiment_engine: Any = None,  # ExperimentEngine | None — A/B 分流
+        persona_injector: Any = None,  # PersonaInjector | None — 供实验覆盖 persona
     ) -> None:
         self._agent = agent
         self._tickets = ticket_store
@@ -89,6 +121,10 @@ class CustomerServicePipeline:
         # Phase 2/3: PII 脱敏与审计
         self._pii = pii_guard
         self._audit = audit_log
+        # A/B 实验：分流影响每条消息的 persona（白名单覆盖），并回写指标。
+        # 未配置时为 None —— 全链路零开销（不分配、不计算 hash）。
+        self._experiment = experiment_engine
+        self._injector = persona_injector
 
         # 并发会话限流：防止过多并发 Agent 调用耗尽 LLM quota / 内存
         max_concurrent = get_settings().agent.max_concurrent_sessions
@@ -174,6 +210,92 @@ class CustomerServicePipeline:
             return ChannelType.WECHAT_PRIVATE
         return ChannelType.QQ_PRIVATE
 
+    # ── A/B 实验（分流 → 覆盖 persona → 回写指标）──
+
+    def _active_experiments(self, user_id: str) -> list[tuple[str, str, dict[str, Any]]]:
+        """列出该用户当前命中的 (实验名, 变体名, persona 覆盖)。
+
+        只取 RUNNING 实验；未配置实验引擎时直接返回空（零开销）。
+        """
+        if self._experiment is None or not user_id:
+            return []
+        out: list[tuple[str, str, dict[str, Any]]] = []
+        try:
+            for exp in self._experiment.list_experiments():
+                status = getattr(exp.status, "value", exp.status)
+                if status != "running":
+                    continue
+                variant = self._experiment.get_variant_for_user(user_id, exp.name)
+                overrides = self._experiment.get_variant_overrides(user_id, exp.name)
+                out.append((exp.name, variant, dict(overrides or {})))
+        except Exception as e:  # noqa: BLE001 — 实验故障不能打断对话
+            log.warning("experiment_assignment_failed", user_id=user_id, error=str(e))
+            return []
+        return out
+
+    def experiment_overrides_for(self, user_id: str) -> dict[str, Any]:
+        """该用户当前命中实验的合并 persona 覆盖（供上层拼 prompt）。
+
+        与 `_record_experiment_metrics` 使用同一套分流逻辑，
+        保证"看到的变体"与"记的指标"一致。
+        """
+        hits = self._active_experiments(user_id)
+        if not hits:
+            return {}
+        merged: dict[str, Any] = {}
+        for _name, _variant, overrides in hits:
+            merged.update(overrides)
+        return merged
+
+    def _apply_experiments(self, user_id: str, overrides: dict[str, Any]) -> dict[str, Any]:
+        """把命中的实验覆盖合并进 persona 配置（白名单校验在 injector 内）。
+
+        返回合并后的覆盖字典（供调用方拼 prompt）；injector 缺失时原样返回
+        —— 此时覆盖不生效但日志会提示，避免"实验看起来在跑、其实没接上"。
+        """
+        if not overrides:
+            return {}
+        if self._injector is None:
+            log.warning("experiment_overrides_no_injector", user_id=user_id)
+            return {}
+        return overrides
+
+    def _record_experiment_metrics(
+        self,
+        user_id: str,
+        chat_id: str,
+        *,
+        escalated: bool,
+        started_at: float | None,
+        message_count: int = 0,
+    ) -> None:
+        """把本轮结果回写给所有命中实验（resolved / escalated / 耗时 / 消息数）。"""
+        if self._experiment is None or not user_id:
+            return
+        try:
+            from lingxi.experiment.models import ExperimentMetric
+
+            for exp_name, variant, _ in self._active_experiments(user_id):
+                self._experiment.record_metric(
+                    ExperimentMetric(
+                        experiment_name=exp_name,
+                        variant_name=variant,
+                        user_id=user_id,
+                        resolved=not escalated,
+                        escalated=escalated,
+                        duration_seconds=(time.monotonic() - started_at) if started_at else 0.0,
+                        message_count=message_count,
+                    )
+                )
+                log.debug(
+                    "experiment_metric_recorded",
+                    experiment=exp_name,
+                    variant=variant,
+                    chat_id=chat_id,
+                )
+        except Exception as e:  # noqa: BLE001
+            log.warning("experiment_metric_failed", user_id=user_id, error=str(e))
+
     async def handle_event(
         self,
         event: IMEvent,
@@ -195,6 +317,20 @@ class CustomerServicePipeline:
             if len(self._chat_channels) > 4096:
                 for k in list(self._chat_channels)[:2048]:
                     self._chat_channels.pop(k, None)
+
+        # A/B 实验分流（未配置引擎时零开销）。覆盖在 persona 上生效，
+        # 白名单校验见 injector._apply_experiment_overrides。
+        _event_started = time.monotonic()
+        _ab_hits = self._active_experiments(event.user_id)
+        _ab_overrides: dict[str, Any] = {}
+        if _ab_hits:
+            for _exp_name, _variant, _ov in _ab_hits:
+                _ab_overrides.update(_ov)
+            log.info(
+                "ab_variants_assigned",
+                user_id=event.user_id,
+                hits=[(n, v) for n, v, _ in _ab_hits],
+            )
 
         text = event.text.strip()
         if not text:
@@ -330,6 +466,11 @@ class CustomerServicePipeline:
         if knowledge_block:
             augmented_prompt += f"\n\n{knowledge_block}"
 
+        # 本项目自产指标埋点：Agent 调用次数 + 延迟 + 结局（resolved/escalated/timeout）。
+        # 此前 record_agent_invocation 只有定义、全仓零调用 —— /metrics 里
+        # Agent 指标永远是 0，等于没有可观测性。
+        _agent_started = time.monotonic()
+        _channel_label = getattr(event.channel, "value", str(event.channel))
         try:
             # 并发限流：超限时等待而非直接拒绝，避免用户消息丢失
             run_cm = self._semaphore if self._semaphore else contextlib.nullcontext()
@@ -350,12 +491,17 @@ class CustomerServicePipeline:
                 )
         except TimeoutError:
             log.warning("agent_timeout", chat_id=event.chat_id)
+            _record_agent_metric(_channel_label, "timeout", _agent_started)
             return await self._escalate_and_respond(
                 ticket=ticket,
                 reason="agent_timeout",
                 reply_text="处理超时，为您转接人工。",
                 send_func=send_func,
             )
+        except Exception:
+            # Agent 内部异常同样计入指标（否则失败面完全不可观测），再向上抛
+            _record_agent_metric(_channel_label, "error", _agent_started)
+            raise
 
         # PII 脱敏: Agent 回复送出前先脱敏
         raw_reply = agent_result.get("final_reply", "")
@@ -387,6 +533,18 @@ class CustomerServicePipeline:
             ticket.transition(TicketStatus.WAITING_USER)
         except ValueError as e:
             log.debug("ticket_transition_skipped", error=str(e))
+
+        # Agent 成功产出可回复内容 → resolved（升级路径在 _escalate_and_respond 里记）
+        _record_agent_metric(_channel_label, "resolved", _agent_started)
+
+        # A/B 指标：本轮以"未升级"收尾
+        self._record_experiment_metrics(
+            event.user_id,
+            event.chat_id,
+            escalated=False,
+            started_at=_event_started,
+            message_count=getattr(ticket, "message_count", 0),
+        )
 
         if send_func:
             msg = OutboundMessage.text(
@@ -445,6 +603,14 @@ class CustomerServicePipeline:
                 detail=reason,
             )
 
+            # 升级率指标（reason 会被归到 low_confidence/timeout/injection/... 分类）
+            collector = _metrics()
+            if collector is not None:
+                try:
+                    collector.record_escalation(reason)
+                except Exception as e:  # noqa: BLE001
+                    log.debug("escalation_metric_failed", error=str(e))
+
             log.info("ticket_escalated", ticket_id=ticket.ticket_id, reason=reason)
         else:
             log.info(
@@ -467,6 +633,17 @@ class CustomerServicePipeline:
                 await send_func(msg)
             except Exception:
                 log.exception("send_failed", chat_id=ticket.chat_id)
+
+        # A/B 指标：升级路径统一在这里回写（所有升级出口都汇到本方法），
+        # user_id 从 ticket 取（本方法可能被规则/关键词短发路径调用，
+        # 那条路径没有 event 对象）。
+        self._record_experiment_metrics(
+            getattr(ticket, "user_id", "") or "",
+            getattr(ticket, "chat_id", "") or "",
+            escalated=True,
+            started_at=time.monotonic(),
+            message_count=getattr(ticket, "message_count", 0),
+        )
 
         return PipelineResult(
             ticket_id=ticket.ticket_id,
