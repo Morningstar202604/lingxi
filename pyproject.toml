@@ -49,6 +49,10 @@ dependencies = [
     "prometheus-client>=0.21.0",
     # ── 限流（官方库，替代手搓的请求计数）──
     "slowapi>=0.1.9",
+    # ── 重试退避（官方库，替代手搓的 for+delay+sleep）──
+    "tenacity>=9.0",
+    # ── BM25 关键词召回（官方实现，替代手搓公式）──
+    "rank-bm25>=0.2.2",
 ]
 
 [project.optional-dependencies]
@@ -148,4 +152,10 @@ ignore_missing_imports = true
 # 两者都是可选 extra，仅在对应后端启用时才 import。
 [[tool.mypy.overrides]]
 module = ["mem0", "neo4j", "neo4j.*"]
+ignore_missing_imports = true
+
+# jsonschema / rank_bm25 官方库不带 py.typed；两者都是运行时必需依赖，
+# 这里只豁免 stub 检查，不豁免任何行为。
+[[tool.mypy.overrides]]
+module = ["jsonschema", "jsonschema.*", "rank_bm25", "rank_bm25.*"]
 ignore_missing_imports = true

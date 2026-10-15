@@ -21,9 +21,7 @@
 """
 from __future__ import annotations
 
-import asyncio
 import json
-import random
 from typing import TYPE_CHECKING, Any
 
 from lingxi.config import get_settings
@@ -74,6 +72,59 @@ def is_retryable(exc: BaseException) -> bool:
     """
     text = f"{type(exc).__name__}: {exc}".lower()
     return not any(m in text for m in _FATAL_MARKERS)
+
+
+async def _retrying_call(
+    fn: Any,
+    kwargs: dict[str, Any],
+    *,
+    retries: int,
+    base_delay: float,
+    model: str,
+) -> Any:
+    """带指数退避 + jitter 的调用（tenacity 官方实现）。
+
+    🔗 工程逻辑
+        重试策略（指数退避、随机抖动、停止条件）是 tenacity 的标准能力，
+        不必手搓 `for attempt in range` + 手算 delay + asyncio.sleep。
+        我们只提供领域知识：`is_retryable` 决定哪些异常值得再试
+        （凭据/参数错重试就是白烧配额）。
+
+    🤖 AI 避坑
+        - `retry_if_exception(is_retryable)`：不可重试异常**直接抛出**，
+          由调用方判定是否切下一个 fallback 模型（不要在这里吞掉）。
+        - `reraise=True`：重试耗尽后抛最后一次的原始异常（而不是
+          tenacity 的 RetryError），否则上层的错误分类与友好提示会失真。
+        - 抖动用 wait_random 叠加：防止多实例同时重试形成惊群。
+    """
+    from tenacity import (
+        AsyncRetrying,
+        retry_if_exception,
+        stop_after_attempt,
+        wait_exponential,
+        wait_random,
+    )
+
+    attempts = retries + 1
+    async for attempt in AsyncRetrying(
+        stop=stop_after_attempt(attempts),
+        wait=wait_exponential(multiplier=max(base_delay, 0.001), exp_base=2, max=30)
+        + wait_random(0, base_delay),
+        retry=retry_if_exception(is_retryable),
+        reraise=True,
+    ):
+        with attempt:
+            if attempt.retry_state.attempt_number > 1:
+                log.warning(
+                    "llm_call_retry",
+                    model=model,
+                    attempt=attempt.retry_state.attempt_number - 1,
+                    max_retries=retries,
+                    error=str(attempt.retry_state.outcome.exception()) if attempt.retry_state.outcome else "",
+                )
+            return await fn(**kwargs)
+    # 理论不可达（reraise=True 会抛出）；兜底避免类型检查报错
+    raise LLMCallError("重试流程异常终止", retryable=False)
 
 
 # litellm 通过 model 字符串的前缀决定走哪家 provider（"ollama/qwen2.5:7b"）。
@@ -254,39 +305,36 @@ async def call_llm(
             kwargs["response_format"] = {"type": "json_object"}
 
         last_error: BaseException | None = None
-        for attempt in range(retries + 1):
-            try:
-                response = await acompletion(**kwargs)
-                if usage is not None:
-                    usage.add(response)
-                extract_content(response)
-                if model_idx > 0:
-                    log.info("llm_fallback_succeeded", model=model, fallback_idx=model_idx)
-                return response
-            except EmptyLLMResponseError:
-                last_error = LLMCallError("模型返回空响应（choices 为空）", retryable=True)
-            except Exception as e:  # noqa: BLE001
-                last_error = e
-                if not is_retryable(e):
-                    log.warning("llm_call_fatal", model=model, error=f"{type(e).__name__}: {e}")
-                    # 不可重试错误，直接尝试下一个 fallback 模型
-                    break
-
-            if attempt < retries:
-                delay = base_delay * (2 ** attempt) * (0.5 + random.random())
-                log.warning(
-                    "llm_call_retry",
-                    model=model,
-                    attempt=attempt + 1,
-                    max_retries=retries,
-                    delay=round(delay, 3),
-                    error=f"{type(last_error).__name__}: {last_error}",
-                )
-                await asyncio.sleep(delay)
-        else:
-            # 该模型重试耗尽，尝试下一个 fallback
-            log.warning("llm_model_exhausted", model=model, next_fallback=models_to_try[model_idx + 1] if model_idx + 1 < len(models_to_try) else None)
-            continue
+        # 重试用 tenacity（官方标准库）：退避+jitter+重试判定交给它，
+        # 我们只提供"哪些异常可重试"的领域知识（is_retryable）。
+        # 此前是手搓 `for attempt in range` + 手算 delay + asyncio.sleep。
+        try:
+            response = await _retrying_call(
+                acompletion, kwargs, retries=retries, base_delay=base_delay, model=model,
+            )
+            if usage is not None:
+                usage.add(response)
+            extract_content(response)
+            if model_idx > 0:
+                log.info("llm_fallback_succeeded", model=model, fallback_idx=model_idx)
+            return response
+        except EmptyLLMResponseError:
+            last_error = LLMCallError("模型返回空响应（choices 为空）", retryable=True)
+        except Exception as e:  # noqa: BLE001
+            last_error = e
+            if not is_retryable(e):
+                log.warning("llm_call_fatal", model=model, error=f"{type(e).__name__}: {e}")
+        # 该模型重试耗尽（或致命错误），尝试下一个 fallback
+        log.warning(
+            "llm_model_exhausted",
+            model=model,
+            next_fallback=(
+                models_to_try[model_idx + 1]
+                if model_idx + 1 < len(models_to_try)
+                else None
+            ),
+        )
+        continue
 
     # 所有模型都失败了，给出友好错误
     friendly_msg = _build_friendly_error(last_error)

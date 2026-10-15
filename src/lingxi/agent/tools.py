@@ -153,6 +153,52 @@ def resolve_required_level(
     return tool.required_permission
 
 
+def validate_tool_arguments(tool: ToolDefinition, arguments: dict[str, Any]) -> str | None:
+    """用工具声明的 JSON Schema 校验入参（jsonschema 官方实现）。
+
+    返回 None 表示通过；否则返回**面向模型可修复**的错误说明
+    （指出缺哪个字段/类型错了），而不是笼统的"执行失败"。
+
+    🤖 AI 避坑
+        - 工具没声明 schema 时直接放行（老工具/第三方 MCP 工具可能没有）。
+        - schema 本身写错（非法 schema）不能让调用失败：jsonschema 抛
+          SchemaError 时记 warning 并放行 —— 校验是增强，不是阻断器。
+        - 只做**结构与类型**校验；业务语义（如 shell 命令内容）由 handler
+          与权限分级负责。
+    """
+    schema = getattr(tool, "input_schema", None)
+    if not isinstance(schema, dict) or not schema:
+        return None
+    try:
+        from jsonschema import Draft202012Validator
+        from jsonschema.exceptions import SchemaError
+
+        try:
+            Draft202012Validator.check_schema(schema)
+        except SchemaError as e:
+            log.warning("tool_schema_invalid", tool=tool.name, error=str(e))
+            return None
+
+        validator = Draft202012Validator(schema)
+        errors = sorted(validator.iter_errors(arguments), key=lambda e: list(e.path))
+        if not errors:
+            return None
+
+        parts: list[str] = []
+        for err in errors[:3]:  # 最多报 3 条，避免刷屏
+            where = ".".join(str(p) for p in err.path) or "(根)"
+            parts.append(f"{where}: {err.message}")
+        return (
+            f"参数校验失败：{'; '.join(parts)}。"
+            f"请按工具声明的参数重试（需要字段：{', '.join(schema.get('required', [])) or '见 schema'}）。"
+        )
+    except ImportError:  # pragma: no cover — jsonschema 是声明依赖，缺失只降级
+        return None
+    except Exception as e:  # noqa: BLE001 — 校验器异常不阻断工具执行
+        log.warning("tool_args_validation_error", tool=tool.name, error=str(e))
+        return None
+
+
 def needs_approval(required: int, current: int) -> bool:
     """该调用是否需要人工审批（BLUEPRINT 权限分级模型）。
 
@@ -217,6 +263,15 @@ async def execute_tool(
     except Exception as e:
         log.warning("permission_denied", tool=tool_name, error=str(e))
         return {"success": False, "observation": f"权限不足：{e}"}
+
+    # ── 入参 schema 校验（jsonschema 官方实现）──
+    # 工具在注册时就声明了 input_schema（同一份也发给模型），这里用它
+    # 在执行前挡住缺参/类型错 —— 否则 handler 内部 TypeError 会被当成
+    # "工具执行出错"，模型看不到"你少传了哪个字段"这种可修复的信息。
+    schema_error = validate_tool_arguments(tool, arguments)
+    if schema_error is not None:
+        log.info("tool_args_invalid", tool=tool_name, error=schema_error)
+        return {"success": False, "observation": schema_error}
 
     # ── 执行 handler ──
     try:

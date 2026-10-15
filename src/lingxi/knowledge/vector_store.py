@@ -21,10 +21,8 @@
 from __future__ import annotations
 
 import contextlib
-import math
 import re
 import uuid
-from collections import Counter
 from typing import Any
 
 from lingxi.core import get_logger
@@ -58,118 +56,96 @@ def _tokenize(text: str) -> list[str]:
 
 
 class BM25Index:
-    """纯 Python BM25 实现 (工业标准算法)。
+    """BM25 关键词召回（**官方 `rank_bm25` 实现**，我们只提供中文分词器）。
 
     🔗 工程逻辑
-        BM25 = TF-IDF 的概率版本, 对关键词精确匹配特化。
-        向量召回 + BM25 取长补短:
-        - 向量: 语义理解 ("快递丢了" ≈ "包裹不见了")
-        - BM25: 关键词命中 ("SF12345678"、"用户ID:8892")
+        BM25 的公式实现（IDF 平滑、k1/b 调参、文档长度归一化）交给
+        `rank_bm25.BM25Okapi` —— 这是被广泛使用、有测试覆盖的实现。
+        我们保留的只有**领域适配**：中文用字符级 bigram 分词
+        （`_tokenize`），因为通用 tokenizer 对中文无效。
+
+        向量召回 + BM25 取长补短：
+        - 向量: 语义理解（"快递丢了" ≈ "包裹不见了"）
+        - BM25: 关键词精确命中（"SF12345678"、"订单20240115"）
 
     🤖 AI 避坑
-        - BM25 不需要真正建倒排索引, 存 {doc_id: text} 就够了
-        - tokenization 必须支持中文 (用字符级 bigram, 不用 jieba)
-        - k1=1.5, b=0.75 是业界默认值, 不需要暴露给用户
-        - IDF 用 log((N - n + 0.5) / (n + 0.5) + 1) 平滑版本
-          (避免 n=0 时分母为零)
+        - rank_bm25 在**构造时**吃整个 corpus（不像我们旧实现支持增量
+          add/remove），所以维护一份 `_docs` 列表，变更后重建索引；
+          倒排重建是 O(n) 且只发生在写入/删除时，检索路径零重建。
+        - 文档数为 0 或查询无 token 时直接返回 []（官方实现对空 corpus
+          的 `get_scores` 会抛 ZeroDivisionError）。
+        - 旧实现自己算 IDF/TF；替换后索引语义等价，但**分数尺度会变**
+          （rank_bm25 的 epsilon/平滑细节不同）—— 排序结果一致，
+          不要拿绝对分数做阈值判断。
     """
 
     def __init__(self, k1: float = 1.5, b: float = 0.75) -> None:
         self._k1 = k1
         self._b = b
         self._docs: dict[str, str] = {}  # doc_id → text
-        self._doc_count = 0
-        self._avg_dl = 0.0
-        self._doc_lengths: dict[str, int] = {}  # doc_id → token count
-        self._term_doc_freq: Counter[str] = Counter()  # term → 包含该 term 的文档数
+        self._ids: list[str] = []        # 与 _corpus 同序（rank_bm25 按下标返回）
+        self._corpus: list[list[str]] = []
+        self._bm25: Any = None
+
+    def _rebuild(self) -> None:
+        """按当前 _docs 重建官方索引（仅在增删后调用）。"""
+        if not self._docs:
+            self._ids = []
+            self._corpus = []
+            self._bm25 = None
+            return
+        self._ids = list(self._docs.keys())
+        self._corpus = [_tokenize(self._docs[i]) for i in self._ids]
+        try:
+            from rank_bm25 import BM25Okapi
+
+            self._bm25 = BM25Okapi(self._corpus, k1=self._k1, b=self._b)
+        except ImportError:  # pragma: no cover — 可选依赖缺失时退化为无关键词召回
+            log.warning("rank_bm25_missing", hint="pip install rank-bm25")
+            self._bm25 = None
 
     def add_document(self, doc_id: str, text: str) -> None:
-        """添加文档到 BM25 索引 (幂等: 同 doc_id 覆盖)。"""
-        # 如果已经存在, 先移除旧数据
-        if doc_id in self._docs:
-            self.remove_document(doc_id)
+        """添加文档（幂等：同 doc_id 覆盖）。"""
         if not text.strip():
             return
-        tokens = _tokenize(text)
         self._docs[doc_id] = text
-        self._doc_lengths[doc_id] = len(tokens)
-        # 更新 term 文档频率 (每个 term 在该文档中只计数一次)
-        for term in set(tokens):
-            self._term_doc_freq[term] += 1
-        self._doc_count += 1
-        # 更新平均文档长度
-        total_dl = sum(self._doc_lengths.values())
-        self._avg_dl = total_dl / self._doc_count if self._doc_count else 0.0
+        self._rebuild()
 
     def search(self, query: str, top_k: int = 10) -> list[tuple[str, float]]:
-        """BM25 搜索, 返回 [(doc_id, score), ...] (按分数降序)。"""
-        if not self._docs or not query.strip():
+        """BM25 搜索，返回 [(doc_id, score)]，按分数降序。"""
+        if self._bm25 is None or not self._docs or not query.strip():
             return []
         query_tokens = _tokenize(query)
         if not query_tokens:
             return []
-        scores: dict[str, float] = {}
-        for doc_id in self._docs:
-            dl = self._doc_lengths[doc_id]
-            score = 0.0
-            # 统计 term frequency in this doc
-            doc_tokens = _tokenize(self._docs[doc_id])
-            tf = Counter(doc_tokens)
-            for term in query_tokens:
-                if term not in tf:
-                    continue
-                n_q = self._term_doc_freq.get(term, 0)
-                if n_q == 0:
-                    continue
-                # IDF: 平滑版 Robertson/Walker
-                idf = math.log(
-                    (self._doc_count - n_q + 0.5) / (n_q + 0.5) + 1.0
-                )
-                # TF: BM25 加权
-                f = tf[term]
-                tf_part = (f * (self._k1 + 1.0)) / (
-                    f + self._k1 * (1.0 - self._b + self._b * dl / self._avg_dl)
-                    if self._avg_dl > 0
-                    else f + self._k1
-                )
-                score += idf * tf_part
-            if score > 0:
-                scores[doc_id] = score
-        # 按分数降序排序, 取 top_k
-        ranked = sorted(scores.items(), key=lambda x: x[1], reverse=True)
+        try:
+            scores = self._bm25.get_scores(query_tokens)
+        except (ZeroDivisionError, ValueError) as e:
+            log.warning("bm25_scoring_failed", error=str(e))
+            return []
+        ranked = [
+            (self._ids[i], float(score))
+            for i, score in enumerate(scores)
+            if score > 0
+        ]
+        ranked.sort(key=lambda x: x[1], reverse=True)
         return ranked[:top_k]
 
     def remove_document(self, doc_id: str) -> None:
-        """从 BM25 索引中移除文档。"""
+        """移除文档并重建索引。"""
         if doc_id not in self._docs:
             return
-        # 减少 term 文档频率
-        tokens = _tokenize(self._docs[doc_id])
-        for term in set(tokens):
-            self._term_doc_freq[term] -= 1
-            if self._term_doc_freq[term] <= 0:
-                del self._term_doc_freq[term]
         del self._docs[doc_id]
-        del self._doc_lengths[doc_id]
-        self._doc_count -= 1
-        # 更新平均文档长度
-        if self._doc_count > 0:
-            total_dl = sum(self._doc_lengths.values())
-            self._avg_dl = total_dl / self._doc_count
-        else:
-            self._avg_dl = 0.0
+        self._rebuild()
 
     def reset(self) -> None:
-        """清空 BM25 索引。"""
+        """清空索引。"""
         self._docs.clear()
-        self._doc_lengths.clear()
-        self._term_doc_freq.clear()
-        self._doc_count = 0
-        self._avg_dl = 0.0
+        self._rebuild()
 
     @property
     def doc_count(self) -> int:
-        return self._doc_count
+        return len(self._docs)
 
 
 def reciprocal_rank_fusion(
