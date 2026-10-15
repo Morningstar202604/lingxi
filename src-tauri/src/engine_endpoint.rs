@@ -1,26 +1,30 @@
 //! 引擎地址发现与配置（**全平台编译**）。
 //!
 //! 🔗 为什么需要这个模块
-//!     「智犀」是「客户端 + 引擎服务」架构。引擎本体是 Python 进程：
-//!     - **桌面**：Tauri 把引擎作为 sidecar 自动拉起，监听 127.0.0.1:<动态端口>，
-//!       令牌随机生成 —— 客户端运行时就能拿到真实地址（见 python_sidecar.rs）。
-//!     - **移动**（Android/iOS）：OS 不允许 fork 任意二进制、也没有 Python
-//!       运行时，**引擎不可能跑在手机上**。客户端改为连接用户自己部署的
-//!       引擎地址（局域网/公网/VPN 均可），或经由云端 API 网关。
+//! 「智犀」是「客户端 + 引擎服务」架构。引擎本体是 Python 进程：
+//! - **桌面**：Tauri 把引擎作为 sidecar 自动拉起，监听 127.0.0.1:<动态端口>，
+//!   令牌随机生成 —— 客户端运行时就能拿到真实地址（见 python_sidecar.rs）。
+//! - **移动**（Android/iOS）：OS 不允许 fork 任意二进制、也没有 Python
+//!   运行时，**引擎不可能跑在手机上**。客户端改为连接用户自己部署的
+//!   引擎地址（局域网/公网/VPN 均可），或经由云端 API 网关。
 //!
-//!     本模块把这两种来源统一成一份「引擎端点」：
-//!     `{ base_url, token, mode }`，前端只需一条 invoke 就能拿到地址，
-//!     不需要知道背后是 sidecar 还是远程服务。
+//! 本模块把这两种来源统一成一份「引擎端点」：
+//! `{ base_url, token, mode }`，前端只需一条 invoke 就能拿到地址，
+//! 不需要知道背后是 sidecar 还是远程服务。
 //!
 //! 🤖 AI 避坑
-//!     - 端点是**可变状态**：桌面在 sidecar 重启换端口后会更新；移动端由
-//!       用户随时修改。所以用全局 Mutex 而非 OnceLock。
-//!     - 移动端把配置持久化到 App 数据目录（`engine.json`），重启不丢；
-//!       桌面端不落盘（地址由 sidecar 每次启动决定，落盘反而会读到过期值）。
-//!     - 令牌与地址都属于**敏感配置**：不做任何日志输出。
+//! - 端点是**可变状态**：桌面在 sidecar 重启换端口后会更新；移动端由
+//!   用户随时修改。所以用全局 Mutex 而非 OnceLock。
+//! - 移动端把配置持久化到 App 数据目录（`engine.json`），重启不丢；
+//!   桌面端不落盘（地址由 sidecar 每次启动决定，落盘反而会读到过期值）。
+//! - 令牌与地址都属于**敏感配置**：不做任何日志输出。
 use std::sync::Mutex;
 
 use serde::{Deserialize, Serialize};
+use tauri::AppHandle;
+
+#[cfg(mobile)]
+use tauri::Manager;
 
 #[cfg(mobile)]
 use std::path::PathBuf;
@@ -65,20 +69,10 @@ impl EngineEndpoint {
 
 /// 端点文件路径（仅移动端落盘；桌面端内存态即可）。
 #[cfg(mobile)]
-fn config_path() -> Option<PathBuf> {
-    // Tauri 的 app_data_dir 在移动端是应用私有目录（无需额外权限）
-    let dir = dirs_next_app_data()?;
+fn config_path_from(app: &AppHandle) -> Option<PathBuf> {
+    let dir = app.path().app_data_dir().ok()?;
     std::fs::create_dir_all(&dir).ok()?;
     Some(dir.join("engine.json"))
-}
-
-#[cfg(mobile)]
-fn dirs_next_app_data() -> Option<PathBuf> {
-    // Android: /data/data/<pkg>/files  ← Tauri 会注入 app 私有目录环境变量
-    std::env::var("HOME")
-        .ok()
-        .map(|h| PathBuf::from(h).join(".lingxi"))
-        .or_else(|| Some(PathBuf::from("/data/local/tmp/lingxi")))
 }
 
 /// 桌面端由 sidecar 启动流程调用，写入真实端口与令牌。
@@ -93,7 +87,9 @@ pub fn set_local(port: u16, token: &str) {
 ///
 /// 返回 `None` 表示"尚未配置"——移动端首启时前端应引导用户填写地址。
 #[tauri::command]
-pub fn get_engine_endpoint() -> Option<EngineEndpoint> {
+pub fn get_engine_endpoint(app: AppHandle) -> Option<EngineEndpoint> {
+    #[cfg(not(mobile))]
+    let _ = app;
     // 内存态优先；移动端冷启动时从磁盘恢复
     if let Ok(guard) = ENDPOINT.lock() {
         if let Some(ep) = guard.as_ref() {
@@ -102,7 +98,7 @@ pub fn get_engine_endpoint() -> Option<EngineEndpoint> {
     }
     #[cfg(mobile)]
     {
-        if let Some(path) = config_path() {
+        if let Some(path) = config_path_from(&app) {
             if let Ok(raw) = std::fs::read_to_string(&path) {
                 if let Ok(ep) = serde_json::from_str::<EngineEndpoint>(&raw) {
                     if ep.is_valid() {
@@ -122,7 +118,13 @@ pub fn get_engine_endpoint() -> Option<EngineEndpoint> {
 ///
 /// 返回 `Ok(true)` 表示已保存并可立即生效。
 #[tauri::command]
-pub fn set_engine_endpoint(base_url: String, token: String) -> Result<bool, String> {
+pub fn set_engine_endpoint(
+    app: AppHandle,
+    base_url: String,
+    token: String,
+) -> Result<bool, String> {
+    #[cfg(not(mobile))]
+    let _ = app;
     let mut ep = EngineEndpoint {
         base_url,
         token,
@@ -134,7 +136,7 @@ pub fn set_engine_endpoint(base_url: String, token: String) -> Result<bool, Stri
     }
 
     #[cfg(mobile)]
-    if let Some(path) = config_path() {
+    if let Some(path) = config_path_from(&app) {
         let raw = serde_json::to_string_pretty(&ep).map_err(|e| e.to_string())?;
         std::fs::write(&path, raw).map_err(|e| format!("保存失败: {}", e))?;
     }

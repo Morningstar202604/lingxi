@@ -80,11 +80,14 @@
 | PWA / 移动端 | Web 标准（manifest + Service Worker） | Android 可直接安装到主屏幕，standalone 运行；静态资源 cache-first、`/api/*` 不缓存 |
 | Agent 编排 | LangGraph（官方 checkpointer） | 未自造状态机或持久化 |
 
-> **关于 Android 交付方式**：当前架构是「客户端 + 引擎服务」——引擎是
-> Python 进程（桌面版由 Tauri 内置为 sidecar 自动拉起）。手机端无法运行
-> 该进程，因此 Android 采用 **PWA**（浏览器"安装到主屏幕"，独立窗口运行）
-> 或**手机浏览器直连你部署的引擎地址**（`NEXT_PUBLIC_API_BASE` 指向服务器）。
-> 这条路径与"线上 API 为主"的定位一致：模型算力在云端，手机只做交互。
+> **Android APK 构建结果（2026-10-15）**：已用 Tauri 2.12.2 + Android API 35 +
+> NDK 27.2 + Rust `aarch64-linux-android` 真实编译 native library，并成功打包
+> `src-tauri/gen/android/app/build/outputs/apk/arm64/release/app-arm64-release-unsigned.apk`
+>（约 22MB）。Windows 上如果没有开启开发者模式，Tauri Gradle 插件创建 JNI
+> 符号链接会被系统拒绝；可先编译 `.so`，再把它复制到
+> `gen/android/app/src/main/jniLibs/arm64-v8a/` 后用 Gradle 打包。产物是**未签名
+> release APK**，发布前需用 Android keystore 签名。Android 端是远程引擎客户端，
+> 首次打开在「连接」页填写 `http(s)://<服务器>:<端口>` 与管理令牌。
 
 ### Agent 运行时能力（2026-10-12 第二轮补齐）
 
